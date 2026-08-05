@@ -51,16 +51,22 @@ def _projection(
     zero_delta_fraction: Optional[float] = 0.1,
     longest_above_overall_rate_run: Optional[int] = 1,
     latest_change_at: Optional[float] = 990.0,
+    latest_change_delta: Optional[float] = 1.0,
+    latest_captured_at: Optional[float] = 990.0,
 ) -> BurnRateProjection:
     """Build a projection that clears every trust threshold with margin by
     default, so each test only needs to override the one field it targets.
 
-    ``latest_change_at`` defaults to 990.0: every test in this module that
-    calls ``render_hook``/``render_burn_rate_status_lines`` uses
-    ``now=1_000.0``, so this default is 10 seconds before "now" -- well
-    inside any source's freshness window (300s Claude, 1800s Codex) unless
-    a test deliberately overrides it to exercise
-    ``burn_rate_evidence_is_current``'s staleness check.
+    ``latest_change_at`` and ``latest_captured_at`` both default to 990.0
+    (the default case is a clean climb whose last capture IS its last
+    change): every test in this module that calls
+    ``render_hook``/``render_burn_rate_status_lines`` uses ``now=1_000.0``,
+    so this default is 10 seconds before "now", matching ``_fresh_reading``'s
+    ``age_seconds=10.0`` default for ``burn_rate_evidence_is_current``'s
+    capture-identity check. ``latest_change_delta`` defaults to 1.0 (a
+    single-point step, matching the default ``rate_percent_per_second`` of
+    0.01 for a 100s implied inter-change interval) unless a test overrides
+    it to exercise a different observed step size.
     """
 
     declined = reason is not None
@@ -82,6 +88,8 @@ def _projection(
         max_raw_rate_ratio=None if declined else max_raw_rate_ratio,
         longest_above_overall_rate_run=None if declined else longest_above_overall_rate_run,
         latest_change_at=None if declined else latest_change_at,
+        latest_change_delta=None if declined else latest_change_delta,
+        latest_captured_at=None if declined else latest_captured_at,
     )
 
 
@@ -287,6 +295,32 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
         self.assertEqual(lines, [])
 
+    def test_reading_from_a_different_capture_event_says_nothing(self) -> None:
+        # (Codex review, round 4, P2) A fresh reading exists for the right
+        # source and window, but its own capture time does not match
+        # projection.latest_captured_at -- state.json and history.jsonl
+        # have drifted and this reading is not the evidence this projection
+        # was built from. Matching by (source, window) alone would wrongly
+        # treat this as confirmation.
+        projection = _projection(source="claude", window="short", latest_captured_at=990.0)
+        mismatched_reading = _fresh_reading(source="claude", window="short")  # age 10.0 -> captured_at 990.0
+        # Force a mismatch: same source/window, different age, so its
+        # recovered captured_at (now - age) no longer lines up.
+        mismatched_reading = Reading(
+            certain=True,
+            lower_bound_percent=mismatched_reading.lower_bound_percent,
+            resets_at=mismatched_reading.resets_at,
+            age_seconds=200.0,
+            window=mismatched_reading.window,
+            source=mismatched_reading.source,
+            confidence=Confidence.FRESH,
+        )
+        lines = render_burn_rate_status_lines(
+            [projection], now=1_000.0, readings=[mismatched_reading]
+        )
+
+        self.assertEqual(lines, [])
+
     def test_trustworthy_projection_with_no_matching_reading_says_nothing(self) -> None:
         # No reading at all for this source/window -- there is no current
         # evidence to confirm, so the gate fails the same way a stale one
@@ -321,11 +355,17 @@ class RenderBurnRateStatusTests(unittest.TestCase):
         # pass under the rate-relative tolerance.
         now = 1_000_000.0
         rate = 1.0 / 7_200.0
+        # _fresh_reading's age_seconds is 10.0, so its own captured_at is
+        # now - 10.0: latest_captured_at must match that for the
+        # capture-identity check to pass (this projection's last capture IS
+        # its last change, so latest_change_at matches too).
         projection = _projection(
             source="codex",
             window="weekly",
             rate_percent_per_second=rate,
             latest_change_at=now - 7_000.0,
+            latest_change_delta=1.0,
+            latest_captured_at=now - 10.0,
         )
         reading = _fresh_reading(source="codex", window="weekly")
         lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])

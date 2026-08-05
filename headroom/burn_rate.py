@@ -343,6 +343,36 @@ class BurnRateProjection:
     ``exhaustion_precedes_reset``'s sibling check (``latest_usage !=
     first_usage``, see ``_project_group``) guarantees at least one
     adjacent pair in the segment differs.
+
+    ``latest_change_delta`` is the ``used_percentage`` difference recorded
+    at that same most-recent-change event -- how BIG the last real move
+    was, not just when it happened. A caller comparing "how long since
+    usage last moved" against "how long a move like that should take at
+    this fitted rate" needs both: dividing this delta by
+    ``rate_percent_per_second`` gives the expected elapsed time for a move
+    of the SAME size the segment has actually been showing, which is not
+    the same as ``1 / rate_percent_per_second`` (the time for a single
+    whole percentage point) unless the segment's real steps happen to be
+    exactly one point each. A source reporting five-point jumps and a
+    source reporting one-tenth-point jumps can fit the identical rate while
+    implying very different real cadences between observed changes; only
+    the observed step size, not the rate alone, tells them apart. Always
+    strictly positive when set, for the same reason given in
+    ``_latest_change``'s docstring (segments are non-decreasing, so a
+    differing adjacent pair differs upward). Present and absent under the
+    same rule as ``latest_change_at``.
+
+    ``latest_captured_at`` is the ``captured_at`` of the segment's actual
+    last record (``records[-1]``, i.e. the same record ``span_seconds`` and
+    ``projected_exhaustion_at`` are anchored to) -- as opposed to
+    ``latest_change_at``, which can be an EARLIER record if the segment
+    ends in a trailing flat run. A caller pairing this projection with a
+    separately-stored "current reading" for the same source and window (as
+    ``status`` and ``hook`` do) can use this field to confirm the two
+    actually describe the same capture event, rather than trusting that a
+    reading matched only by source and window is necessarily the reading
+    this projection's own history produced. Present and absent under the
+    same rule as the other fields above.
     """
 
     source: str
@@ -362,6 +392,8 @@ class BurnRateProjection:
     max_raw_rate_ratio: Optional[float] = None
     longest_above_overall_rate_run: Optional[int] = None
     latest_change_at: Optional[float] = None
+    latest_change_delta: Optional[float] = None
+    latest_captured_at: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-compatible representation with every field present.
@@ -390,6 +422,8 @@ class BurnRateProjection:
             "max_raw_rate_ratio": self.max_raw_rate_ratio,
             "longest_above_overall_rate_run": self.longest_above_overall_rate_run,
             "latest_change_at": self.latest_change_at,
+            "latest_change_delta": self.latest_change_delta,
+            "latest_captured_at": self.latest_captured_at,
         }
 
 
@@ -650,6 +684,7 @@ def _project_group(
 
     resets_at = latest.resets_at
     precedes_reset = None if resets_at is None else projected_at < resets_at
+    change_at, change_delta = _latest_change(records)
     return BurnRateProjection(
         source=source,
         window=window,
@@ -666,13 +701,25 @@ def _project_group(
         zero_delta_fraction=measurements.zero_delta_fraction,
         max_raw_rate_ratio=measurements.max_raw_rate_ratio,
         longest_above_overall_rate_run=measurements.longest_above_overall_rate_run,
-        latest_change_at=_latest_change_at(records),
+        latest_change_at=change_at,
+        latest_change_delta=change_delta,
+        latest_captured_at=latest.captured_at,
     )
 
 
-def _latest_change_at(records: List[_HistoryRecord]) -> float:
-    """The ``captured_at`` of the most recent record whose ``used_percentage``
-    differs from the record immediately before it.
+def _latest_change(records: List[_HistoryRecord]) -> Tuple[float, float]:
+    """The (``captured_at``, usage delta) of the most recent record whose
+    ``used_percentage`` differs from the record immediately before it.
+
+    The delta is reported alongside the timestamp, not just the timestamp
+    alone, because a caller comparing "how long since usage last moved"
+    against "how long a move of this rate should take" needs to know how
+    BIG that last move was: a rate fitted from 5-point jumps and a rate
+    fitted from 0.1-point jumps can be numerically identical while implying
+    very different real inter-change cadences, and only the observed step
+    size (not the rate alone) distinguishes them. See
+    ``BurnRateProjection.latest_change_at``'s docstring for how a caller
+    uses this pair together.
 
     Callable only once ``latest_usage != first_usage`` is already
     established (see ``_project_group``, right before ``BurnRateProjection``
@@ -681,17 +728,22 @@ def _latest_change_at(records: List[_HistoryRecord]) -> float:
     the first and last values would be transitively equal too. So this
     always finds a match before its loop reaches index 0; the function has
     no "nothing ever changed" branch to fall back to because that case is
-    unreachable under its precondition.
+    unreachable under its precondition. The reported delta is always
+    strictly positive (not merely nonzero): segments are non-decreasing by
+    construction (see ``_records_since_latest_reset``), so an adjacent pair
+    that differs at all differs upward.
     """
 
     for index in range(len(records) - 1, 0, -1):
-        if records[index].used_percentage != records[index - 1].used_percentage:
-            return records[index].captured_at
+        current = records[index]
+        previous = records[index - 1]
+        if current.used_percentage != previous.used_percentage:
+            return current.captured_at, current.used_percentage - previous.used_percentage
     # Unreachable given this function's precondition (see docstring); kept
     # as a defensive, honestly-labeled fallback rather than an assertion, so
     # a future caller that violates the precondition gets the segment's
-    # earliest timestamp instead of an IndexError.
-    return records[0].captured_at
+    # earliest timestamp and a zero delta instead of an IndexError.
+    return records[0].captured_at, 0.0
 
 
 def _pairwise_slopes(records: List[_HistoryRecord]) -> List[float]:
