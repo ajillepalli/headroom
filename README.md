@@ -62,7 +62,7 @@ Stop parallel subagent fan-out, use cheaper models, and checkpoint work now.
 
 | Document | What it covers |
 | --- | --- |
-| [CLI reference](docs/reference-cli.md) | Every command, flag, environment variable, state file, and exit code. |
+| [CLI reference](docs/reference-cli.md) | Every command, flag, environment variable, state file, exit code, and the opt-in update check. |
 | [Why the bounds are sound](docs/explanation-bounds.md) | Fresh, stale, and post-reset readings, reset validation, and severity. |
 | [How capture works](docs/explanation-capture.md) | Claude statusline input, Codex app-server RPC, and rollout fallback. |
 | [Installation guide](docs/howto-install.md) | Claude Code settings, the `CODEX_HOME/hooks.json` path, safe init previews, backups, and clone installs. |

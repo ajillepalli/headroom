@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "json",
         "doctor",
         "reset",
+        "update",
     ):
         subparsers.add_parser(command)
     hook_parser = subparsers.add_parser("hook")
@@ -147,6 +148,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except OSError as error:
             print("headroom reset: {}".format(error), file=sys.stderr)
             return 1
+    if arguments.command == "update":
+        return _update()
     try:
         if arguments.command == "doctor":
             return _doctor()
@@ -162,6 +165,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         readings = _readings(state, now)
         if arguments.command == "status":
             print(render_report(readings, now))
+            _print_status_update()
         elif arguments.command == "json":
             print(json.dumps(_json_document(state, readings), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         elif arguments.command == "hook":
@@ -330,6 +334,87 @@ def _doctor() -> int:
     notes += codex.rpc.notes + (rollout.notes if rollout is not None else ())
     if notes:
         print("Notes: {}".format("; ".join(dict.fromkeys(notes))))
+    _print_update_doctor()
+    return 0
+
+
+def _print_status_update() -> None:
+    """Make the opt-in update call only from the interactive status command."""
+
+    from .update_check import check_for_update, discovery_line, update_check_enabled
+
+    hint = discovery_line()
+    if hint is not None:
+        print(hint)
+        return
+    if not update_check_enabled():
+        return
+    result = check_for_update(_installed_version())
+    if result.update_available:
+        print(
+            "Update available: headroom-cli {} (installed {}). Run headroom update.".format(
+                result.latest_version,
+                result.installed_version,
+            )
+        )
+
+
+def _print_update_doctor() -> None:
+    """Report cached or freshly checked update diagnostics."""
+
+    from .update_check import (
+        CACHE_FILENAME,
+        check_for_update,
+        format_timestamp,
+        read_cached_result,
+        update_check_enabled,
+    )
+
+    enabled = update_check_enabled()
+    result = (
+        check_for_update(_installed_version())
+        if enabled
+        else read_cached_result()
+    )
+    print()
+    print("Update check")
+    print("  Enabled: {}".format("yes" if enabled else "no"))
+    print("  Cache: {}".format(resolve_state_dir() / CACHE_FILENAME))
+    if result is None:
+        print("  Last outcome: not checked")
+        print("  Last checked: never")
+        print("  Next eligible check: now")
+        return
+    if result.outcome == "update":
+        outcome = "update available: {}".format(result.latest_version)
+    elif result.outcome == "current":
+        outcome = "up to date"
+    else:
+        outcome = "failed: {}".format(result.reason)
+    print("  Last outcome: {}".format(outcome))
+    print("  Last checked: {}".format(format_timestamp(result.checked_at)))
+    print("  Next eligible check: {}".format(format_timestamp(result.next_check_at)))
+
+
+def _update() -> int:
+    """Print an installation-specific update command without executing it."""
+
+    install = inspect_install(_installed_version())
+    if install.update_mode == "uv-tool":
+        print("Detected install mode: uv tool")
+        print("Run: uv tool upgrade headroom-cli")
+    elif install.update_mode == "pip":
+        print("Detected install mode: pip")
+        print("Run: pip install -U headroom-cli")
+    elif install.update_mode == "source":
+        print("Detected install mode: source checkout")
+        print("In {}, run:".format(install.path.parent))
+        print("  git pull")
+        print("  pip install -e .")
+    else:
+        print("Install mode could not be determined confidently.")
+        print("No update command is suggested.")
+    print("Nothing was changed.")
     return 0
 
 

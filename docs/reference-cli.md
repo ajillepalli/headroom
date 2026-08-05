@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md) | [How capture works](explanation-capture.md) | [Troubleshooting](howto-troubleshoot.md)
 
-headroom requires Python 3.9 or newer and uses only the Python standard library. It makes no direct network calls. The installed entry point and `python -m headroom.cli` expose the same interface.
+headroom requires Python 3.9 or newer and uses only the Python standard library. By default, it makes no outbound network calls. The installed entry point and `python -m headroom.cli` expose the same interface.
 
 ## Command form
 
@@ -18,15 +18,18 @@ headroom COMMAND [OPTIONS]
 
 | Command | Input | Output and side effects |
 | --- | --- | --- |
-| `headroom statusline` | One Claude Code JSON document on standard input | Parses Claude readings, stores snapshots and diagnostics, and prints one compact line. It never starts the Codex app-server. Malformed input still produces a fallback line and exits 0. |
-| `headroom status` | None | Refreshes Codex through the app-server with rollout fallback, updates state, and prints Claude and Codex short and weekly readings. Missing readings are `unavailable`. |
-| `headroom json` | None | Performs the same Codex refresh as `status`, then prints one compact JSON document containing persisted state, diagnostics, and four bounded readings. |
-| `headroom hook` | Optional Claude Code hook JSON | Performs the same Codex refresh, then emits guidance for the highest actionable severity. A `UserPromptSubmit` payload selects the documented JSON envelope. With no hook payload, output is human-readable text. It emits nothing when all readings are `ok`. |
-| `headroom doctor` | None | Reads current Codex sources without updating state, then reports install provenance, the Codex hooks path and registration status, state paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
+| `headroom statusline` | One Claude Code JSON document on standard input | Parses Claude readings, stores snapshots and diagnostics, and prints one compact line. It never starts the Codex app-server or checks for updates. Malformed input still produces a fallback line and exits 0. |
+| `headroom status` | None | Refreshes Codex through the app-server with rollout fallback, updates state, and prints Claude and Codex short and weekly readings. Missing readings are `unavailable`. When update checking is unset, it adds one local-only discovery line. When opted in, it reports an available update but stays quiet on current or failed checks. |
+| `headroom json` | None | Performs the same Codex refresh as `status`, then prints one compact JSON document containing persisted state, diagnostics, and four bounded readings. It does not check for updates. |
+| `headroom hook` | Optional Claude Code hook JSON | Performs the same Codex refresh, then emits guidance for the highest actionable severity. A `UserPromptSubmit` payload selects the documented JSON envelope. With no hook payload, output is human-readable text. It emits nothing when all readings are `ok` and never checks for updates. |
+| `headroom doctor` | None | Reads current Codex sources without updating usage state, then reports install provenance, hook registration, state and Codex diagnostics, and update-check status. When update checking is enabled, it makes a check only if the daily cache is due. |
 | `headroom reset` | None | Removes `state.json` and `history.jsonl`. It reports whether anything was removed and leaves other files in the state directory untouched. |
 | `headroom init` | None | Merges the Claude Code statusline and prompt hook by default. `--codex` selects the Codex hook, and `--all` configures both. See [Installation](howto-install.md). |
+| `headroom update` | None | Detects a source checkout, uv tool install, or pip install and prints the appropriate update command. It does not run the command or change anything. Unknown install modes are reported without guessing. |
 
-`statusline`, `status`, `json`, `doctor`, and `reset` have no command-specific flags other than help.
+`statusline`, `status`, `json`, `doctor`, `reset`, and `update` have no command-specific flags other than help.
+
+`headroom update` prints `uv tool upgrade headroom-cli` for a detected uv tool install and `pip install -U headroom-cli` for a detected pip install. For a source checkout, it prints `git pull` followed by `pip install -e .` from the checkout. Every path ends with `Nothing was changed.` The command never performs an update.
 
 ## Hook output
 
@@ -61,7 +64,8 @@ With no target flag, init configures Claude Code only. Codex uses `hooks.json` i
 | Variable | Default | Accepted value and behavior |
 | --- | --- | --- |
 | `CODEX_HOME` | `~/.codex` | Codex home used by `init --codex` and by `doctor` when locating `hooks.json`. `--codex-home` overrides it for init. |
-| `HEADROOM_STATE_DIR` | `~/.headroom` | Directory containing `state.json` and `history.jsonl`. A nonempty value is expanded as a user path. |
+| `HEADROOM_STATE_DIR` | `~/.headroom` | Directory containing `state.json`, `history.jsonl`, and the separate `update-check.json` cache when those files are created. A nonempty value is expanded as a user path. |
+| `HEADROOM_UPDATE_CHECK` | Off | The exact value `1` allows `status` and `doctor` to query PyPI at most once per 24 hours. Unset it to disable checking and show the local discovery hint in `status`. Set it to `0` to disable checking and suppress the hint. Every other value also disables checking. |
 | `HEADROOM_CODEX_HOME` | `~/.codex` | Codex home used only for usage capture. Rollout fallback reads its `sessions` child directory. It does not select the hook installation path. |
 | `HEADROOM_CODEX_RPC` | Enabled | The exact value `0` skips the app-server RPC. Every other value, including an unset value, enables it. |
 | `HEADROOM_CODEX_RPC_TIMEOUT` | `6` | Shared timeout in seconds for startup, initialization, and the rate-limit response. It must be finite and greater than zero. An invalid value falls back to 6 seconds and adds a diagnostic note. |
@@ -75,6 +79,12 @@ An invalid freshness value causes `status`, `json`, or `hook` to exit 1. `status
 ## State and JSON fields
 
 `state.json` is replaced atomically through a temporary file in the same directory. A failed or partial read produces an empty in-memory state. The document has `version` set to 1, a `sources` object keyed by source and window, and any stored `diagnostics`. Every captured snapshot is also appended as one compact object to `history.jsonl`, with the file flushed and synced after writing.
+
+Update results are stored separately in `update-check.json`. The cache contains the check time, installed version, outcome, available version when applicable, and a local failure reason when applicable. Both successful and failed attempts become eligible for another check after 24 hours. The response body is limited to 256 KB and the request has an approximately two-second total deadline. PyPI data is treated as untrusted, release keys are conservatively parsed, and eligibility is determined from non-yanked files in the `releases` object rather than `info.version`.
+
+The `doctor` update section reports `Enabled`, `Cache`, `Last outcome`, `Last checked`, and `Next eligible check`. A failure reason is part of `Last outcome`. When checking is disabled, these fields come only from the local cache. When there is no cache, the outcome is `not checked`, the last check is `never`, and the next eligible check is `now`.
+
+With `HEADROOM_UPDATE_CHECK=1`, only `status` and `doctor` can send an HTTPS GET request to `https://pypi.org/pypi/headroom-cli/json`, and only when the cache is due. The request identifies the fixed package name and includes `Accept: application/json` and `User-Agent: headroom-update-check`. The destination can observe the source IP address and timing. No usage readings, account data, local paths, installed version, or cache data are sent. `hook` and `statusline` cannot invoke this request path.
 
 Each stored snapshot contains:
 
