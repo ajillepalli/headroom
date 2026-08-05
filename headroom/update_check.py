@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import time
 import unicodedata
@@ -24,6 +25,7 @@ CACHE_FILENAME = "update-check.json"
 CACHE_SECONDS = 24 * 60 * 60
 DEADLINE_SECONDS = 2.0
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_CACHE_BYTES = 16 * 1024
 READ_SIZE = 16 * 1024
 _VERSION = re.compile(
     r"^([0-9]+(?:\.[0-9]+)*)(?:(a|b|rc)([0-9]+))?(?:\.post([0-9]+))?$",
@@ -127,12 +129,14 @@ def select_latest_release(document: Any, installed: ParsedVersion) -> Optional[s
         raise ValueError("PyPI response has no releases object")
     selected_name: Optional[str] = None
     selected: Optional[ParsedVersion] = None
+    credible_release = False
     for name, files in releases.items():
         if not isinstance(name, str) or not _has_non_yanked_file(files):
             continue
         parsed = parse_version(name)
         if parsed is None:
             continue
+        credible_release = True
         if parsed.is_prerelease and not installed.is_prerelease:
             continue
         if not version_is_newer(parsed, installed):
@@ -140,6 +144,8 @@ def select_latest_release(document: Any, installed: ParsedVersion) -> Optional[s
         if selected is None or version_is_newer(parsed, selected):
             selected_name = name
             selected = parsed
+    if not credible_release:
+        raise ValueError("PyPI response has no credible releases")
     return selected_name
 
 
@@ -151,17 +157,11 @@ def check_for_update(
     """Return a daily cached result, performing the only network call in headroom."""
 
     checked_at = time.time() if now is None else now
-    cached = read_cached_result(state_dir)
-    if cached is not None and checked_at < cached.next_check_at:
-        if cached.installed_version == installed_version:
+    cached = read_cached_result(state_dir, installed_version)
+    if cached is not None:
+        age = checked_at - cached.checked_at
+        if 0 <= age < CACHE_SECONDS:
             return _with_cached(cached)
-        return UpdateResult(
-            "failure",
-            cached.checked_at,
-            installed_version,
-            reason="installed version changed since the cached check",
-            cached=True,
-        )
 
     installed = parse_version(installed_version)
     if installed is None:
@@ -218,18 +218,41 @@ def check_for_update(
     return result
 
 
-def read_cached_result(state_dir: Optional[Path] = None) -> Optional[UpdateResult]:
+def read_cached_result(
+    state_dir: Optional[Path] = None,
+    installed_version: Optional[str] = None,
+) -> Optional[UpdateResult]:
     """Read and validate the separate, attacker-influenced update cache."""
 
     path = resolve_state_dir(state_dir) / CACHE_FILENAME
+    # Cache authentication is intentionally out of scope. Anyone who can write
+    # the user's state directory can also replace the headroom executable, so
+    # integrity material would add complexity without protecting this threat model.
     try:
-        if path.stat().st_size > MAX_RESPONSE_BYTES:
+        with path.open("rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            payload = handle.read(MAX_CACHE_BYTES + 1)
+        if len(payload) > MAX_CACHE_BYTES:
             return None
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (OSError, UnicodeError, ValueError):
+        value = json.loads(payload)
+        result = _result_from_cache(value)
+        if (
+            result is not None
+            and installed_version is not None
+            and result.installed_version != installed_version
+        ):
+            return None
+        return result
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        OverflowError,
+    ):
         return None
-    return _result_from_cache(value)
 
 
 def format_timestamp(timestamp: float) -> str:
@@ -254,7 +277,13 @@ def _fetch_pypi_json() -> Any:
         },
         method="GET",
     )
-    response = request.urlopen(request_value, timeout=DEADLINE_SECONDS)
+    try:
+        response = _open_pypi(request_value, timeout=DEADLINE_SECONDS)
+    except error.HTTPError as exc:
+        try:
+            raise ValueError("PyPI returned HTTP status {}".format(exc.code)) from None
+        finally:
+            exc.close()
     try:
         if getattr(response, "status", 200) != 200:
             raise ValueError("PyPI returned a non-success response")
@@ -273,21 +302,28 @@ def _fetch_pypi_json() -> Any:
                 raise TimeoutError("deadline exceeded")
             _set_response_timeout(response, remaining)
             chunk = response.read(min(READ_SIZE, MAX_RESPONSE_BYTES + 1 - total))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("deadline exceeded")
             if not chunk:
                 break
             total += len(chunk)
             if total > MAX_RESPONSE_BYTES:
                 raise _ResponseTooLarge
             chunks.append(chunk)
-        if time.monotonic() > deadline:
-            raise TimeoutError("deadline exceeded")
         return json.loads(b"".join(chunks).decode("utf-8"))
     finally:
         response.close()
 
 
+def _open_pypi(request_value: request.Request, timeout: float) -> Any:
+    """Open the fixed PyPI URL without following redirects."""
+
+    opener = request.build_opener(_NoRedirectHandler())
+    return opener.open(request_value, timeout=timeout)
+
+
 def _set_response_timeout(response: Any, timeout: float) -> None:
-    """Keep successive reads inside the original total deadline when possible."""
+    """Limit read inactivity; the caller checks its deadline between reads."""
 
     try:
         response.fp.raw._sock.settimeout(timeout)
@@ -439,3 +475,8 @@ def _write_cache(result: UpdateResult, state_dir: Optional[Path]) -> None:
 
 class _ResponseTooLarge(Exception):
     pass
+
+
+class _NoRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None

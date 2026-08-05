@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 with mock.patch("headroom.cli._refresh_codex"):
                     with mock.patch(
-                        "headroom.update_check.request.urlopen",
+                        "headroom.update_check._open_pypi",
                         side_effect=AssertionError("network attempted"),
                     ) as opened:
                         with redirect_stdout(output):
@@ -154,7 +154,7 @@ class CliTests(unittest.TestCase):
                     "headroom.cli._installed_version", return_value="development"
                 ):
                     with mock.patch(
-                        "headroom.update_check.request.urlopen",
+                        "headroom.update_check._open_pypi",
                         side_effect=AssertionError("network attempted"),
                     ) as opened:
                         with redirect_stdout(output):
@@ -163,6 +163,41 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             opened.assert_not_called()
             self.assertIn("Last outcome: failed: installed version", output.getvalue())
+
+    def test_doctor_ignores_cache_for_another_installed_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "update-check.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "checked_at": 100.0,
+                        "installed_version": "1.0",
+                        "outcome": "current",
+                        "latest_version": None,
+                        "reason": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = {
+                "CODEX_HOME": str(root / "codex-hooks"),
+                "HEADROOM_STATE_DIR": str(state_dir),
+                "HEADROOM_CODEX_HOME": str(root / "codex"),
+                "HEADROOM_CODEX_RPC": "0",
+                "HEADROOM_UPDATE_CHECK": "0",
+            }
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("headroom.cli._installed_version", return_value="2.0"):
+                    with redirect_stdout(output):
+                        result = cli.main(["doctor"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Last outcome: not checked", output.getvalue())
+            self.assertNotIn("Last outcome: up to date", output.getvalue())
 
     def test_update_prints_commands_without_executing_or_changing_files(self) -> None:
         cases = (
@@ -175,25 +210,43 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             marker = root / "unchanged.txt"
             marker.write_text("original\n", encoding="utf-8")
-            for mode, expected in cases:
-                with self.subTest(mode=mode):
-                    info = InstallInfo(
-                        path=root / "headroom",
-                        mode="source" if mode == "source" else "installed",
-                        version="1.0",
-                        modified_at=None,
-                        commit=None,
-                        update_mode=mode,
-                    )
-                    output = io.StringIO()
-                    with mock.patch("headroom.cli.inspect_install", return_value=info):
-                        with redirect_stdout(output):
-                            result = cli.main(["update"])
+            forbidden = AssertionError("update command executed a process")
+            with mock.patch("subprocess.run", side_effect=forbidden):
+                with mock.patch("subprocess.Popen", side_effect=forbidden):
+                    with mock.patch("os.system", side_effect=forbidden):
+                        with mock.patch("os.execv", side_effect=forbidden):
+                            for mode, expected in cases:
+                                with self.subTest(mode=mode):
+                                    info = InstallInfo(
+                                        path=root / "headroom",
+                                        mode=(
+                                            "source"
+                                            if mode == "source"
+                                            else "installed"
+                                        ),
+                                        version="1.0",
+                                        modified_at=None,
+                                        commit=None,
+                                        update_mode=mode,
+                                    )
+                                    output = io.StringIO()
+                                    with mock.patch(
+                                        "headroom.cli.inspect_install",
+                                        return_value=info,
+                                    ):
+                                        with redirect_stdout(output):
+                                            result = cli.main(["update"])
 
-                    self.assertEqual(result, 0)
-                    self.assertIn(expected, output.getvalue())
-                    self.assertIn("Nothing was changed.", output.getvalue())
-                    self.assertEqual(marker.read_text(encoding="utf-8"), "original\n")
+                                    self.assertEqual(result, 0)
+                                    self.assertIn(expected, output.getvalue())
+                                    self.assertIn(
+                                        "Nothing was changed.",
+                                        output.getvalue(),
+                                    )
+                                    self.assertEqual(
+                                        marker.read_text(encoding="utf-8"),
+                                        "original\n",
+                                    )
 
     def test_version_uses_installed_distribution_metadata(self) -> None:
         output = io.StringIO()

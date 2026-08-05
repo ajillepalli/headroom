@@ -371,10 +371,11 @@ def _print_update_doctor() -> None:
     )
 
     enabled = update_check_enabled()
+    installed_version = _installed_version()
     result = (
-        check_for_update(_installed_version())
+        check_for_update(installed_version)
         if enabled
-        else read_cached_result()
+        else read_cached_result(installed_version=installed_version)
     )
     print()
     print("Update check")
