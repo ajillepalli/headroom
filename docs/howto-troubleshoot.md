@@ -30,6 +30,12 @@ For Claude, confirm that `headroom init` configured the statusline and that Clau
 
 For Codex, use the `Codex source` and `Notes` lines from `doctor`. The app-server may be missing, disabled, timed out, or may have returned no usable Codex bucket. Rollout fallback may report a missing sessions directory or no usable rate limits. A null short bucket is valid, so the Codex 5h line may be unavailable while 7d is present.
 
+## Claude readings look too good on multiple machines
+
+Claude usage can look lower than account-wide usage when you run Claude Code on more than one machine. Each machine has separate local state, and Claude capture sees only the statusline payloads observed on that machine. Its reading can therefore undercount usage from the other machines.
+
+Treat each machine's Claude reading as a lower bound, not an account-complete percentage. Prefer the reading from the machine where you do most of your work. Codex app-server readings do not have this limitation: `account/rateLimits/read` returns account-wide figures regardless of which machine asks. Run `headroom doctor` and check that `Codex source` is `app-server` before relying on that distinction.
+
 ## A reading has a greater-than-or-equal marker
 
 `>=65% used` is a stale lower bound. Usage can only rise before the window resets, so the last percentage remains safe as a minimum. It is not presented as a current estimate.

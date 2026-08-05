@@ -8,6 +8,8 @@ headroom combines two local capture paths. Claude arrives through statusline inp
 
 Claude Code invokes a configured statusline command and sends a JSON document on standard input. Claude Code 2.1.80 and newer include `rate_limits` in that input. headroom reads the whole document whenever Claude Code renders the statusline.
 
+On a multi-machine setup, this capture sees only the statusline payloads observed on that machine, so its Claude reading is a lower bound on account-wide usage. See [Claude readings look too good on multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
+
 The nesting is not fixed, so the parser walks dictionaries and lists recursively. It accepts these bucket spellings:
 
 | Meaning | Accepted fields |
@@ -69,6 +71,8 @@ The verified response has this shape, with other limit buckets allowed beside th
 headroom first searches `rateLimitsByLimitId` for a bucket whose `limitId` is `codex`. If none is found, it uses the top-level `rateLimits` object when present. The RPC spells the duration `windowDurationMins`; rollout records spell it `window_minutes`. The shared parser accepts both, along with the other camel-case and snake-case variants listed in the source.
 
 The `account/rateLimits/read` request costs no Codex quota and creates no session rollout. Those two side effects were checked against Codex 0.146.0.
+
+Unlike Claude statusline capture, this RPC returns account-wide Codex figures regardless of which machine asks. See [Claude readings look too good on multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
 
 The whole exchange shares a default six-second deadline. A timeout, launch failure, protocol error, unusable response, or disabled RPC becomes a diagnostic and leads to rollout fallback. The process is killed and reaped if it does not exit itself.
 
