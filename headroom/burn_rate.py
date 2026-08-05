@@ -209,7 +209,39 @@ class BurnRateProjection:
     ``max_raw_rate_ratio`` is the largest single raw interval's rate,
     divided by the segment's OVERALL rate (total usage delta over total
     elapsed time -- the rate the segment would report if treated as one
-    interval start to finish). Because the overall rate is the
+    interval start to finish). "Total elapsed time" means exactly that:
+    the segment's actual start-to-finish span, ``records[-1].captured_at -
+    records[0].captured_at`` -- the same span this projection reports as
+    ``span_seconds`` -- NOT the sum of only the raw intervals that ended up
+    retained as measurement intervals. Those two can differ by design: a
+    segment's final raw gap can accumulate a real elapsed time too small to
+    stand alone (below MIN_INTERVAL_SECONDS) with no following gap left to
+    carry it into (see ``_consecutive_intervals``). Two different things
+    can happen to that trailing gap, and they must not be confused with
+    each other:
+
+    * If its usage delta is EXACTLY zero, no usage was lost, so nothing
+      declines -- the gap is silently dropped. But its elapsed time is
+      still real and belongs in this ratio's denominator regardless, or
+      the overall rate would be computed over less time than the segment
+      actually spanned, inflating both this ratio and
+      ``longest_above_overall_rate_run`` for a reason that has nothing to
+      do with the segment's actual burn pattern. [(0,0),(60,10),
+      (60.0000005,10)] is the concrete case: the trailing ~5e-7s gap
+      carries no usage, so summing only the retained intervals'
+      elapsed time (60.0s) undercounts the true 60.0000005s span, and
+      reports ``max_raw_rate_ratio=1.0`` and
+      ``longest_above_overall_rate_run=0`` instead of the honest
+      ``1.0000000083...`` and ``1``.
+    * If its usage delta is instead NONZERO, it cannot be silently
+      absorbed either way (dividing by ~microseconds is float noise, not
+      evidence; merging it into the previous interval smears a possibly
+      fast remainder across a span it never ran at -- see
+      ``_TerminalRemainderUnmergeable``). The whole projection declines
+      with ``NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE`` instead,
+      before this field is ever computed.
+
+    Because the overall rate is the
     elapsed-time-weighted average of every raw interval's rate, this ratio
     is mathematically always >= 1.0, with equality only when every raw
     interval runs at exactly the same rate -- but that holds for the exact
@@ -702,7 +734,20 @@ def _consecutive_intervals(
     caller declines the whole projection rather than report a number built
     on either invention. A trailing accumulator whose leftover delta is
     exactly zero needs no such handling: it contributes nothing to the
-    usage total either way, so it is still dropped cleanly, same as before.
+    usage total either way, so it is still dropped cleanly, same as before
+    -- its DELTA, that is, not its elapsed time. That elapsed time is real
+    (the gap between two actual captures happened, it just carried no
+    usage) and is NOT lost: ``_measure_raw_structure`` computes
+    ``max_raw_rate_ratio``'s overall-rate denominator from the segment's
+    full start-to-finish span (``records[-1].captured_at -
+    records[0].captured_at``), not from summing only the intervals this
+    function returns, specifically so a dropped zero-delta remainder's
+    elapsed time is not silently excluded from "the rate the segment would
+    report treated as one interval start to finish." See that function and
+    BurnRateProjection's ``max_raw_rate_ratio`` docstring for the worked
+    example and for how this differs from the nonzero-remainder case
+    handled above, which declines instead of reaching that computation at
+    all.
     """
 
     rates: List[float] = []
@@ -1036,7 +1081,7 @@ def _measure_raw_structure(
     on an unrepresentable rate.
     """
 
-    rates, deltas, elapsed_list = _raw_intervals(records)
+    rates, deltas, _elapsed_list = _raw_intervals(records)
     if not rates:
         # Mirrors _measure_view's own guard and is unreachable through
         # project_exhaustion for the same reason: a nonzero total delta
@@ -1048,15 +1093,32 @@ def _measure_raw_structure(
 
     zero_delta_fraction = _raw_zero_delta_fraction(records)
 
-    # The overall rate is the elapsed-time-weighted average of every raw
-    # interval's rate: sum(delta)/sum(elapsed) == sum(rate*elapsed)/sum(elapsed).
-    # That makes it a fixed reference point comparable across segments with
-    # different interval counts, unlike comparing against the (also
-    # interval-count-sensitive) median _measure_view uses for the folded
-    # deviation.
+    # The overall rate is "the rate the segment would report if treated as
+    # one interval start to finish" (see BurnRateProjection's
+    # max_raw_rate_ratio docstring) -- so its denominator is the segment's
+    # actual start-to-finish span, ``records[-1].captured_at -
+    # records[0].captured_at`` (the same formula _project_group uses for
+    # span_seconds, recomputed here from the identical records list rather
+    # than threaded through as a parameter). This is deliberately NOT
+    # sum(_elapsed_list): _raw_intervals silently drops a trailing
+    # accumulator whose delta is exactly zero (see _consecutive_intervals's
+    # docstring, "A trailing accumulator...exactly zero") -- no usage was
+    # lost, so nothing declines, but that gap's ELAPSED time is real and
+    # summing only the retained intervals would exclude it, shrinking the
+    # denominator and inflating both this ratio and
+    # longest_above_overall_rate_run for no reason connected to the
+    # segment's actual burn pattern. [(0,0),(60,10),(60.0000005,10)] is the
+    # concrete case: the final 5e-7s gap carries no usage (delta 0) so it is
+    # dropped from _raw_intervals's own elapsed sum, but it still elapsed --
+    # sum(_elapsed_list) here would be 60.0, undercounting the true 60.0000005s
+    # span. A NONZERO terminal remainder is a different case entirely,
+    # already handled upstream: it cannot be silently absorbed either way
+    # (see _TerminalRemainderUnmergeable), so the whole projection declines
+    # with NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE before this
+    # function is ever reached, and this ratio is not computed at all.
     total_delta = sum(deltas)
-    total_elapsed = sum(elapsed_list)
-    overall_rate = total_delta / total_elapsed
+    span_seconds = records[-1].captured_at - records[0].captured_at
+    overall_rate = total_delta / span_seconds
     if overall_rate == 0.0:
         # total_delta > 0 here is the same invariant _measure_view relies
         # on (this function is never reached unless latest_usage >
@@ -1069,7 +1131,7 @@ def _measure_raw_structure(
         # already passed through _raw_intervals's own underflow guard), but
         # is guarded rather than assumed away.
         raise _RateUnderflowedToZero(
-            f"total delta {total_delta!r} over {total_elapsed!r}s "
+            f"total delta {total_delta!r} over {span_seconds!r}s "
             "underflowed to a zero overall rate"
         )
 

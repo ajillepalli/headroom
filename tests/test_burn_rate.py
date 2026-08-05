@@ -25,6 +25,7 @@ from headroom.burn_rate import (
     _TerminalRemainderUnmergeable,
     _folded_intervals,
     _interval_measurements,
+    _longest_above_overall_rate_run,
     _pairwise_slopes,
     _project_group,
     _raw_intervals,
@@ -1853,6 +1854,248 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(_relative_difference(-5.0, 0.0), 1.0)
         self.assertEqual(_relative_difference(1.25, 1.0), 0.25)
         self.assertEqual(_relative_difference(0.75, 1.0), 0.25)
+
+    # -- Round 10 findings ---------------------------------------------
+
+    def test_overall_rate_denominator_includes_discarded_terminal_elapsed(
+        self,
+    ) -> None:
+        # (MEDIUM finding, round 10) [(0,0),(60,10),(60.0000005,10)]: the
+        # final ~5e-7s gap carries no usage (delta 0), so it never becomes
+        # its own raw interval and is silently dropped by _raw_intervals
+        # (see _consecutive_intervals's docstring, "A trailing accumulator
+        # whose leftover delta is exactly zero"). Before this fix, the
+        # overall rate's denominator summed only the retained intervals'
+        # elapsed time (60.0s here), excluding that dropped gap's very
+        # real elapsed time -- so it was NOT "the rate the segment would
+        # report if treated as one interval start to finish" as
+        # documented, and reported max_raw_rate_ratio=1.0 and
+        # longest_above_overall_rate_run=0. The documented start-to-finish
+        # span is 60.0000005s (records[-1] - records[0]); dividing by that
+        # instead gives an overall rate a hair below the single retained
+        # interval's own rate (10/60.0), so that interval's ratio against
+        # it is genuinely (not just from rounding) above 1.0, and it forms
+        # a run of length 1, not 0.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 0.0),
+            _HistoryRecord(60.0, None, "claude", "short", 10.0),
+            _HistoryRecord(60.0000005, None, "claude", "short", 10.0),
+        ]
+
+        measurements = _interval_measurements(records)
+
+        assert measurements is not None
+        self._assertClose(measurements.max_raw_rate_ratio, 60.0000005 / 60.0)
+        self.assertGreater(measurements.max_raw_rate_ratio, 1.0)
+        self.assertEqual(measurements.longest_above_overall_rate_run, 1)
+
+    def test_longest_above_overall_rate_run_strict_comparison_at_the_boundary(
+        self,
+    ) -> None:
+        # (MEDIUM test finding, round 10) `rate > overall_rate` mutated to
+        # `rate >= overall_rate` survives every existing test for this
+        # field, because every tested rate is decisively above or below
+        # the overall rate (see
+        # test_longest_above_overall_rate_run_separates_clustered_from_
+        # alternating_burn). A single interval's rate is *always* exactly
+        # equal to the overall rate -- both are literally the same
+        # division, delta/elapsed -- so [1.0] against overall rate 1.0 is
+        # the sharpest possible boundary case: the correct (strict)
+        # comparison gives 0, the mutant gives 1.
+        self.assertEqual(_longest_above_overall_rate_run([1.0], 1.0), 0)
+
+        # All-equal-rate: every interval ties the overall rate exactly, so
+        # a strict > finds nothing above it anywhere in the run, not just
+        # at one point.
+        self.assertEqual(
+            _longest_above_overall_rate_run([2.0, 2.0, 2.0], 2.0), 0
+        )
+
+        # End-to-end companion: a real (non-degenerate) segment whose raw
+        # intervals are all identical in rate must report 0 through the
+        # full pipeline, not just through the helper called directly.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 0.0),
+            _HistoryRecord(60.0, None, "claude", "short", 10.0),
+            _HistoryRecord(120.0, None, "claude", "short", 20.0),
+        ]
+        measurements = _interval_measurements(records)
+        assert measurements is not None
+        self.assertEqual(measurements.longest_above_overall_rate_run, 0)
+
+    def test_longest_above_overall_rate_run_sourced_from_raw_not_folded(
+        self,
+    ) -> None:
+        # (MEDIUM test finding, round 10) The dedicated round-9 test for
+        # this field
+        # (test_longest_above_overall_rate_run_separates_clustered_from_
+        # alternating_burn) never has a zero-delta gap, so raw and folded
+        # rates agree on every one of its fixtures -- a mutation that fed
+        # the FOLDED rates into _longest_above_overall_rate_run instead of
+        # the RAW ones would still pass it. This fixture has a leading
+        # zero-delta gap specifically to make the two views disagree:
+        # [(0,0),(60,0),(120,10),(180,20)].
+        #
+        # Raw view (the correct source): three intervals, rates
+        # [0.0, 1/6, 1/6] -- the last two are adjacent and both above the
+        # overall rate (20/180), giving a run of 2.
+        # Folded view (the wrong source): the leading zero-delta gap folds
+        # forward into the next interval, leaving two intervals, rates
+        # [1/12, 1/6] -- only the second is above the same overall rate,
+        # giving a run of 1.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 0.0),
+            _HistoryRecord(60.0, None, "claude", "short", 0.0),
+            _HistoryRecord(120.0, None, "claude", "short", 10.0),
+            _HistoryRecord(180.0, None, "claude", "short", 20.0),
+        ]
+
+        raw_rates, _, _ = _raw_intervals(records)
+        folded_rates, _, _ = _folded_intervals(records)
+        self.assertEqual(len(raw_rates), 3)
+        self.assertEqual(len(folded_rates), 2)
+
+        overall_rate = 20.0 / 180.0
+        # Confirms the fixture actually discriminates the two sources
+        # before trusting the production call below to be meaningful.
+        self.assertEqual(
+            _longest_above_overall_rate_run(raw_rates, overall_rate), 2
+        )
+        self.assertEqual(
+            _longest_above_overall_rate_run(folded_rates, overall_rate), 1
+        )
+
+        measurements = _interval_measurements(records)
+        assert measurements is not None
+        self.assertEqual(measurements.longest_above_overall_rate_run, 2)
+
+    def test_tiny_terminal_remainder_still_declines(self) -> None:
+        # (MEDIUM test finding, round 10) Every existing terminal-remainder
+        # test uses a remainder of at least 1.0 point, so an
+        # epsilon-tolerance mutation (e.g. treating a delta below 1e-6 as
+        # "close enough to zero" to fold away or drop) would pass all of
+        # them while quietly losing real usage. This is an hours-long,
+        # two-hour-span segment whose terminal delta is 1e-9 -- far
+        # smaller than any tested remainder -- and it must STILL decline
+        # with TERMINAL_REMAINDER_UNMERGEABLE, not fold away, drop, or
+        # merge.
+        #
+        # This also locks in the deliberate, reviewer-endorsed decision
+        # that declining is strict and NOT proportional to remainder size:
+        # a future reader must not "helpfully" add a tolerance here,
+        # because doing so is exactly the failure mode this test exists
+        # to catch.
+        projection = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=None),
+                self._record(3_600.0, 10.0, resets_at=None),
+                self._record(7_200.0, 20.0, resets_at=None),
+                self._record(7_200.0000005, 20.000000001, resets_at=None),
+            ],
+            now=7_201.0,
+        )[0]
+
+        self.assertEqual(
+            projection.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertIsNone(projection.projected_exhaustion_at)
+        self._assertNoMeasurements(projection)
+
+    def test_terminal_remainder_decline_crosses_segmentation_and_sample_cap(
+        self,
+    ) -> None:
+        # (MEDIUM test finding, round 10) Table-driven: none of the
+        # existing terminal-remainder tests put the remainder anywhere
+        # near a segmentation boundary or the MAX_FIT_SAMPLES cap, so a
+        # mutation that scans discarded segments, or that keeps the OLDEST
+        # samples instead of the newest under the cap, survives. Each case
+        # asserts the specific, most informative `reason`, not merely that
+        # the projection declined.
+
+        # (a) A terminal remainder that would be unmergeable sits inside a
+        # segment that a later usage decrease discards entirely (records
+        # 0-2: 0,1,2 at t=0,60,60.0000005). The kept segment (records 3-5:
+        # 0,10,20 at t=120,180,240) is ordinary and must PROJECT normally
+        # -- the discarded segment's dangling small gap must not leak
+        # through and poison it.
+        projection_a = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=None),
+                self._record(60.0, 1.0, resets_at=None),
+                self._record(60.0000005, 2.0, resets_at=None),
+                self._record(120.0, 0.0, resets_at=None),
+                self._record(180.0, 10.0, resets_at=None),
+                self._record(240.0, 20.0, resets_at=None),
+            ],
+            now=241.0,
+        )[0]
+        self.assertIsNone(projection_a.reason)
+        self.assertEqual(projection_a.samples_used, 3)
+        self.assertEqual(projection_a.projected_exhaustion_at, 720.0)
+        self.assertIsNotNone(projection_a.max_relative_deviation)
+
+        # (b) 501 ordinary steady records (i*60s, i*0.1%) followed by one
+        # positive sub-threshold terminal record, for 502 total -- more
+        # than MAX_FIT_SAMPLES. Cap must keep the NEWEST 500 (dropping the
+        # earliest 2), so the terminal-remainder pair (records 500 and
+        # 501) is still present in the retained set and the decline must
+        # still fire. A mutant that kept the OLDEST 500 instead would drop
+        # both records of that pair and this would project normally
+        # instead of declining.
+        records_b = [self._record(float(i) * 60.0, i * 0.1, resets_at=None) for i in range(501)]
+        records_b.append(
+            self._record(500 * 60.0 + 5e-7, 50.05, resets_at=None)
+        )
+        self.assertEqual(len(records_b), 502)
+        projection_b = self._project(
+            records_b, now=records_b[-1]["captured_at"] + 1.0
+        )[0]
+        self.assertEqual(
+            projection_b.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertEqual(projection_b.samples_used, MAX_FIT_SAMPLES)
+
+        # (c) A terminal remainder immediately inside a segment that
+        # starts at a resets_at change (not a usage decrease). The earlier
+        # resets_at=1,000 segment is discarded; the resets_at=2,000
+        # segment ends in the unmergeable remainder and must decline.
+        projection_c = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=1_000.0),
+                self._record(60.0, 10.0, resets_at=1_000.0),
+                self._record(120.0, 20.0, resets_at=1_000.0),
+                self._record(180.0, 0.0, resets_at=2_000.0),
+                self._record(240.0, 10.0, resets_at=2_000.0),
+                self._record(300.0, 20.0, resets_at=2_000.0),
+                self._record(300.0000005, 20.5, resets_at=2_000.0),
+            ],
+            now=301.0000005,
+        )[0]
+        self.assertEqual(
+            projection_c.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertEqual(projection_c.samples_used, 4)
+
+        # (d) A terminal remainder immediately inside a segment that
+        # starts at a usage decrease (the classic segmentation trigger).
+        # The pre-decrease records (0, 60: usage 0, 50) are discarded; the
+        # kept segment (120 onward: 5, 15, 25, 25.5) ends in the
+        # unmergeable remainder and must decline.
+        projection_d = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=1_000.0),
+                self._record(60.0, 50.0, resets_at=1_000.0),
+                self._record(120.0, 5.0, resets_at=1_000.0),
+                self._record(180.0, 15.0, resets_at=1_000.0),
+                self._record(240.0, 25.0, resets_at=1_000.0),
+                self._record(240.0000005, 25.5, resets_at=1_000.0),
+            ],
+            now=241.0000005,
+        )[0]
+        self.assertEqual(
+            projection_d.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertEqual(projection_d.samples_used, 4)
 
 
 if __name__ == "__main__":
