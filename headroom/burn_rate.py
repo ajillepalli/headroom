@@ -34,95 +34,6 @@ MIN_INTERVAL_SECONDS = 1e-6
 # cap keeps the most RECENT readings in the segment rather than the oldest.
 MAX_FIT_SAMPLES = 500
 
-# Two matching intervals is one coincidence, not a pattern: it is
-# indistinguishable from two readings that happen to agree by chance. HIGH
-# confidence claims the rate is dependably steady, so it needs a third
-# independent interval before that claim is defensible.
-MIN_INTERVALS_FOR_HIGH_CONFIDENCE = 3
-
-# HIGH confidence asserts that EVERY interval sampled the same underlying
-# rate, not merely that the intervals agree "on average". A mean-based
-# statistic -- however it is weighted -- can always be satisfied by one
-# catastrophic interval as long as enough agreeing intervals surround it,
-# because averaging is precisely the operation that dilutes an outlier by
-# the size of the crowd around it. This is a hard mathematical ceiling: no
-# choice of weights fixes it (three rounds of review confirmed that: a
-# sign-based check, then a recency-weighted mean, then the worse of a
-# recency-weighted and an unweighted mean all still passed a 500-interval
-# segment where a single interval carried 20% of the total usage change).
-# The only fix is a check that a mean can never launder: the single WORST
-# interval, compared on its own to the group's median rate.
-#
-# A fourth round found this cap (originally 4x, i.e. "off by a factor of
-# 4") still too permissive: an interval at 3.99x the median passed it while
-# carrying 84.7% of the segment's total usage. HIGH claims the median rate
-# describes every interval, so the bar has to be "recognizably the same
-# rate", not merely "the same order of magnitude". 25% relative deviation
-# marks that line -- ordinary sampling jitter and reporting-granularity
-# rounding on a steady process moves a reading by single-digit to
-# low-double-digit percent (see the quantization fixtures in the test
-# suite, built from this project's own captured history), not by a
-# quarter of itself, so an interval 25% off the median is already
-# behaving like a different regime, and HIGH must not claim otherwise.
-# This is stated as a DEVIATION (|rate - median| / median), not a
-# multiplicative ratio like the old constant: deviation is symmetric
-# around zero and gives a rate of exactly 0 a finite, still-well-over-cutoff
-# score (1.0) instead of requiring a special-cased infinity.
-#
-# One consequence worth being explicit about: this per-interval deviation
-# cap is now numerically at least as strict as the old mean-based
-# dispersion check above, at every possible input. A mean (weighted or
-# not) of a set of per-interval deviation ratios can never exceed the
-# largest ratio in that set -- that is what "mean" means. So once every
-# interval's individual deviation is capped at 0.25, the weighted and
-# unweighted dispersion ratios are *already* bounded by 0.25 too; checking
-# them again for HIGH would be checking something already guaranteed.
-# HIGH below therefore gates on this per-interval cap alone (plus the
-# usage-share cap next to it); dispersion_ratio is kept only to place
-# MEDIUM vs LOW, where it still does real work.
-MAX_INTERVAL_RATE_DEVIATION = 0.25
-
-# The deviation cap above bounds a RATIO -- how far off the median an
-# interval's rate runs -- but the harm HIGH must guard against is a
-# question of SHARE: how much of the segment's total usage change that one
-# interval is responsible for. These are different quantities and a bound
-# on one does not bound the other: an interval can sit well inside the
-# rate-deviation cap and still supply nearly all of the observed usage, if
-# it is simply much longer than the intervals around it (this is exactly
-# how the round-4 fixture passed the old ratio-only gate: 3.99x is a
-# tight ratio, but that one interval was 1000 seconds long against
-# neighbors 60 seconds long, so it carried the overwhelming majority of
-# the evidence). HIGH claims the fitted rate is corroborated by the
-# segment as a whole, not smuggled in by one interval that simply
-# happened to run the longest. A cap of 0.5 encodes "no single interval
-# may supply a MAJORITY of the observed usage change" -- if a single
-# interval accounts for more than half, the other intervals combined
-# supply less evidence than that one interval alone, and the claim that
-# "every interval agrees" has degenerated into "one interval, weakly
-# seconded by a minority of the total evidence."
-#
-# This does mean a genuinely steady rate sampled very unevenly -- one
-# interval spanning most of the segment's elapsed time (e.g. a long idle
-# gap between captures) -- can be held to MEDIUM even though its rate
-# matches everyone else's exactly. That is a real, known trade-off, not an
-# oversight: seen in isolation, a single dominant-by-duration interval is
-# indistinguishable from a single dominant-by-anomaly interval (the exact
-# failure this cap exists to catch), and nothing in a single pairwise
-# comparison can tell those two cases apart. Preferring the occasional
-# false MEDIUM on legitimately steady but unevenly-sampled data over a
-# false HIGH on data actually dominated by one bad interval is the
-# intended, conservative choice.
-MAX_INTERVAL_USAGE_SHARE = 0.5
-
-
-class ProjectionConfidence(str, Enum):
-    """How consistently the history supports the fitted direction."""
-
-    NONE = "none"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
 
 class NoProjectionReason(str, Enum):
     """Why an exhaustion time could not be defended."""
@@ -134,7 +45,6 @@ class NoProjectionReason(str, Enum):
     FLAT_USAGE = "flat_usage"
     USAGE_WENT_BACKWARDS = "usage_went_backwards"
     NON_POSITIVE_RATE = "non_positive_rate"
-    LOW_CONFIDENCE = "low_confidence"
     WINDOW_ALREADY_RESET = "window_already_reset"
     NON_FINITE_RESULT = "non_finite_result"
     PROJECTED_EXHAUSTION_IN_PAST = "projected_exhaustion_in_past"
@@ -166,6 +76,87 @@ class BurnRateProjection:
     let a non-finite span escape to a caller, it is None whenever the true
     span cannot be represented as a finite float; ``reason`` is then
     ``NON_FINITE_RESULT``. A non-None ``span_seconds`` is always finite.
+
+    ``max_relative_deviation``, ``max_usage_share``, ``intervals_used``,
+    ``rate_drift``, and ``effective_intervals`` report how consistent the
+    fitted rate was with the segment's own recent history. This module used
+    to collapse those numbers into a HIGH/MEDIUM/LOW confidence tier, but
+    four consecutive rounds of adversarial review moved the same fight to a
+    different threshold every time (a slope sign, then a dispersion mean,
+    then a rate-ratio cap, then a usage-share cap -- each one gameable from
+    just underneath). The abstraction was the defect: whether a given
+    deviation or share is "acceptable" depends on what the caller does with
+    the projection (a status line and an automated cutoff switch tolerate
+    very different risk), and that is a policy question this module cannot
+    answer once for every caller. So it reports the measurements instead and
+    takes no position on what threshold, if any, a caller should apply. A
+    projection being returned at all (``reason`` is None) is NOT itself a
+    claim that the underlying rate is steady -- these five fields are how a
+    caller judges that for itself. All five are None exactly when no
+    projection was made (``reason`` is set).
+
+    Each is built from the segment's consecutive, non-overlapping intervals
+    (independent evidence, unlike the combinatorial pairwise slopes used to
+    fit ``rate_percent_per_second`` itself), after folding any interval whose
+    usage delta is EXACTLY zero forward into the next interval that actually
+    changed. That folding matters on real data: this project's own captures
+    report ``used_percentage`` as a whole number (see
+    ``_records_since_latest_reset``'s "57 -> 56 -> 57" note), so a genuinely
+    sub-point-per-interval rate reports as a long run of zero-delta readings
+    interrupted by occasional single-point jumps. Treating each zero-delta
+    reading as its own independent interval manufactures a median interval
+    rate of 0 out of quantization alone, which then scores every real jump as
+    maximally different from "the" rate even though nothing is actually
+    unstable -- an adversarial review of this module's own history found
+    every one of a real capture history's short-window segments scored the
+    worst tier for exactly this reason. Folding is not a tuned tolerance: it
+    only merges intervals that reported literally no change, so a segment
+    with no quantization (every raw delta already nonzero) is untouched by
+    it. ``intervals_used`` counts these post-folding intervals, so it can be
+    smaller than ``samples_used - 1``; the difference is how many zero-delta
+    readings were folded away.
+
+    ``max_relative_deviation`` is the largest |interval_rate - median_rate| /
+    median_rate across those intervals. LOW means every interval's rate sat
+    close to the group's median; HIGH means at least one interval ran at a
+    rate very different from the rest. The median can only be exactly zero if
+    at least half the folded intervals report a zero rate, which folding
+    itself rules out (every folded interval has a strictly positive delta by
+    construction, so every rate here is strictly positive too) -- but the
+    ratio's zero-baseline case is still defined, not left to divide by zero,
+    as a defensive convention: 0.0 if every interval is exactly zero (trivial
+    agreement) and 1.0 (maximal, but finite) otherwise. This field is always
+    finite -- never inf or nan -- whenever it is not None.
+
+    ``max_usage_share`` is the largest fraction of the segment's total usage
+    delta contributed by any single interval. LOW means no one interval
+    dominates the evidence; HIGH (approaching 1.0) means the fitted rate
+    rests mostly on one interval -- which can mean a genuine anomaly, or,
+    innocently, that the interval simply ran far longer than its neighbors
+    (a laptop asleep overnight produces one long, unremarkable interval that
+    still supplies most of the segment's elapsed time and usage). This field
+    alone cannot tell those two cases apart.
+
+    ``rate_drift`` compares the segment's early portion to its late portion:
+    split the (folded) intervals in half by count, take each half's
+    time-weighted rate (total delta over total elapsed within that half), and
+    report the relative difference between them, using the same zero-baseline
+    convention as ``max_relative_deviation``. Per-interval deviation and share
+    are both LOCAL measures -- each compares one interval against the rest --
+    so neither can see a rate that climbs steadily across many intervals that
+    are each individually unremarkable. ``rate_drift`` is defined as 0.0 for
+    a single-interval segment, where there is no second portion to compare.
+
+    ``effective_intervals`` is the usual inverse-Herfindahl measure of how
+    concentrated the usage-share weights are across the folded intervals:
+    ``total_delta**2 / sum(delta**2 for delta in deltas)``. It is 1.0 if one
+    interval supplies the entire usage delta and ``intervals_used`` if every
+    interval supplies an equal share. ``max_usage_share`` alone answers "how
+    big is the single worst interval"; it cannot see a small CLUSTER of
+    intervals jointly dominating while each one individually stays under any
+    per-interval share. A projection can have a low ``max_relative_deviation``
+    and a low ``max_usage_share`` and still rest on very little independent
+    evidence if ``effective_intervals`` is far below ``intervals_used``.
     """
 
     source: str
@@ -175,8 +166,12 @@ class BurnRateProjection:
     exhaustion_precedes_reset: Optional[bool]
     samples_used: int
     span_seconds: Optional[float]
-    confidence: ProjectionConfidence
     reason: Optional[NoProjectionReason] = None
+    max_relative_deviation: Optional[float] = None
+    max_usage_share: Optional[float] = None
+    intervals_used: Optional[int] = None
+    rate_drift: Optional[float] = None
+    effective_intervals: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -344,7 +339,6 @@ def _project_group(
     def unavailable(
         reason: NoProjectionReason,
         rate: Optional[float] = None,
-        confidence: ProjectionConfidence = ProjectionConfidence.NONE,
     ) -> BurnRateProjection:
         return BurnRateProjection(
             source=source,
@@ -354,7 +348,6 @@ def _project_group(
             exhaustion_precedes_reset=None,
             samples_used=samples_used,
             span_seconds=span_seconds,
-            confidence=confidence,
             reason=reason,
         )
 
@@ -401,22 +394,21 @@ def _project_group(
     ):
         return unavailable(NoProjectionReason.NON_FINITE_RESULT, None)
 
-    confidence = _confidence_for_records(records)
     if span_seconds < horizon_seconds * MIN_SPAN_TO_HORIZON_RATIO:
-        return unavailable(
-            NoProjectionReason.INSUFFICIENT_SPAN_FOR_HORIZON,
-            rate,
-            confidence,
-        )
-    if confidence is ProjectionConfidence.LOW:
-        return unavailable(NoProjectionReason.LOW_CONFIDENCE, rate, confidence)
+        return unavailable(NoProjectionReason.INSUFFICIENT_SPAN_FOR_HORIZON, rate)
     if projected_at < now:
         # The rate is stale enough that, projected forward, we'd already be
         # past exhaustion by "now" without a fresher reading confirming it.
         # Stating a past timestamp as a live projection is not defensible.
-        return unavailable(
-            NoProjectionReason.PROJECTED_EXHAUSTION_IN_PAST, rate, confidence
-        )
+        return unavailable(NoProjectionReason.PROJECTED_EXHAUSTION_IN_PAST, rate)
+
+    measurements = _interval_measurements(records)
+    if measurements is None:
+        # Structurally unreachable in practice (see _interval_measurements),
+        # but if it ever is reached, a non-finite diagnostic must not leak
+        # out any more than a non-finite rate or span may -- decline the
+        # whole projection rather than hand back a partially-finite result.
+        return unavailable(NoProjectionReason.NON_FINITE_RESULT, rate)
 
     resets_at = latest.resets_at
     precedes_reset = None if resets_at is None else projected_at < resets_at
@@ -428,7 +420,11 @@ def _project_group(
         exhaustion_precedes_reset=precedes_reset,
         samples_used=samples_used,
         span_seconds=span_seconds,
-        confidence=confidence,
+        max_relative_deviation=measurements.max_relative_deviation,
+        max_usage_share=measurements.max_usage_share,
+        intervals_used=measurements.intervals_used,
+        rate_drift=measurements.rate_drift,
+        effective_intervals=measurements.effective_intervals,
     )
 
 
@@ -447,137 +443,173 @@ def _pairwise_slopes(records: List[_HistoryRecord]) -> List[float]:
     return slopes
 
 
-def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfidence:
-    """Rate confidence by how CONSISTENT the burn rate is, not by its sign.
+@dataclass(frozen=True)
+class _IntervalMeasurements:
+    """The five diagnostic numbers folded into a successful projection."""
 
-    Usage is monotonic within a segment, so nearly every pairwise slope is
-    positive; a sign-based check is close to tautological and was the root
-    cause of a real bug (a single 1-second terminal burst after hours of
-    near-flat usage previously scored HIGH confidence). Instead this looks at
-    consecutive, non-overlapping intervals (independent evidence, unlike the
-    combinatorial pairwise slopes used for the rate itself) and measures how
-    much they disagree: the mean absolute deviation from the median interval
-    rate, normalized by that median, computed two ways and combined.
+    max_relative_deviation: float
+    max_usage_share: float
+    intervals_used: int
+    rate_drift: float
+    effective_intervals: float
 
-    Recency weighting (oldest interval weight 1, newest weight N) matters
-    because a burst in the most recent interval is exactly what would
-    corrupt a near-term projection. But recency weighting alone can also
-    dilute a single wildly deviant interval into irrelevance purely because
-    of where it sits in the sequence: 500 one-second readings where the
-    FIRST interval carries half the entire quota still scored a
-    recency-weighted dispersion of ~0.004 (HIGH) because that interval's
-    weight of 1 was swamped by 499 agreeing neighbors weighted up to 499.
-    An unweighted (equal-weight) mean absolute deviation acts as a veto
-    against exactly that: it cannot be diluted by position, so a single
-    interval that disagrees sharply with the rest keeps its full statistical
-    weight regardless of whether it is oldest or newest. Taking the WORSE
-    (larger) of the weighted and unweighted ratios means either kind of
-    inconsistency -- a recent burst or a single buried outlier -- can veto
-    HIGH confidence.
 
-    Both of the above are still MEANS, and a mean of N numbers can always be
-    kept small by making N large enough: a single interval consuming 20% of
-    the segment's total usage change, spread across 500 total intervals,
-    produces an unweighted mean deviation ratio that lands just UNDER the
-    (then 0.25) HIGH cutoff (proven in
-    test_dominant_interval_diluted_across_many_samples_is_not_high_confidence
-    below). No mean-based statistic can close this gap, because dilution by
-    sample count is exactly what a mean does. What cannot be diluted by
-    sample count is a MAXIMUM: comparing each interval's rate to the
-    group's median individually, keeping only the single worst ratio. See
-    MAX_INTERVAL_RATE_DEVIATION for what that ratio means.
+def _folded_intervals(
+    records: List[_HistoryRecord],
+) -> Tuple[List[float], List[float], List[float]]:
+    """Build the (rate, delta, elapsed) triples _interval_measurements uses.
 
-    A fourth round found even the max-based check gameable, by a route the
-    ratio alone cannot see: an interval can sit just inside the ratio cap
-    and still supply almost all of the segment's usage, if it simply runs
-    much longer than its neighbors (a 1000-second interval at 3.99x the
-    median rate next to twelve 60-second intervals -- comfortably under
-    the old 4x cap, but 84.7% of the segment's total usage change came from
-    that one interval). Rate ratio and usage share are different
-    quantities; a bound on one does not bound the other. See
-    MAX_INTERVAL_USAGE_SHARE for what that second, independent bound means.
-    Both this cap and MAX_INTERVAL_RATE_DEVIATION can veto HIGH on their
-    own; HIGH requires both to pass.
+    Consecutive, non-overlapping intervals are used here (not the
+    combinatorial pairwise slopes _pairwise_slopes builds for the fitted
+    rate) because they are independent evidence: each raw capture appears in
+    exactly one interval, so one bad reading corrupts only the interval it
+    touches, unlike a pairwise slope where it corrupts every pair built from
+    it.
 
-    The mean-based dispersion ratio computed above is, as of the
-    MAX_INTERVAL_RATE_DEVIATION tightening, mathematically unable to
-    exceed that per-interval cap once every interval individually passes
-    it (a mean of values each <= X is itself <= X), so it is no longer
-    checked again for HIGH -- checking it would only ever restate a
-    conclusion the per-interval cap already reached. It still decides
-    MEDIUM vs LOW below, where no per-interval or share-based cap
-    substitutes for it: broad, evenly-spread disagreement with no single
-    outlier interval is exactly the shape it exists to catch.
-
-    HIGH additionally requires at least MIN_INTERVALS_FOR_HIGH_CONFIDENCE
-    independent intervals: two intervals agreeing is one coincidence, not a
-    demonstrated pattern, and is indistinguishable from chance agreement.
+    A raw interval whose usage delta is EXACTLY zero is folded forward into
+    the next reading that actually changed, instead of being kept as its own
+    zero-rate interval. See BurnRateProjection's docstring for why: real
+    captures round used_percentage to whole points, so a genuinely
+    sub-point-per-interval rate reports as a long run of zero-delta readings
+    interrupted by occasional single-point jumps, and treating each
+    zero-delta reading as independent evidence manufactures instability out
+    of quantization alone. This folding is exact, not a tuned tolerance: it
+    only merges intervals that reported literally no change, so a segment
+    where every raw delta is already nonzero is completely unaffected.
     """
 
-    intervals = []
-    # Raw (signed, un-normalized) usage delta per interval, kept parallel to
-    # intervals so the usage-share check below can weigh each interval by
-    # how much of the segment's total change it actually contributed,
-    # independent of how that delta and the interval's elapsed time combine
-    # into a rate.
-    deltas = []
+    rates: List[float] = []
+    deltas: List[float] = []
+    elapsed_list: List[float] = []
+    accumulated_delta = 0.0
+    accumulated_elapsed = 0.0
     for index in range(1, len(records)):
         previous = records[index - 1]
         current = records[index]
         elapsed = current.captured_at - previous.captured_at
         if elapsed < MIN_INTERVAL_SECONDS:
             continue
-        delta = current.used_percentage - previous.used_percentage
-        rate = delta / elapsed
+        accumulated_delta += current.used_percentage - previous.used_percentage
+        accumulated_elapsed += elapsed
+        if accumulated_delta == 0.0:
+            continue
+        rate = accumulated_delta / accumulated_elapsed
         if math.isfinite(rate):
-            intervals.append(rate)
-            deltas.append(delta)
+            rates.append(rate)
+            deltas.append(accumulated_delta)
+            elapsed_list.append(accumulated_elapsed)
+        accumulated_delta = 0.0
+        accumulated_elapsed = 0.0
+    return rates, deltas, elapsed_list
 
-    if len(intervals) < 2:
-        # Only one independent interval means there is no second, separate
-        # observation to check it against: nothing here supports HIGH.
-        return ProjectionConfidence.LOW
 
-    center = median(intervals)
-    if center == 0.0:
-        return ProjectionConfidence.LOW
+def _relative_difference(value: float, baseline: float) -> float:
+    """|value - baseline| / baseline, with a finite convention at baseline 0.
 
-    weighted_deviation = 0.0
-    weight_total = 0.0
-    unweighted_deviation = 0.0
-    for rank, rate in enumerate(intervals, start=1):
-        deviation = abs(rate - center)
-        weighted_deviation += rank * deviation
-        weight_total += rank
-        unweighted_deviation += deviation
-    weighted_ratio = (weighted_deviation / weight_total) / abs(center)
-    unweighted_ratio = (unweighted_deviation / len(intervals)) / abs(center)
-    dispersion_ratio = max(weighted_ratio, unweighted_ratio)
+    A zero baseline has no positive scale to express a RATIO against, so
+    "how many times bigger" is undefined by division. This is defined
+    instead as 0.0 when value also equals the (zero) baseline -- trivial
+    agreement -- and 1.0 (maximal, but finite) for any other value, so the
+    result is always finite here, never inf or nan, regardless of baseline.
 
-    # The max-based veto: how far the SINGLE worst interval sits from the
-    # median, regardless of how many agreeing intervals surround it. An
-    # interval at exactly the median rate scores 0.0; stated as a deviation
-    # rather than a ratio, a rate of 0 against a positive median scores a
-    # finite 1.0 (100% off) rather than needing a special-cased infinity --
-    # see MAX_INTERVAL_RATE_DEVIATION for why 0.25 is the cutoff.
-    max_relative_deviation = max(abs(rate - center) / abs(center) for rate in intervals)
+    Every current caller passes a strictly positive baseline in practice:
+    _folded_intervals only ever emits intervals with a strictly positive
+    delta (usage is non-decreasing within a segment and an interval is only
+    recorded once its accumulated delta is nonzero), so every rate and every
+    half-segment rate built from those intervals is itself strictly
+    positive, and the baseline==0.0 branch below can never actually run
+    through project_exhaustion. It is kept as an explicit branch rather than
+    an assumption so this function stays correct if that guarantee is ever
+    loosened, and so the zero-baseline convention itself stays directly
+    testable without needing to defeat the folding guarantee to construct a
+    test case.
+    """
+    if baseline == 0.0:
+        return 0.0 if value == 0.0 else 1.0
+    return abs(value - baseline) / abs(baseline)
 
-    # The share-based veto: how much of the segment's total usage change
-    # the single largest interval is responsible for. Guarded against
-    # total_delta <= 0 even though it should be unreachable here (center
-    # != 0 was already checked, and usage is non-decreasing within a
-    # segment, so the deltas summed below should be positive) -- treating
-    # that impossible case as maximal share is the fail-safe direction: it
-    # can only ever cost an unwarranted HIGH, never grant one.
+
+def _interval_measurements(
+    records: List[_HistoryRecord],
+) -> Optional[_IntervalMeasurements]:
+    """Measure how consistent the segment's folded intervals are.
+
+    See BurnRateProjection's docstring for what each of the five numbers
+    means and why the library reports them instead of collapsing them into
+    a tier.
+    """
+
+    rates, deltas, elapsed_list = _folded_intervals(records)
+    if not rates:
+        # Structurally unreachable through project_exhaustion: by the time
+        # this runs, latest_usage > first_usage is already established, so
+        # the raw deltas summed across the whole segment are positive, which
+        # guarantees the accumulator above closes on a nonzero delta at
+        # least once. Guarded anyway so a future direct caller of this
+        # private function gets "no measurement" rather than a crash from
+        # median()/max() on empty input.
+        return None
+
+    center = median(rates)
+    max_relative_deviation = max(_relative_difference(rate, center) for rate in rates)
+
     total_delta = sum(deltas)
+    # total_delta <= 0 should be unreachable: every accumulated delta above
+    # is a sum of non-negative raw deltas (usage is non-decreasing within a
+    # segment) that is nonzero by construction, so it is strictly positive,
+    # and so is their sum. Guarded in the fail-safe direction anyway: this
+    # can only make the reported share look MORE cautious, never less.
     max_usage_share = (max(deltas) / total_delta) if total_delta > 0.0 else 1.0
 
-    if (
-        len(intervals) >= MIN_INTERVALS_FOR_HIGH_CONFIDENCE
-        and max_relative_deviation <= MAX_INTERVAL_RATE_DEVIATION
-        and max_usage_share <= MAX_INTERVAL_USAGE_SHARE
+    # Effective number of intervals: the usual inverse-Herfindahl measure of
+    # how concentrated the usage-share weights are (1.0 if one interval
+    # supplies everything, len(deltas) if every interval supplies an equal
+    # share). max_usage_share alone answers "how big is the single worst
+    # interval"; it cannot tell a genuine single dominant interval apart
+    # from a small CLUSTER of intervals that jointly dominate while each
+    # individually stays under any per-interval share.
+    sum_of_squares = sum(delta * delta for delta in deltas)
+    effective_intervals = (total_delta * total_delta) / sum_of_squares
+
+    # Whole-series drift: does the rate measured over the segment's first
+    # half look like the rate measured over its second half? Per-interval
+    # deviation and share are both LOCAL -- each compares one interval
+    # against the rest -- so neither can see a rate that climbs steadily
+    # across many intervals that are each individually unremarkable next to
+    # their immediate neighbors.
+    if len(rates) < 2:
+        # One interval has no second portion to compare against; this is
+        # defined as 0.0 (no evidence of drift) rather than left undefined.
+        rate_drift = 0.0
+    else:
+        midpoint = len(rates) // 2
+        early_elapsed = sum(elapsed_list[:midpoint])
+        late_elapsed = sum(elapsed_list[midpoint:])
+        early_rate = sum(deltas[:midpoint]) / early_elapsed
+        late_rate = sum(deltas[midpoint:]) / late_elapsed
+        rate_drift = _relative_difference(late_rate, early_rate)
+
+    if not all(
+        math.isfinite(value)
+        for value in (
+            max_relative_deviation,
+            max_usage_share,
+            effective_intervals,
+            rate_drift,
+        )
     ):
-        return ProjectionConfidence.HIGH
-    if dispersion_ratio <= 0.75:
-        return ProjectionConfidence.MEDIUM
-    return ProjectionConfidence.LOW
+        # Never let a non-finite diagnostic escape to a caller, matching
+        # every other finiteness gate in this module. Extreme finite inputs
+        # (deltas near the float range limit) could in principle overflow a
+        # sum of squares even though every individual value is finite; the
+        # honest response is to decline, not hand back a partly-finite
+        # result.
+        return None
+
+    return _IntervalMeasurements(
+        max_relative_deviation=max_relative_deviation,
+        max_usage_share=max_usage_share,
+        intervals_used=len(rates),
+        rate_drift=rate_drift,
+        effective_intervals=effective_intervals,
+    )

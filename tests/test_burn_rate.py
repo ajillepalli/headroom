@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import statistics
 import tempfile
 import time
 import tracemalloc
@@ -14,19 +15,16 @@ from unittest import mock
 
 from headroom.burn_rate import (
     MAX_FIT_SAMPLES,
-    MAX_INTERVAL_RATE_DEVIATION,
-    MAX_INTERVAL_USAGE_SHARE,
     MIN_INTERVAL_SECONDS,
-    MIN_INTERVALS_FOR_HIGH_CONFIDENCE,
     MIN_SPAN_TO_HORIZON_RATIO,
     MIN_SAMPLES,
     BurnRateProjection,
     NoProjectionReason,
-    ProjectionConfidence,
     _HistoryRecord,
-    _confidence_for_records,
+    _interval_measurements,
     _pairwise_slopes,
     _project_group,
+    _relative_difference,
     project_exhaustion,
 )
 
@@ -70,6 +68,31 @@ class BurnRateTests(unittest.TestCase):
             "window": window,
         }
 
+    def _assertClose(
+        self,
+        actual: Optional[float],
+        expected: float,
+        rel_tol: float = 1e-9,
+    ) -> None:
+        # A tight relative tolerance (not a loose ">"/"<" assertion) so a
+        # mutation to the underlying computation is caught rather than
+        # absorbed -- mutation audits on this file's old tier-based tests
+        # found that loose assertions ("large enough", "not HIGH") survived
+        # mutated cutoffs across three separate review rounds.
+        self.assertIsNotNone(actual)
+        assert actual is not None  # narrows for mypy/readers
+        self.assertTrue(
+            math.isclose(actual, expected, rel_tol=rel_tol, abs_tol=1e-9),
+            f"{actual!r} not close to {expected!r}",
+        )
+
+    def _assertNoMeasurements(self, projection: BurnRateProjection) -> None:
+        self.assertIsNone(projection.max_relative_deviation)
+        self.assertIsNone(projection.max_usage_share)
+        self.assertIsNone(projection.intervals_used)
+        self.assertIsNone(projection.rate_drift)
+        self.assertIsNone(projection.effective_intervals)
+
     def test_flat_usage_yields_no_projection_and_reason(self) -> None:
         projection = self._project(
             [
@@ -82,6 +105,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertIsNone(projection.projected_exhaustion_at)
         self.assertIsNone(projection.exhaustion_precedes_reset)
         self.assertEqual(projection.reason, NoProjectionReason.FLAT_USAGE)
+        self._assertNoMeasurements(projection)
 
     def test_real_weekly_shape_is_too_short_for_projection_horizon(self) -> None:
         projection = self._project(
@@ -107,6 +131,10 @@ class BurnRateTests(unittest.TestCase):
             projection.reason,
             NoProjectionReason.INSUFFICIENT_SPAN_FOR_HORIZON,
         )
+        # INSUFFICIENT_SPAN_FOR_HORIZON declines the projection, so it
+        # carries no measurements either -- there is nothing for a caller
+        # to judge the steadiness of when there is no projected exhaustion.
+        self._assertNoMeasurements(projection)
 
     def test_short_horizon_projects_from_two_hours_of_evidence(self) -> None:
         projection = self._project(
@@ -121,11 +149,17 @@ class BurnRateTests(unittest.TestCase):
         self.assertAlmostEqual(projection.projected_exhaustion_at or 0.0, 9_600.0)
         self.assertTrue(projection.exhaustion_precedes_reset)
         self.assertIsNone(projection.reason)
+        # Two equal 3,600s intervals, each climbing 30 points: a perfectly
+        # steady rate with no dilution.
+        self._assertClose(projection.max_relative_deviation, 0.0)
+        self._assertClose(projection.max_usage_share, 0.5)
+        self.assertEqual(projection.intervals_used, 2)
+        self._assertClose(projection.rate_drift, 0.0)
+        self._assertClose(projection.effective_intervals, 2.0)
 
     def test_weekly_projection_with_several_days_of_evidence(self) -> None:
         # Four points (three consecutive intervals, all at the same 25%-per-
-        # 172800s rate) so this clears MIN_INTERVALS_FOR_HIGH_CONFIDENCE: two
-        # agreeing intervals is one coincidence, not a demonstrated pattern.
+        # 172800s rate): a clean, evenly-spread steady series.
         projection = self._project(
             [
                 self._record(0.0, 20.0, resets_at=604_800.0, window="weekly"),
@@ -140,14 +174,22 @@ class BurnRateTests(unittest.TestCase):
             552_960.0,
         )
         self.assertTrue(projection.exhaustion_precedes_reset)
-        self.assertEqual(projection.confidence, ProjectionConfidence.HIGH)
         self.assertIsNone(projection.reason)
+        self._assertClose(projection.max_relative_deviation, 0.0)
+        self._assertClose(projection.max_usage_share, 1.0 / 3.0)
+        self.assertEqual(projection.intervals_used, 3)
+        self._assertClose(projection.rate_drift, 0.0)
+        self._assertClose(projection.effective_intervals, 3.0)
 
-    def test_low_confidence_never_emits_exhaustion_boolean(self) -> None:
+    def test_uneven_intervals_still_project_and_report_the_disagreement(
+        self,
+    ) -> None:
         # Monotonic (no decreases, so segmentation leaves all 5 samples in
-        # play) but with wildly uneven per-interval rates: +20, +2, +23, +2.
-        # That inconsistency, not the old sign-based check, is what must
-        # drive LOW confidence here.
+        # play) but with wildly uneven per-interval rates: +20, +2, +23, +2
+        # over 1,800s intervals. Confidence tiering used to veto this
+        # outright (LOW_CONFIDENCE); the continuous library has no veto, so
+        # it must still project, while reporting numbers that make the
+        # disagreement plain to a caller.
         projection = self._project(
             [
                 self._record(0.0, 10.0, resets_at=20_000.0),
@@ -159,32 +201,24 @@ class BurnRateTests(unittest.TestCase):
         )[0]
 
         self.assertEqual(projection.samples_used, 5)
-        self.assertEqual(projection.confidence, ProjectionConfidence.LOW)
-        self.assertIsNone(projection.projected_exhaustion_at)
-        self.assertIsNone(projection.exhaustion_precedes_reset)
-        self.assertEqual(projection.reason, NoProjectionReason.LOW_CONFIDENCE)
+        self.assertIsNone(projection.reason)
+        self.assertIsNotNone(projection.projected_exhaustion_at)
+        # No raw delta here is zero, so folding is a no-op: intervals_used is
+        # the raw consecutive-interval count.
+        self.assertEqual(projection.intervals_used, 4)
+        self._assertClose(projection.max_relative_deviation, 1.0909090909090908)
+        self._assertClose(projection.max_usage_share, 0.48936170212765956)
+        self._assertClose(projection.rate_drift, 0.13636363636363624)
+        self._assertClose(projection.effective_intervals, 2.3575240128068304)
 
     # -- Regression tests for the second-round Codex P2 confidence review --
+    # (kept as the historical record of what this metric must expose, now
+    # asserting the measured values rather than a since-deleted tier)
 
-    def test_first_interval_carrying_half_the_quota_is_not_high_confidence(
-        self,
-    ) -> None:
+    def test_first_interval_carrying_half_the_quota(self) -> None:
         # (Codex P2, round 2) 500 one-second readings: the first interval
         # alone jumps usage from 0 to 50 (half the entire quota in one
         # interval), then 498 more intervals each add a steady +0.1.
-        #
-        # This originally isolated the unweighted-mean veto (recency
-        # weighting alone diluted this to a ~0.004 recency-weighted
-        # dispersion ratio, which was HIGH under the then-current check).
-        # That isolation no longer exists to test: round 4 replaced the
-        # mean-based checks in the HIGH gate with a per-interval cap that
-        # a mean can never be stricter than (see _confidence_for_records),
-        # so mean weighting is not part of how HIGH is decided any more.
-        # Kept as a plain regression case instead -- required by the round-4
-        # review's verification checklist -- now caught directly by
-        # MAX_INTERVAL_RATE_DEVIATION (this interval runs at 500x the
-        # 0.1 median rate) and independently by MAX_INTERVAL_USAGE_SHARE
-        # (50.1% of the segment's total usage came from this one interval).
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
         usage = 50.0
         for index in range(1, 500):
@@ -193,22 +227,21 @@ class BurnRateTests(unittest.TestCase):
             )
             usage += 0.1
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        # The dominant interval runs at 500x the 0.1 median rate...
+        self._assertClose(measurements.max_relative_deviation, 499.0000000000284)
+        # ...and alone supplies just over half the segment's total usage.
+        self._assertClose(measurements.max_usage_share, 0.5010020040080253)
+        self.assertEqual(measurements.intervals_used, 499)
+        # Effective intervals collapses from 499 raw intervals to ~4: nearly
+        # all the "evidence" is really just this one interval.
+        self._assertClose(measurements.effective_intervals, 3.976095617529735)
 
-    def test_three_intervals_with_one_early_deviation_is_not_high_confidence(
-        self,
-    ) -> None:
+    def test_three_intervals_with_one_early_deviation(self) -> None:
         # (Codex P2, round 2) Exactly three intervals with rates [2, 1, 1]:
-        # the first interval disagrees with the other two by 100%. This
-        # used to isolate the unweighted-mean veto specifically (recency
-        # weighting alone gave a weighted dispersion ratio of ~0.167, under
-        # the old 0.25 cutoff, because the deviant interval was also
-        # oldest and lowest-weighted). As above, HIGH no longer consults a
-        # mean at all: this is now rejected directly by
-        # MAX_INTERVAL_RATE_DEVIATION -- the first interval's rate is 100%
-        # off the median of the other two, four times the 25% cutoff.
+        # the first interval disagrees with the other two by 100%.
         records = [
             _HistoryRecord(0.0, None, "claude", "short", 0.0),
             _HistoryRecord(1.0, None, "claude", "short", 2.0),
@@ -216,58 +249,47 @@ class BurnRateTests(unittest.TestCase):
             _HistoryRecord(3.0, None, "claude", "short", 4.0),
         ]
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 1.0)
+        self._assertClose(measurements.max_usage_share, 0.5)
+        self.assertEqual(measurements.intervals_used, 3)
 
-    def test_two_intervals_can_never_reach_high_confidence(self) -> None:
-        # (Codex P2, round 2) Exactly two intervals, both at rate 1.0 -- a
-        # PERFECT match, chosen deliberately so this isolates
-        # MIN_INTERVALS_FOR_HIGH_CONFIDENCE alone. (The original round-2
-        # fixture here was rates [1, 1.5]: a 60%-of-total usage share for
-        # the larger interval, which round 4's MAX_INTERVAL_USAGE_SHARE
-        # cutoff of 50% now also rejects independently, so it stopped
-        # isolating the count gate the moment that cap was added -- the
-        # same loss of isolation the round-4 review's P3 finding flagged
-        # for a different fixture. An exact match with an equal 50/50
-        # usage split clears both the deviation cap (0.0) and the share
-        # cap (0.5, at the boundary) with no ambiguity left over, so only
-        # the count requirement can be doing the rejecting below.)
-        # Two intervals agreeing is one coincidence, not a demonstrated
-        # pattern, so HIGH must still be blocked on count alone.
+    def test_two_intervals_disagreeing_by_fifty_percent(self) -> None:
+        # (Codex P2, round 2) The original fixture: two intervals at rates
+        # [1.0, 1.5]. With confidence tiering removed there is no longer a
+        # "too few intervals" veto to isolate -- intervals_used is reported
+        # plainly instead, and the deviation between the two rates (20% off
+        # their 1.25 mean... but 20% off the 1.0 MEDIAN, since Theil-Sen-
+        # style measures here use the median of just two values, which is
+        # their average) is what a caller sees.
         records = [
             _HistoryRecord(0.0, None, "claude", "short", 0.0),
             _HistoryRecord(1.0, None, "claude", "short", 1.0),
-            _HistoryRecord(2.0, None, "claude", "short", 2.0),
+            _HistoryRecord(2.0, None, "claude", "short", 2.5),
         ]
-        self.assertLess(len(records) - 1, MIN_INTERVALS_FOR_HIGH_CONFIDENCE)
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 2)
+        self._assertClose(measurements.max_relative_deviation, 0.2)
+        self._assertClose(measurements.max_usage_share, 0.6)
+        self._assertClose(measurements.rate_drift, 0.5)
+        self._assertClose(measurements.effective_intervals, 1.9230769230769231)
 
-    # -- Regression tests for the third-round Codex P2 confidence review ---
+    # -- Regression tests for the third-round Codex P2 confidence review --
 
-    def test_dominant_interval_diluted_across_many_samples_is_not_high_confidence(
-        self,
-    ) -> None:
+    def test_dominant_interval_diluted_across_many_samples(self) -> None:
         # (Codex P2, round 3) 500 one-second intervals: the first interval
-        # alone accounts for 20 of the segment's 99.68 total usage change
-        # (about 20%); the other 498 intervals each add a steady +0.16. The
-        # dominant interval is diluted across so many agreeing neighbors
-        # that BOTH mean-based dispersion ratios sit just under a 0.25
-        # cutoff (the unweighted ratio lands at ~0.2485) -- proving that no
-        # mean, however weighted, can be trusted to catch this: growing N
-        # is enough to launder any single outlier through a mean. This is
-        # exactly why HIGH does not consult a mean for this check: only
-        # comparing the single worst interval (rate 20.0) against the
-        # group's median (0.16) catches it. That per-interval deviation is
-        # about 12400% (over 100x the median), so it fails
-        # MAX_INTERVAL_RATE_DEVIATION by a wide margin, while its usage
-        # share (about 20%) stays comfortably under MAX_INTERVAL_USAGE_SHARE
-        # -- proof the deviation cap is doing real work here independent of
-        # the share cap (see the revert-and-observe evidence in the task
-        # report for the converse case).
+        # alone accounts for 20 of the segment's ~99.68 total usage change;
+        # the other 498 intervals each add a steady +0.16. Any MEAN-based
+        # dispersion statistic -- however weighted -- can be diluted toward
+        # zero by growing the sample count around one outlier; a MAXIMUM
+        # cannot. This is the fixture that proved it: the single worst
+        # interval (rate 20.0) against the 0.16 median is what the old means
+        # could not see, and what max_relative_deviation catches directly.
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
         usage = 20.0
         records.append(_HistoryRecord(1.0, None, "claude", "short", usage))
@@ -278,19 +300,24 @@ class BurnRateTests(unittest.TestCase):
             )
         self.assertEqual(len(records), 500)
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        # Over 100x the median rate -- about 12,400% relative deviation.
+        self._assertClose(measurements.max_relative_deviation, 124.00000000000267)
+        # But its usage SHARE stays modest (~20%): proof the deviation cap
+        # catches something the share cap does not, and vice versa (see the
+        # round-4 fixture below).
+        self._assertClose(measurements.max_usage_share, 0.2006420545746417)
+        self._assertClose(measurements.effective_intervals, 24.073001302486468)
 
-    def test_genuinely_steady_series_can_still_reach_high_confidence(self) -> None:
-        # The per-interval caps above must not make HIGH unreachable -- if
-        # nothing can ever satisfy them, the confidence metric is useless,
-        # which would be a worse outcome than the bug they fix. 100
+    def test_genuinely_steady_series_measures_small(self) -> None:
+        # The measurements above must not saturate on ALL data -- if nothing
+        # can ever measure small, the metric is useless, which would be a
+        # worse outcome than the instability it exists to expose. 100
         # intervals, each within 3% of a 1.0 %/s baseline (a fixed
         # alternating +/-3% pattern, not real randomness, so this can never
-        # flake), must still clear both MAX_INTERVAL_RATE_DEVIATION and
-        # MAX_INTERVAL_USAGE_SHARE (each interval here supplies about 1% of
-        # the total usage change).
+        # flake).
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
         usage = 0.0
         for index in range(1, 101):
@@ -300,44 +327,27 @@ class BurnRateTests(unittest.TestCase):
                 _HistoryRecord(float(index), None, "claude", "short", usage)
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertEqual(confidence, ProjectionConfidence.HIGH)
-
-    def test_max_interval_rate_deviation_threshold_allows_ordinary_jitter(
-        self,
-    ) -> None:
-        # Sanity check on the constant's value only (mirrors
-        # test_degenerate_interval_threshold_is_positive below): it must be
-        # strictly between 0.0 and 1.0. A deviation of exactly 0.0 would
-        # require every interval to match the median exactly, which no real
-        # sampled data does, making HIGH permanently unreachable. A
-        # deviation of 1.0 or more would accept an interval running at
-        # double the median rate (or a stalled interval at zero) as "the
-        # same rate", which is the regime-change case this cap exists to
-        # reject. Coverage that the constant is actually USED lives in the
-        # tests above and below.
-        self.assertGreater(MAX_INTERVAL_RATE_DEVIATION, 0.0)
-        self.assertLess(MAX_INTERVAL_RATE_DEVIATION, 1.0)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 0.030000000000001137)
+        self._assertClose(measurements.max_usage_share, 0.01030000000000001)
+        self.assertEqual(measurements.intervals_used, 100)
+        self._assertClose(measurements.rate_drift, 0.0)
+        self._assertClose(measurements.effective_intervals, 99.91008092716555)
 
     # -- Regression tests for the fourth-round Codex P2 confidence review --
 
-    def test_long_interval_under_the_ratio_cap_but_dominant_by_share_is_not_high(
-        self,
-    ) -> None:
-        # (Codex P2, round 4) The concrete fixture from the review: a
+    def test_long_interval_dominant_by_share_not_by_ratio(self) -> None:
+        # (Codex P2, round 4) The concrete fixture from that review: a
         # 1000-second interval running at 39.9/1000 = 0.0399 %/s, followed
         # by twelve 60-second intervals each adding 0.6 (a 0.01 %/s rate).
-        # The first interval's rate is 3.99x the 0.01 median -- just under
-        # the OLD 4.0 ratio cap -- but because it is 1000 seconds long
-        # against 60-second neighbors, it alone supplies 39.9 of the
-        # segment's 47.1 total usage change (84.7%). Rate ratio and usage
-        # share are different quantities: this interval is caught by BOTH
-        # of round 4's replacement checks independently (deviation ~299%,
-        # far past the new 25% cutoff; share 84.7%, far past the 50%
-        # cutoff), which is the point -- neither check alone is redundant,
-        # see the isolation test below for a fixture that only the share
-        # cap catches.
+        # The first interval's rate is 3.99x the 0.01 median -- comfortably
+        # inside what used to be a 4.0x ratio cap -- but because it is
+        # 1000 seconds long against 60-second neighbors, it alone supplies
+        # 39.9 of the segment's 47.1 total usage change (84.7%). Rate ratio
+        # and usage share are different quantities, which is exactly why
+        # both are reported rather than collapsed into one pass/fail cap.
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
         records.append(_HistoryRecord(1000.0, None, "claude", "short", 39.9))
         for step in range(1, 13):
@@ -351,23 +361,24 @@ class BurnRateTests(unittest.TestCase):
                 )
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 2.98999999999999)
+        self._assertClose(measurements.max_usage_share, 0.8471337579617835)
+        self.assertEqual(measurements.intervals_used, 13)
+        # Effective intervals near 1: nearly all the evidence is really one
+        # interval's worth, despite 13 raw intervals existing.
+        self._assertClose(measurements.effective_intervals, 1.3896938602920446)
 
-    def test_share_cap_alone_rejects_a_long_interval_within_the_deviation_cap(
-        self,
-    ) -> None:
-        # Isolates MAX_INTERVAL_USAGE_SHARE from MAX_INTERVAL_RATE_DEVIATION:
-        # three intervals with rates [1.2, 1.0, 1.0]. The first interval's
-        # deviation from the 1.0 median is 20%, safely under the 25%
-        # deviation cutoff, so the deviation cap alone would let this
-        # through. But that first interval is 1000 seconds long against
-        # 1-second neighbors, so it alone supplies 1200 of the segment's
-        # 1202 total usage change (99.8%) -- far past the 50% share
-        # cutoff. If the share cap were removed (see the task report's
-        # revert-and-observe check), this fixture would score HIGH; with
-        # it, it must not.
+    def test_share_is_independent_of_deviation(self) -> None:
+        # Isolates max_usage_share from max_relative_deviation: three
+        # intervals with rates [1.2, 1.0, 1.0]. The first interval's
+        # deviation from the 1.0 median is only 20%, but that same interval
+        # is 1000 seconds long against 1-second neighbors, so it alone
+        # supplies 1200 of the segment's 1202 total usage change (99.8%).
+        # Deviation alone would call this unremarkable; share alone flags
+        # it -- proof the two fields carry different information.
         records = [
             _HistoryRecord(0.0, None, "claude", "short", 0.0),
             _HistoryRecord(1000.0, None, "claude", "short", 1200.0),
@@ -375,41 +386,22 @@ class BurnRateTests(unittest.TestCase):
             _HistoryRecord(1002.0, None, "claude", "short", 1202.0),
         ]
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 0.19999999999999996)
+        self._assertClose(measurements.max_usage_share, 0.9983361064891847)
+        self._assertClose(measurements.effective_intervals, 1.00333471759067)
 
-    def test_max_interval_usage_share_threshold_is_a_majority_bound(self) -> None:
-        # Sanity check on the constant's value only. It must be strictly
-        # between 1 / MIN_INTERVALS_FOR_HIGH_CONFIDENCE (below that, even a
-        # perfectly steady series sampled at exactly the minimum interval
-        # count -- an equal three-way split of usage -- could never reach
-        # HIGH, making the cap self-defeating; see
-        # test_weekly_projection_with_several_days_of_evidence, which
-        # relies on a three-way 33.3% split reaching HIGH) and 1.0 (a bound
-        # of 1.0 or more would accept a single interval supplying the
-        # segment's entire usage change, which is exactly what this cap
-        # exists to reject).
-        self.assertGreater(
-            MAX_INTERVAL_USAGE_SHARE, 1.0 / MIN_INTERVALS_FOR_HIGH_CONFIDENCE
-        )
-        self.assertLess(MAX_INTERVAL_USAGE_SHARE, 1.0)
-
-    def test_steady_rate_sampled_at_uneven_intervals_is_still_high_confidence(
-        self,
-    ) -> None:
+    def test_steady_rate_sampled_at_uneven_intervals_measures_small(self) -> None:
         # Realistic shape #1: captures do not arrive on a fixed clock (the
         # gap between two readings depends on when headroom happened to
         # run), so a genuinely steady 1.0 %/s process can still be sampled
         # at durations spread over a 5x range (30s to 150s, a fixed
         # sequence, not real randomness). Every interval reports EXACTLY
-        # the same rate, so the deviation cap sees 0.0. The share cap sees
-        # at most 150/1000 = 15% for the single longest interval, well
-        # under the 50% cutoff, because no one interval's duration
-        # dominates the segment's total elapsed time. This must still
-        # reach HIGH -- if uneven sampling alone could prevent it, the
-        # metric would be useless for this project's actual capture
-        # pattern.
+        # the same rate, so max_relative_deviation is 0.0. No single
+        # interval's duration dominates the segment's total elapsed time,
+        # so max_usage_share stays well under the interval count's inverse.
         durations = [30, 150, 60, 40, 100, 55, 45, 130, 35, 70, 90, 50, 60, 80, 45]
         rate = 1.0
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
@@ -422,26 +414,24 @@ class BurnRateTests(unittest.TestCase):
                 _HistoryRecord(elapsed, None, "claude", "short", usage)
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 0.0)
+        self._assertClose(measurements.max_usage_share, 0.14423076923076922)
+        self.assertEqual(measurements.intervals_used, 15)
+        self._assertClose(measurements.rate_drift, 0.0)
+        self._assertClose(measurements.effective_intervals, 12.111982082866742)
 
-    def test_steady_rate_with_rounding_jitter_is_still_high_confidence(self) -> None:
+    def test_steady_rate_with_rounding_jitter_measures_small(self) -> None:
         # Realistic shape #2: this project's own captured history
         # (~/.headroom/history.jsonl) reports used_percentage as a whole
         # number, so a continuously climbing true rate is quantized on
         # capture -- the "57 -> 56 -> 57" jitter described in
-        # _records_since_latest_reset's docstring. Modeled here as a
-        # steady 5-points-per-60s rate with a fixed +/-1 point rounding
-        # pattern (never real randomness, so this can never flake), which
-        # stays monotone (no interval ever reports a decrease) and never
-        # produces a zero-rate interval. Every interval's rate is within
-        # 20% of the 5/60 median, under the 25% cutoff, and no single
-        # interval carries more than 1/60 of the total, so this must still
-        # reach HIGH. See test_low_resolution_quantization_jitter_is_a_
-        # known_high_confidence_gap below for the resolution at which this
-        # stops holding, and the task report for why that gap is accepted
-        # rather than papered over.
+        # _records_since_latest_reset's docstring. Modeled here as a steady
+        # 5-points-per-60s rate with a fixed +/-1 point rounding pattern
+        # (never real randomness, so this can never flake). No interval
+        # ever reports a zero delta, so folding is a no-op here.
         jitter = [1, -1, 0, 1, -1, 0, 1, -1, 0, 0, 1, -1]
         base = 5.0
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
@@ -454,28 +444,27 @@ class BurnRateTests(unittest.TestCase):
                 _HistoryRecord(elapsed, None, "claude", "short", usage)
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertEqual(confidence, ProjectionConfidence.HIGH)
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 60)
+        self._assertClose(measurements.max_relative_deviation, 0.20000000000000012)
+        self._assertClose(measurements.max_usage_share, 0.02)
+        self._assertClose(measurements.effective_intervals, 58.44155844155844)
 
-    def test_low_resolution_quantization_jitter_is_a_known_high_confidence_gap(
+    def test_low_resolution_quantization_jitter_is_a_plain_measurement_now(
         self,
     ) -> None:
-        # FINDING (round 4 verification): the same +/-1 point rounding
+        # FINDING (round 4 verification, now expressed as a number rather
+        # than an accepted tier failure): the same +/-1 point rounding
         # jitter as the test above, but sampled at a lower true rate (2
-        # points per 60s instead of 5) no longer reaches HIGH -- a +/-1
-        # swing off a base of 2 is up to 50% relative deviation, over the
-        # 25% cutoff. This is not a bug introduced by tightening the cap
-        # to 25%; the OLD 4x ratio cap already treated a same-sized swing
-        # off a base of 1 (a jitter step to 0) as an infinite ratio, so
-        # very-low-resolution quantized data could not reach HIGH before
-        # this round either. It is recorded here, passing, as an honest
-        # boundary rather than an omission: this metric cannot claim HIGH
-        # confidence from a handful of whole-percentage-point samples
-        # climbing only 1-2 points per interval, no matter how the cutoff
-        # is tuned, because at that resolution +/-1 rounding noise IS a
-        # large fraction of the signal. MEDIUM is the correct, honest
-        # answer for that shape of data, not a metric flaw.
+        # points per 60s instead of 5), produces a real 50% deviation --
+        # a +/-1 swing off a base of 2 really is half the signal, not a
+        # metric flaw. This is not a "gap" any more: there is no threshold
+        # this number is being compared against, so there is nothing for it
+        # to fail. It is simply a moderate deviation, and max_usage_share /
+        # effective_intervals stay low, correctly telling a caller this is
+        # spread-out resolution noise, not one bad interval.
         jitter = [1, -1, 0, 1, -1, 0]
         base = 2.0
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
@@ -488,28 +477,28 @@ class BurnRateTests(unittest.TestCase):
                 _HistoryRecord(elapsed, None, "claude", "short", usage)
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertEqual(confidence, ProjectionConfidence.MEDIUM)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 0.5000000000000001)
+        self._assertClose(measurements.max_usage_share, 0.025)
+        self._assertClose(measurements.effective_intervals, 51.42857142857143)
 
-    def test_long_idle_gap_at_a_steady_rate_is_a_known_high_confidence_gap(
-        self,
-    ) -> None:
-        # FINDING (round 4 design trade-off, documented on
-        # MAX_INTERVAL_USAGE_SHARE): a perfectly steady 0.02 %/s rate,
-        # sampled every 120 seconds except for one 8-hour idle gap in the
-        # middle (a plausible real pattern -- a laptop asleep overnight).
+    def test_long_idle_gap_is_a_plain_measurement_now(self) -> None:
+        # FINDING (round 4 design trade-off, now expressed as a number): a
+        # perfectly steady 0.02 %/s rate, sampled every 120 seconds except
+        # for one 8-hour idle gap in the middle (a laptop asleep overnight).
         # Every interval, including the long one, reports EXACTLY the same
-        # rate (deviation 0.0 throughout), so MAX_INTERVAL_RATE_DEVIATION
-        # never objects. But the 8-hour interval alone accounts for over
-        # 92% of the segment's total usage change purely because of its
-        # duration, which trips MAX_INTERVAL_USAGE_SHARE even though
-        # nothing here is actually inconsistent. This is accepted as a
-        # deliberate trade-off (a false MEDIUM on legitimately steady,
-        # unevenly-sampled data) rather than fixed, because a share-based
-        # cap and a duration-weighted one are indistinguishable from a
-        # single pairwise comparison -- see the constant's docstring and
-        # the task report for the full reasoning.
+        # rate, so max_relative_deviation is ~0. But the 8-hour interval
+        # alone accounts for over 92% of the segment's total usage change
+        # purely because of its duration (max_usage_share), and
+        # effective_intervals collapses to ~1.2 out of 21 raw intervals.
+        # This is the intended shape: a caller who only looks at deviation
+        # would (correctly) see a steady rate; a caller who also looks at
+        # share or effective count would (also correctly) see that the
+        # evidence is really resting on one long interval. Both are true at
+        # once, which is exactly why they are reported separately instead
+        # of collapsed into one verdict.
         records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
         rate = 0.02
         elapsed = 0.0
@@ -530,9 +519,141 @@ class BurnRateTests(unittest.TestCase):
                 _HistoryRecord(elapsed, None, "claude", "short", usage)
             )
 
-        confidence = _confidence_for_records(records)
+        measurements = _interval_measurements(records)
 
-        self.assertEqual(confidence, ProjectionConfidence.MEDIUM)
+        assert measurements is not None
+        self._assertClose(measurements.max_relative_deviation, 0.0, rel_tol=1e-6)
+        self._assertClose(measurements.max_usage_share, 0.9230769230769235)
+        self.assertEqual(measurements.intervals_used, 21)
+        self._assertClose(measurements.rate_drift, 0.0, rel_tol=1e-6)
+        self._assertClose(measurements.effective_intervals, 1.1732037486983677)
+
+    # -- Round 5: quantized real data and whole-series drift -----------------
+
+    def test_quantized_real_data_produces_actionable_numbers(self) -> None:
+        # (Round 5 review, P1) Input straight from the finding: 60-second
+        # captures with usage [90,90,90,91,91,92,92,93]. Under the old
+        # tiering every zero-delta raw interval (5 of the 7 raw gaps here
+        # report no change at all) vetoed HIGH outright, and a production
+        # history audit found ALL 54 eligible claude-short segments scored
+        # LOW for exactly this reason -- the metric was unusable on the data
+        # it exists to describe.
+        #
+        # Folding zero-delta intervals forward into the next reading that
+        # actually changed (see _folded_intervals) turns the 7 raw gaps
+        # into 3 real intervals (deltas of 1 point each, over 180s/120s/
+        # 120s), producing a moderate, actionable 33% deviation instead of
+        # a saturated one. max_usage_share (33%) and effective_intervals
+        # (3.0, equal to intervals_used) confirm this is evenly spread
+        # quantization noise, not one dominant interval.
+        projection = self._project(
+            [
+                self._record(0.0, 90.0, resets_at=604_800.0, window="weekly"),
+                self._record(60.0, 90.0, resets_at=604_800.0, window="weekly"),
+                self._record(120.0, 90.0, resets_at=604_800.0, window="weekly"),
+                self._record(180.0, 91.0, resets_at=604_800.0, window="weekly"),
+                self._record(240.0, 91.0, resets_at=604_800.0, window="weekly"),
+                self._record(300.0, 92.0, resets_at=604_800.0, window="weekly"),
+                self._record(360.0, 92.0, resets_at=604_800.0, window="weekly"),
+                self._record(420.0, 93.0, resets_at=604_800.0, window="weekly"),
+            ],
+            now=421.0,
+        )[0]
+
+        self.assertIsNone(projection.reason)
+        self.assertEqual(projection.samples_used, 8)
+        # 7 raw gaps folded down to 3 real intervals.
+        self.assertEqual(projection.intervals_used, 3)
+        self._assertClose(projection.max_relative_deviation, 1.0 / 3.0)
+        self._assertClose(projection.max_usage_share, 1.0 / 3.0)
+        self._assertClose(projection.effective_intervals, 3.0)
+        self._assertClose(projection.rate_drift, 0.5)
+
+    def test_unfolded_zero_delta_intervals_would_saturate_the_deviation(
+        self,
+    ) -> None:
+        # Direct unit-level companion to the test above: proves the folding
+        # in _folded_intervals is what keeps max_relative_deviation
+        # actionable, by checking the un-folded raw shape would have been
+        # degenerate. Without folding, the 7 raw intervals are
+        # [0,0,1/60,0,1/60,0,1/60] %/s; their median is 0 (4 of 7 are
+        # zero), so every nonzero raw interval scores the saturated 1.0
+        # deviation defined for a zero baseline -- the exact "every real
+        # reading looks maximally unstable" failure the round-5 review
+        # found across this project's own production history.
+        raw_rates = [0.0, 0.0, 1.0 / 60.0, 0.0, 1.0 / 60.0, 0.0, 1.0 / 60.0]
+        center = statistics.median(raw_rates)
+        self.assertEqual(center, 0.0)
+        self._assertClose(_relative_difference(1.0 / 60.0, center), 1.0)
+
+    def test_conspiring_intervals_evade_per_interval_maxima_but_not_drift(
+        self,
+    ) -> None:
+        # (Round 5 review, P2) Input straight from the finding: intervals
+        # with (rate, usage_delta) of [(0.751, 44), (1, 0.4) x5, (1.249,
+        # 44)]. Every interval individually stays under what used to be a
+        # 25% deviation cap and a 50% share cap (max_relative_deviation
+        # lands at 0.249, max_usage_share at 0.489, both just inside the old
+        # thresholds), because per-interval maxima can only ever see ONE
+        # interval at a time. But the endpoint intervals jointly carry
+        # 97.8% of the usage while the rate climbs from 0.751 to 1.249 --
+        # a whole-series drift no per-interval check can see.
+        #
+        # rate_drift (comparing the time-weighted rate of the first half of
+        # intervals to the second half) and effective_intervals (the
+        # usage-weighted effective count) both expose it: effective_intervals
+        # lands at about 2.1 despite 7 raw intervals existing, meaning the
+        # segment really carries only about two intervals' worth of
+        # independent evidence.
+        records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        elapsed = 0.0
+        usage = 0.0
+        for rate, delta in [(0.751, 44.0)] + [(1.0, 0.4)] * 5 + [(1.249, 44.0)]:
+            elapsed += delta / rate
+            usage += delta
+            records.append(
+                _HistoryRecord(elapsed, None, "claude", "short", usage)
+            )
+
+        measurements = _interval_measurements(records)
+
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 7)
+        # Both per-interval maxima stay inside what used to be "safe":
+        self._assertClose(measurements.max_relative_deviation, 0.2490000000000001)
+        self._assertClose(measurements.max_usage_share, 0.488888888888889)
+        # But the whole-series measures expose the conspiracy plainly:
+        self._assertClose(measurements.rate_drift, 0.6448474590894441)
+        self._assertClose(measurements.effective_intervals, 2.0915100185911997)
+        self.assertLess(measurements.effective_intervals, 3.0)
+
+    def test_single_terminal_burst_after_quiet_history(self) -> None:
+        # (Codex P1, round 1) All the acceleration comes from one 1-second
+        # burst (7200 -> 7201) after two hours of near-flat usage. The old
+        # sign-based confidence check saw 6 of 6 positive pairwise slopes
+        # and called that HIGH; the old LOW_CONFIDENCE veto later blocked
+        # this outright. The continuous library has no veto -- it still
+        # projects -- but the measurements it reports make the single-burst
+        # shape unmistakable: an interval running millions of times the
+        # median rate, supplying essentially all the usage, with an
+        # effective interval count of about 1.
+        projection = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=None),
+                self._record(3_600.0, 0.1, resets_at=None),
+                self._record(7_200.0, 0.2, resets_at=None),
+                self._record(7_201.0, 99.0, resets_at=None),
+            ],
+            now=7_202.0,
+        )[0]
+
+        self.assertIsNone(projection.reason)
+        self.assertIsNotNone(projection.projected_exhaustion_at)
+        self.assertEqual(projection.intervals_used, 3)
+        self._assertClose(projection.max_relative_deviation, 3556799.0)
+        self._assertClose(projection.max_usage_share, 0.997979797979798)
+        self._assertClose(projection.rate_drift, 987.7253540683142)
+        self._assertClose(projection.effective_intervals, 1.0040506235747522)
 
     def test_project_group_hard_invariant_rejects_decrease_if_called_directly(
         self,
@@ -565,6 +686,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(
             projection.reason, NoProjectionReason.USAGE_WENT_BACKWARDS
         )
+        self._assertNoMeasurements(projection)
 
     def test_already_exhausted_usage_yields_no_projection(self) -> None:
         projection = self._project(
@@ -577,6 +699,7 @@ class BurnRateTests(unittest.TestCase):
 
         self.assertIsNone(projection.projected_exhaustion_at)
         self.assertEqual(projection.reason, NoProjectionReason.ALREADY_EXHAUSTED)
+        self._assertNoMeasurements(projection)
 
     def test_steep_ramp_exhausts_before_reset(self) -> None:
         projection = self._project(
@@ -642,6 +765,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(projection.samples_used, MIN_SAMPLES - 1)
         self.assertIsNone(projection.projected_exhaustion_at)
         self.assertEqual(projection.reason, NoProjectionReason.TOO_FEW_SAMPLES)
+        self._assertNoMeasurements(projection)
 
     def test_too_short_span_has_distinct_reason(self) -> None:
         projection = self._project(
@@ -774,7 +898,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(projection.span_seconds, 6.0)
         self.assertIsNone(projection.projected_exhaustion_at)
         self.assertEqual(projection.reason, NoProjectionReason.SPAN_TOO_SHORT)
-        self.assertEqual(projection.confidence, ProjectionConfidence.NONE)
+        self._assertNoMeasurements(projection)
 
     def test_completed_window_relative_to_now_is_rejected(self) -> None:
         # (Codex P1, burn_rate.py:85) The window reset at t=1000 and "now"
@@ -823,28 +947,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(
             projection.reason, NoProjectionReason.PROJECTED_EXHAUSTION_IN_PAST
         )
-
-    def test_single_terminal_burst_after_quiet_history_is_not_high_confidence(
-        self,
-    ) -> None:
-        # (Codex P1, burn_rate.py:253) All the acceleration comes from one
-        # 1-second burst (7200 -> 7201) after two hours of near-flat usage.
-        # The old sign-based confidence check saw 6 of 6 positive pairwise
-        # slopes and called that HIGH. A single independent interval out of
-        # three cannot defend HIGH confidence.
-        projection = self._project(
-            [
-                self._record(0.0, 0.0, resets_at=None),
-                self._record(3_600.0, 0.1, resets_at=None),
-                self._record(7_200.0, 0.2, resets_at=None),
-                self._record(7_201.0, 99.0, resets_at=None),
-            ],
-            now=7_202.0,
-        )[0]
-
-        self.assertNotEqual(projection.confidence, ProjectionConfidence.HIGH)
-        self.assertIsNone(projection.projected_exhaustion_at)
-        self.assertEqual(projection.reason, NoProjectionReason.LOW_CONFIDENCE)
+        self._assertNoMeasurements(projection)
 
     def test_ten_thousand_reading_segment_is_bounded_in_time_and_memory(
         self,
@@ -853,7 +956,9 @@ class BurnRateTests(unittest.TestCase):
         # segment is O(n^2) in time and memory: 10,000 readings would build
         # ~50 million float pairs. history.jsonl is append-only and a
         # segment can grow without bound absent a marked reset, so this must
-        # stay fast and small regardless of history length.
+        # stay fast and small regardless of history length. The interval
+        # measurements added alongside the fitted rate are only O(n) over
+        # the same capped segment, so they do not change this bound.
         records = [
             self._record(float(index) * 10.0, index * 0.005, resets_at=None)
             for index in range(10_000)
@@ -961,6 +1066,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(projection.reason, NoProjectionReason.NON_FINITE_RESULT)
         self.assertIsNone(projection.rate_percent_per_second)
         self.assertIsNone(projection.projected_exhaustion_at)
+        self._assertNoMeasurements(projection)
         # The raw inputs and their span are finite (only the extrapolated
         # projection overflows), which is exactly what distinguishes this
         # gate from the burn_rate.py:241 span fix: that fix is for when the
@@ -994,6 +1100,7 @@ class BurnRateTests(unittest.TestCase):
 
         self.assertEqual(projection.reason, NoProjectionReason.NON_FINITE_RESULT)
         self.assertIsNone(projection.span_seconds)
+        self._assertNoMeasurements(projection)
 
     def test_unreadable_history_file_yields_no_projections(self) -> None:
         # (Codex P2, burn_rate.py:82) Only FileNotFoundError/IsADirectoryError
@@ -1024,6 +1131,22 @@ class BurnRateTests(unittest.TestCase):
         # regardless of what the constant's value is.
         self.assertGreater(MIN_INTERVAL_SECONDS, 0.0)
         self.assertLess(MIN_INTERVAL_SECONDS, 1.0)
+
+    # -- Direct coverage of the shared zero-baseline convention -------------
+
+    def test_relative_difference_zero_baseline_convention(self) -> None:
+        # _folded_intervals guarantees every real rate this module computes
+        # is strictly positive (see _relative_difference's docstring), so
+        # the zero-baseline branch below can never actually run through
+        # project_exhaustion. It is tested directly here, independent of
+        # that guarantee, so the convention itself -- 0.0 for trivial
+        # agreement, 1.0 (not inf/nan) otherwise -- stays covered even
+        # though no real segment can reach it.
+        self.assertEqual(_relative_difference(0.0, 0.0), 0.0)
+        self.assertEqual(_relative_difference(5.0, 0.0), 1.0)
+        self.assertEqual(_relative_difference(-5.0, 0.0), 1.0)
+        self.assertEqual(_relative_difference(1.25, 1.0), 0.25)
+        self.assertEqual(_relative_difference(0.75, 1.0), 0.25)
 
 
 if __name__ == "__main__":
