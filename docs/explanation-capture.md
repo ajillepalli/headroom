@@ -84,6 +84,29 @@ Files are ordered newest first by modification time and then path. headroom scan
 
 Rollouts may contain `primary` and `secondary` buckets, and either can be `null`. Current samples often have a weekly primary bucket and a null short bucket, so the Codex 5h reading can remain unavailable. The parser accepts `used_percent`, `used_percentage`, `usedPercent`, and `usedPercentage`, plus all three supported window-duration spellings.
 
+## Which surfaces are covered
+
+Claude Code runs in several places, and capture and injection do not reach the same set of them. Capture is how headroom reads the numbers. Injection is how the warning reaches the model.
+
+| Surface | Claude capture | Injection |
+| --- | --- | --- |
+| Terminal CLI | yes | yes |
+| Desktop app | no documented mechanism | yes |
+| VS Code and JetBrains extensions | no documented mechanism | yes |
+| Claude Code on the web | no documented mechanism | project settings only |
+
+Injection is the documented case. The hooks documentation states that hooks run wherever Claude Code runs, covering terminal sessions, IDE extensions, the Desktop app, and the web.
+
+Capture is the narrow one. The statusline payload is the only documented source of Claude rate limits, and statusline is documented only for the terminal. Nothing states that the other surfaces refuse to run a statusline command; there is simply no documented mechanism for it, and those surfaces have no terminal status bar to render into. Treat that row as an absence of documentation rather than a tested failure.
+
+No other route exists. `/usage` draws its bars for a person to read rather than emitting anything a program can parse, no state or config file records the numbers, no API returns them, no other hook event carries them in its payload, and MCP servers are not given them.
+
+The web has a second constraint. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings. They do not load `~/.claude/settings.json`. `headroom init` writes the user file, so a web session gets no hook today. That is tracked in [issue #36](https://github.com/ajillepalli/headroom/issues/36).
+
+Codex is not affected the same way. Its capture asks the account for its own limits through the app-server RPC, so the answer does not depend on which client spent the quota. Codex readings stay correct through GUI and IDE use as long as the `codex` binary is installed and signed in.
+
+The practical result follows from the bound rather than from any special handling. Usage is monotonic within a window and the limit is account-wide, so a capture taken in the terminal stays a valid lower bound on work done anywhere else. Working in the terminal some of the time and elsewhere the rest means headroom captures in the terminal and still warns everywhere, because hooks fire everywhere; the warning is sound and reads low. Working only outside the terminal means headroom captures nothing and stays quiet. It under-reports rather than misreporting, which is the same property described for [multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
+
 ## Storage and limits of the sources
 
 Successful snapshots from either source are merged into `state.json`, which is replaced atomically. Each snapshot is appended to `history.jsonl`. On-demand Codex refresh updates Codex diagnostics even when neither source yields a new snapshot. `doctor` performs capture discovery without changing state.
