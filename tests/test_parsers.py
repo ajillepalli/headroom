@@ -11,14 +11,90 @@ import unittest
 from unittest import mock
 
 from headroom.bounds import Confidence, Snapshot, bound_snapshot
-from headroom.claude import parse_payload, parse_reset_time
+from headroom.claude import classify_window, parse_payload, parse_reset_time
 from headroom.cli import main
 from headroom.codexsrc import parse_rate_limits
 from headroom.render import render_report
 from headroom.state import save_snapshots
 
 
+CLAUDE_STATUSLINE_PAYLOAD = {
+    "rate_limits": {
+        "five_hour": {"resets_at": 1785929400, "used_percentage": 20},
+        "seven_day": {"resets_at": 1786266000, "used_percentage": 4},
+    },
+    "context_window": {
+        "context_window_size": 1000000,
+        "current_usage": {
+            "cache_creation_input_tokens": 1100,
+            "cache_read_input_tokens": 812517,
+            "input_tokens": 2,
+            "output_tokens": 1050,
+        },
+        "remaining_percentage": 19,
+        "total_input_tokens": 813619,
+        "total_output_tokens": 1050,
+        "used_percentage": 81,
+    },
+}
+
+
 class ParserTests(unittest.TestCase):
+    def test_real_claude_statusline_payload_yields_only_rate_limit_windows(self) -> None:
+        result = parse_payload(CLAUDE_STATUSLINE_PAYLOAD, captured_at=1_785_920_000.0)
+
+        self.assertEqual(
+            [(snapshot.window, snapshot.used_percentage) for snapshot in result.snapshots],
+            [("short", 20.0), ("weekly", 4.0)],
+        )
+        self.assertNotIn(81.0, [snapshot.used_percentage for snapshot in result.snapshots])
+        self.assertNotIn(19.0, [snapshot.used_percentage for snapshot in result.snapshots])
+        self.assertFalse(
+            any("context_window" in note.get("path", ()) for note in result.unparsed)
+        )
+
+    def test_context_window_is_excluded_even_if_it_has_a_duration(self) -> None:
+        payload = {
+            "context_window": {
+                "used_percentage": 81,
+                "remaining_percentage": 19,
+                "window_minutes": 300,
+            }
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.snapshots, ())
+        self.assertNotIn("context_window", repr(result.unparsed))
+
+    def test_existing_name_variants_still_classify(self) -> None:
+        cases = (
+            (("wrapper", "weekly"), "weekly"),
+            (("wrapper", "7d"), "weekly"),
+            (("wrapper", "fiveHour"), "short"),
+            (("wrapper", "5h"), "short"),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                self.assertEqual(classify_window(None, path), expected)
+
+    def test_duration_classification_wins_over_real_window_name(self) -> None:
+        self.assertEqual(classify_window(10_080, ("five_hour",)), "weekly")
+        self.assertEqual(classify_window(300, ("seven_day",)), "short")
+
+    def test_genuinely_unknown_rate_limit_shape_stays_in_diagnostics(self) -> None:
+        payload = {"rate_limits": {"mystery": {"used_percentage": 42}}}
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertTrue(
+            any(
+                note.get("path") == ["rate_limits", "mystery"]
+                and note.get("reason") == "unknown window"
+                for note in result.unparsed
+            )
+        )
+
     def test_null_codex_secondary_yields_only_weekly_window(self) -> None:
         payload = {
             "rate_limits": {

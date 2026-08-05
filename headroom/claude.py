@@ -12,6 +12,8 @@ from .resets import parse_plausible_reset_time, parse_reset_time
 _USED_KEYS = ("used_percentage", "usedPercentage", "used_percent", "usedPercent")
 _RESET_KEYS = ("resets_at", "resetsAt")
 _WINDOW_KEYS = ("window_minutes", "windowMinutes")
+_NAMED_WINDOWS = {"five_hour": "short", "seven_day": "weekly"}
+_CONTEXT_WINDOW_KEYS = frozenset(("context_window", "contextWindow"))
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,10 @@ def classify_window(window_minutes: Any, path: Sequence[str]) -> Optional[str]:
     duration = valid_percent(window_minutes)
     if duration is not None:
         return "weekly" if duration >= 1440.0 else "short"
+    if path:
+        named_window = _NAMED_WINDOWS.get(path[-1].lower())
+        if named_window is not None:
+            return named_window
     name = "/".join(path).lower()
     if "week" in name or "7d" in name:
         return "weekly"
@@ -44,6 +50,8 @@ def parse_payload(payload: Any, captured_at: Optional[float] = None) -> ParseRes
     notes: List[Dict[str, Any]] = []
 
     for path, value in _walk(payload):
+        if any(part in _CONTEXT_WINDOW_KEYS for part in path):
+            continue
         if not isinstance(value, dict):
             continue
         used_key = _first_key(value, _USED_KEYS)
@@ -51,13 +59,25 @@ def parse_payload(payload: Any, captured_at: Optional[float] = None) -> ParseRes
             continue
         used = valid_percent(value.get(used_key))
         if used is None:
-            notes.append({"path": list(path), "reason": "invalid used percentage", "value": value})
+            notes.append(
+                {
+                    "path": list(path),
+                    "reason": "invalid used percentage",
+                    "value": _without_context_windows(value),
+                }
+            )
             continue
         duration_key = _first_key(value, _WINDOW_KEYS)
         duration = value.get(duration_key) if duration_key is not None else None
         window = classify_window(duration, path)
         if window is None:
-            notes.append({"path": list(path), "reason": "unknown window", "value": value})
+            notes.append(
+                {
+                    "path": list(path),
+                    "reason": "unknown window",
+                    "value": _without_context_windows(value),
+                }
+            )
             continue
         reset_key = _first_key(value, _RESET_KEYS)
         reset_value = value.get(reset_key) if reset_key is not None else None
@@ -76,7 +96,13 @@ def parse_payload(payload: Any, captured_at: Optional[float] = None) -> ParseRes
         found[window] = snapshot
 
     if not found:
-        notes.append({"path": [], "reason": "no usable rate limits", "value": payload})
+        notes.append(
+            {
+                "path": [],
+                "reason": "no usable rate limits",
+                "value": _without_context_windows(payload),
+            }
+        )
     return ParseResult(tuple(found[key] for key in ("short", "weekly") if key in found), tuple(notes))
 
 
@@ -108,3 +134,17 @@ def _first_key(value: Dict[str, Any], keys: Sequence[str]) -> Optional[str]:
         if key in value:
             return key
     return None
+
+
+def _without_context_windows(value: Any) -> Any:
+    """Copy diagnostic data while omitting Claude's context-usage subtree."""
+
+    if isinstance(value, dict):
+        return {
+            key: _without_context_windows(child)
+            for key, child in value.items()
+            if str(key) not in _CONTEXT_WINDOW_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_context_windows(child) for child in value]
+    return value
