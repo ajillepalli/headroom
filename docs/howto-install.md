@@ -12,7 +12,7 @@ The `headroom-cli` package is on PyPI. Install the command with:
 uv tool install headroom-cli
 ```
 
-To upgrade later, run `uv tool upgrade headroom-cli`, or `headroom update` to print the right command for however you installed it.
+To upgrade later, run `uv tool upgrade headroom-cli`. `headroom update` prints the command for a detected uv tool, pip, or source-checkout install, and says nothing is suggested when it does not recognize the install.
 
 Then configure Claude Code, Codex, or both:
 
