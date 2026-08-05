@@ -1,4 +1,8 @@
 <p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/headroom-logo-dark.svg">
+    <img src="images/headroom-logo.svg" alt="headroom" width="420">
+  </picture><br>
   <strong>headroom</strong><br>
   <a href="#why-headroom">Why headroom</a> &middot;
   <a href="#install">Install</a> &middot;

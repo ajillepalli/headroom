@@ -27,3 +27,10 @@ $RECYCLE.BIN/
 # Local agent and runtime state
 .agents/
 .tmp-state/
+.gstack/
+
+# local previews and agent scratch
+.logo-preview.*
+.logo-dark.png
+.rpc-work.log
+.topics-command.txt
