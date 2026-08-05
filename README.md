@@ -18,7 +18,7 @@ Claude Code and Codex enforce rolling usage limits but show the numbers only to 
 
 ## Install and first run
 
-The package is not published yet. Once it is published, the shortest path will be:
+The shortest path:
 
 ```console
 uv tool install headroom-cli
@@ -26,7 +26,7 @@ headroom init --all
 headroom status
 ```
 
-Until then, run one of these from a clone:
+To work from a clone instead, run one of these:
 
 ```console
 uv tool install .
