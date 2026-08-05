@@ -51,16 +51,22 @@ def _projection(
     zero_delta_fraction: Optional[float] = 0.1,
     longest_above_overall_rate_run: Optional[int] = 1,
     latest_change_at: Optional[float] = 990.0,
+    latest_change_delta: Optional[float] = 1.0,
+    latest_captured_at: Optional[float] = 990.0,
 ) -> BurnRateProjection:
     """Build a projection that clears every trust threshold with margin by
     default, so each test only needs to override the one field it targets.
 
-    ``latest_change_at`` defaults to 990.0: every test in this module that
-    calls ``render_hook``/``render_burn_rate_status_lines`` uses
-    ``now=1_000.0``, so this default is 10 seconds before "now" -- well
-    inside any source's freshness window (300s Claude, 1800s Codex) unless
-    a test deliberately overrides it to exercise
-    ``burn_rate_evidence_is_current``'s staleness check.
+    ``latest_change_at`` and ``latest_captured_at`` both default to 990.0
+    (the default case is a clean climb whose last capture IS its last
+    change): every test in this module that calls
+    ``render_hook``/``render_burn_rate_status_lines`` uses ``now=1_000.0``,
+    so this default is 10 seconds before "now", matching ``_fresh_reading``'s
+    ``age_seconds=10.0`` default for ``burn_rate_evidence_is_current``'s
+    capture-identity check. ``latest_change_delta`` defaults to 1.0 (a
+    single-point step, matching the default ``rate_percent_per_second`` of
+    0.01 for a 100s implied inter-change interval) unless a test overrides
+    it to exercise a different observed step size.
     """
 
     declined = reason is not None
@@ -82,6 +88,8 @@ def _projection(
         max_raw_rate_ratio=None if declined else max_raw_rate_ratio,
         longest_above_overall_rate_run=None if declined else longest_above_overall_rate_run,
         latest_change_at=None if declined else latest_change_at,
+        latest_change_delta=None if declined else latest_change_delta,
+        latest_captured_at=None if declined else latest_captured_at,
     )
 
 
@@ -287,6 +295,64 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
         self.assertEqual(lines, [])
 
+    def test_reading_from_a_different_capture_event_says_nothing(self) -> None:
+        # (Codex review, round 4, P2) A fresh reading exists for the right
+        # source and window, but its own capture time does not match
+        # projection.latest_captured_at -- state.json and history.jsonl
+        # have drifted and this reading is not the evidence this projection
+        # was built from. Matching by (source, window) alone would wrongly
+        # treat this as confirmation.
+        projection = _projection(source="claude", window="short", latest_captured_at=990.0)
+        mismatched_reading = _fresh_reading(source="claude", window="short")  # age 10.0 -> captured_at 990.0
+        # Force a mismatch: same source/window, different age, so its
+        # recovered captured_at (now - age) no longer lines up.
+        mismatched_reading = Reading(
+            certain=True,
+            lower_bound_percent=mismatched_reading.lower_bound_percent,
+            resets_at=mismatched_reading.resets_at,
+            age_seconds=200.0,
+            window=mismatched_reading.window,
+            source=mismatched_reading.source,
+            confidence=Confidence.FRESH,
+        )
+        lines = render_burn_rate_status_lines(
+            [projection], now=1_000.0, readings=[mismatched_reading]
+        )
+
+        self.assertEqual(lines, [])
+
+    def test_capture_identity_check_rejects_a_near_but_distinct_capture_at_epoch_scale(
+        self,
+    ) -> None:
+        # (Codex review, round 5, P2) math.isclose's default rel_tol=1e-9
+        # scales with the LARGER magnitude being compared. At a realistic
+        # epoch timestamp (~1.7e9), that default alone contributes roughly
+        # 1.7 SECONDS of tolerance -- nearly 2000x looser than the intended
+        # 1ms abs_tol -- so two genuinely distinct captures 1.5s apart would
+        # have been wrongly accepted as the same event before rel_tol was
+        # pinned to 0.0. This gap (1.5s) is deliberately smaller than that
+        # old bug's effective tolerance (~1.7s) but far larger than the
+        # 1ms this check is actually supposed to allow.
+        now = 1_700_000_000.0
+        projection = _projection(
+            source="claude",
+            window="short",
+            latest_change_at=now - 10.0,
+            latest_captured_at=now - 10.0,
+        )
+        reading = Reading(
+            certain=True,
+            lower_bound_percent=20.0,
+            resets_at=now + 100_000.0,
+            age_seconds=8.5,  # captured_at = now - 8.5, 1.5s off latest_captured_at
+            window="short",
+            source="claude",
+            confidence=Confidence.FRESH,
+        )
+        lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
+
+        self.assertEqual(lines, [])
+
     def test_trustworthy_projection_with_no_matching_reading_says_nothing(self) -> None:
         # No reading at all for this source/window -- there is no current
         # evidence to confirm, so the gate fails the same way a stale one
@@ -321,17 +387,42 @@ class RenderBurnRateStatusTests(unittest.TestCase):
         # pass under the rate-relative tolerance.
         now = 1_000_000.0
         rate = 1.0 / 7_200.0
+        # _fresh_reading's age_seconds is 10.0, so its own captured_at is
+        # now - 10.0: latest_captured_at must match that for the
+        # capture-identity check to pass (this projection's last capture IS
+        # its last change, so latest_change_at matches too).
         projection = _projection(
             source="codex",
             window="weekly",
             rate_percent_per_second=rate,
             latest_change_at=now - 7_000.0,
+            latest_change_delta=1.0,
+            latest_captured_at=now - 10.0,
         )
         reading = _fresh_reading(source="codex", window="weekly")
         lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
 
         self.assertEqual(len(lines), 1)
         self.assertIn("Codex", lines[0])
+
+    def test_cadence_tolerance_scales_with_the_observed_step_size(self) -> None:
+        # Codex review, round 4, P2: a source moving 5 points per real
+        # change (not the default 1.0) has a true inter-change cadence of
+        # delta/rate, not 1/rate. rate=0.01 gives 1/rate=100s (wrong here)
+        # vs delta/rate=5.0/0.01=500s (correct). A 400s-old change is
+        # inside the correct tolerance (4*500=2000s) but would fail the
+        # wrong one (4*100=400s is not > 400s -- use a value that cleanly
+        # separates both: 1000s clears 2000s but not 400s).
+        now = 1_000.0
+        projection = _projection(
+            latest_change_delta=5.0,
+            latest_change_at=now - 1_000.0,
+            latest_captured_at=now - 10.0,
+        )
+        reading = _fresh_reading()
+        lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
+
+        self.assertEqual(len(lines), 1)
 
 
 class RenderHookCompositionTests(unittest.TestCase):

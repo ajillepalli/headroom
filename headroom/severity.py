@@ -1,6 +1,7 @@
 """Pure severity calculation for bounded readings."""
 
 from enum import IntEnum
+import math
 from typing import Optional
 
 from .bounds import Confidence, Reading
@@ -231,6 +232,25 @@ def burn_rate_evidence_is_current(
       ``Confidence.FRESH`` (``bounds.py``, ``freshness.py``) -- a recent
       CAPTURE happened at all. A missing reading, or anything less current
       than ``FRESH``, fails this gate outright.
+    * That reading is actually the SAME capture event this projection's own
+      history produced, not merely a reading that happens to share its
+      source and window (Codex review, round 4, P2). ``state.json`` (where
+      readings come from) and ``history.jsonl`` (where projections come
+      from) are written by the same call in normal operation, but not
+      atomically together -- ``state.py``'s ``save_snapshots`` replaces
+      ``state.json`` and then appends to history as two separate steps, so
+      a failure between them, or another command reading in between, can
+      leave the two out of step. A reading matched only by source and
+      window could then belong to a different, unrelated capture -- for
+      example a fresher one from a decrease or a new reset that
+      ``history.jsonl`` has not caught up to yet -- and pairing it with a
+      stale projection would present that projection as confirmed by
+      evidence it was never actually built from. This is checked by
+      recovering the reading's own capture time (``now - age_seconds``,
+      valid because both were computed from the same ``now`` within one
+      command invocation) and requiring it to match
+      ``projection.latest_captured_at``, the capture this projection's own
+      segment actually ends on.
     * ``now`` is within a tolerance of ``projection.latest_change_at`` --
       usage last demonstrably CHANGED recently, not just that a capture
       recently repeated an old value (Codex review, round 2, P1). A recent,
@@ -243,33 +263,44 @@ def burn_rate_evidence_is_current(
       statistics forever.
 
       The tolerance is ``STALE_TREND_TOLERANCE`` multiples of the
-      projection's OWN implied inter-change interval (1 / rate), not a
-      fixed per-source constant. A first version of this check reused the
-      per-source freshness window (300s Claude, 1800s Codex) here, on the
-      theory that it already answers "how large a gap between captures is
-      still ordinary." That was wrong for a genuinely slow trend: Codex
-      weekly usage climbing 1 whole point every 2 hours is a perfectly real,
-      steady trend whose OWN inter-tick gap (7200s) is several times longer
-      than Codex's 1800s freshness window, so a fixed window rejected such
-      a trend for roughly three quarters of every tick cycle even though
-      nothing was actually wrong with it (Codex review, round 3, P1). The
-      right comparison is the rate's OWN cadence: how long would this
-      projection's fitted rate itself predict between whole-point changes,
-      and is the observed gap since the last one within a reasonable
-      multiple of that.
+      projection's OWN implied inter-change interval, computed as
+      ``latest_change_delta / rate`` -- how long the fitted rate predicts a
+      move of the SAME SIZE as the segment's actual last move should take
+      -- not ``1 / rate`` (a fixed one-point assumption) and not a fixed
+      per-source constant. Two earlier versions of this check each got this
+      wrong in a different way. A version that reused the per-source
+      freshness window (300s Claude, 1800s Codex) here rejected a
+      genuinely slow trend: Codex weekly usage climbing 1 whole point
+      every 2 hours has its own honest 7200s inter-tick gap, several times
+      longer than the 1800s window, so a fixed window called it stale for
+      roughly three quarters of every tick cycle (Codex review, round 3,
+      P1). Replacing that with ``1 / rate`` fixed the slow case but broke
+      sources whose real steps are not exactly one point: a series moving
+      5 points every 300s fits the same rate as one moving 1 point every
+      60s, so ``1 / rate`` recovers the wrong cadence (60s instead of the
+      true 300s) whenever a segment's real step size differs from one
+      point (Codex review, round 4, P2). Dividing the OBSERVED step size
+      by the rate recovers the segment's true cadence regardless of how
+      big its real steps are.
 
-    Both are required because they catch different failure shapes: a
-    missing/stale reading with a recent ``latest_change_at`` still fails (no
-    current capture to confirm anything), and a fresh reading with a stale
-    ``latest_change_at`` still fails (captures are current, but nothing has
-    actually moved recently relative to the rate's own implied cadence) --
-    this is the specific case a round-1 version of this function missed,
-    because it checked only reading freshness.
+    All three are required because they catch different failure shapes: a
+    missing/stale reading fails outright (no current capture at all); a
+    fresh reading for a DIFFERENT capture event than this projection's own
+    tail fails even though something is current (state and history have
+    drifted); and a fresh, correctly-matched reading with a stale
+    ``latest_change_at`` still fails (captures are current and correctly
+    paired, but nothing has actually moved recently relative to the
+    segment's own observed cadence).
     """
 
     if reading is None or reading.confidence is not Confidence.FRESH:
         return False
-    if projection.latest_change_at is None or projection.rate_percent_per_second is None:
+    if (
+        projection.latest_change_at is None
+        or projection.latest_change_delta is None
+        or projection.latest_captured_at is None
+        or projection.rate_percent_per_second is None
+    ):
         return False
     if projection.rate_percent_per_second <= 0.0:
         # Structurally unreachable through project_exhaustion (a successful
@@ -277,5 +308,18 @@ def burn_rate_evidence_is_current(
         # see burn_rate.py's NON_POSITIVE_RATE decline), but guarded so a
         # division below never sees a non-positive divisor.
         return False
-    expected_interval_seconds = 1.0 / projection.rate_percent_per_second
+    reading_captured_at = now - reading.age_seconds
+    # rel_tol=0.0 is required, not just the default: math.isclose's default
+    # rel_tol=1e-9 scales with the LARGER magnitude of the two values being
+    # compared, and epoch timestamps are ~1.7e9, so the default relative
+    # component alone contributes roughly 1.7 SECONDS of tolerance --
+    # almost 2000x looser than the 1ms abs_tol this line asks for, and wide
+    # enough to accept two genuinely distinct capture events as if they
+    # were the same one (Codex review, round 5, P2). Pinning rel_tol to
+    # 0.0 makes abs_tol the only tolerance in effect, as intended.
+    if not math.isclose(
+        reading_captured_at, projection.latest_captured_at, rel_tol=0.0, abs_tol=1e-3
+    ):
+        return False
+    expected_interval_seconds = projection.latest_change_delta / projection.rate_percent_per_second
     return (now - projection.latest_change_at) <= STALE_TREND_TOLERANCE * expected_interval_seconds

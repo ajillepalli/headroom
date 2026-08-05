@@ -101,6 +101,8 @@ class BurnRateTests(unittest.TestCase):
         self.assertIsNone(projection.max_raw_rate_ratio)
         self.assertIsNone(projection.longest_above_overall_rate_run)
         self.assertIsNone(projection.latest_change_at)
+        self.assertIsNone(projection.latest_change_delta)
+        self.assertIsNone(projection.latest_captured_at)
 
     def test_flat_usage_yields_no_projection_and_reason(self) -> None:
         projection = self._project(
@@ -235,6 +237,8 @@ class BurnRateTests(unittest.TestCase):
 
         self.assertIsNone(projection.reason)
         self.assertEqual(projection.latest_change_at, 1_200.0)
+        self.assertEqual(projection.latest_change_delta, 10.0)
+        self.assertEqual(projection.latest_captured_at, 1_200.0)
 
     def test_latest_change_at_is_before_a_trailing_flat_run(self) -> None:
         # (Codex review, round 2, P1) A climb followed by several captures
@@ -244,7 +248,10 @@ class BurnRateTests(unittest.TestCase):
         # (3_000.0), not the segment's final capture (4_500.0) -- the whole
         # point of this field is to let a caller distinguish "recently
         # captured" from "recently changed", and a trailing flat run is
-        # exactly the case those two diverge.
+        # exactly the case those two diverge. latest_captured_at, in
+        # contrast, IS the segment's final capture (4_500.0) -- it answers a
+        # different question (which capture does this projection's span and
+        # exhaustion time actually anchor to).
         projection = self._project(
             [
                 self._record(0.0, 10.0, resets_at=20_000.0),
@@ -260,6 +267,32 @@ class BurnRateTests(unittest.TestCase):
 
         self.assertIsNone(projection.reason)
         self.assertEqual(projection.latest_change_at, 3_000.0)
+        self.assertEqual(projection.latest_change_delta, 10.0)
+        self.assertEqual(projection.latest_captured_at, 4_500.0)
+
+    def test_latest_change_delta_reflects_a_multi_point_step(self) -> None:
+        # (Codex review, round 4, P2) A source whose real steps are 5 points
+        # per change, not 1: latest_change_delta must report the true step
+        # size (5.0), not silently assume a single point, because a caller
+        # dividing this by the fitted rate to recover the segment's real
+        # inter-change cadence needs the actual step size to do that
+        # correctly.
+        projection = self._project(
+            [
+                self._record(0.0, 10.0, resets_at=20_000.0),
+                self._record(300.0, 15.0, resets_at=20_000.0),
+                self._record(600.0, 20.0, resets_at=20_000.0),
+            ]
+        )[0]
+
+        self.assertIsNone(projection.reason)
+        self.assertEqual(projection.latest_change_delta, 5.0)
+        # rate is 5 points per 300s = 1/60 %/s; the TRUE inter-change
+        # cadence recovered from delta/rate is 300s, not 1/rate (60s).
+        assert projection.rate_percent_per_second is not None
+        self._assertClose(
+            projection.latest_change_delta / projection.rate_percent_per_second, 300.0
+        )
 
     # -- Regression tests for the second-round Codex P2 confidence review --
     # (kept as the historical record of what this metric must expose, now
