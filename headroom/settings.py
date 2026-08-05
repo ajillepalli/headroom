@@ -178,15 +178,6 @@ def run_init(
             )
         )
 
-    if len(targets) > 1 and _same_file(targets[0].path, targets[1].path):
-        print(
-            "headroom init: refusing to configure the same file as both Claude and Codex: {}".format(
-                targets[0].path
-            ),
-            file=sys.stderr,
-        )
-        return 1
-
     if print_only:
         document = (
             targets[0].snippet
@@ -195,6 +186,15 @@ def run_init(
         )
         print(json.dumps(document, indent=2))
         return 0
+
+    if len(targets) > 1 and _same_file(targets[0].path, targets[1].path):
+        print(
+            "headroom init: refusing to configure the same file as both Claude and Codex: {}".format(
+                targets[0].path
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     prepared: List[_PreparedInstall] = []
     for target in targets:
@@ -321,6 +321,9 @@ def _write_prepared(item: _PreparedInstall) -> None:
     backup = _backup_path(path)
     _exclusive_write(backup, item.original_text)
     print("Backup: {}".format(backup))
+    # A process can still edit between this comparison and os.replace(). Closing
+    # this accepted, microsecond-scale TOCTOU window requires a cross-platform
+    # exclusive lock or conditional-commit primitive.
     _assert_preflight_content(path, item.original_bytes)
     _atomic_write(path, item.rendered)
 
@@ -337,13 +340,22 @@ def _assert_preflight_content(path: Path, expected: bytes) -> None:
 def _rollback_installs(applied: Sequence[_PreparedInstall]) -> List[str]:
     errors: List[str] = []
     for item in reversed(applied):
+        path = item.target.path
+        try:
+            current = path.read_bytes()
+        except OSError as error:
+            errors.append("{} no longer matches the applied update: {}".format(path, error))
+            continue
+        if current != item.rendered.encode("utf-8"):
+            errors.append("{} changed after it was updated; left unchanged".format(path))
+            continue
         try:
             if item.existed:
-                _atomic_write(item.target.path, item.original_text)
+                _atomic_write(path, item.original_text)
             else:
-                item.target.path.unlink()
+                path.unlink()
         except OSError as error:
-            errors.append("{}: {}".format(item.target.path, error))
+            errors.append("{}: {}".format(path, error))
     return errors
 
 
@@ -454,23 +466,27 @@ def _is_headroom_hook_command(command: str) -> bool:
         if executable in ("headroom", "headroom.exe") and len(tokens) > 1:
             if tokens[1].casefold() == "hook":
                 return True
-        lowered = [token.casefold() for token in tokens]
-        for index in range(len(lowered) - 2):
-            if lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]:
-                return True
+        if _is_python_executable(executable):
+            lowered = [token.casefold() for token in tokens]
+            for index in range(1, len(lowered) - 2):
+                if lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]:
+                    return True
     return False
 
 
 def _command_is_available(command: str) -> bool:
     for tokens in _command_segments(command):
         lowered = [token.casefold() for token in tokens]
+        name = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
         is_hook = False
         if len(tokens) > 1:
-            name = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
             is_hook = name in ("headroom", "headroom.exe") and lowered[1] == "hook"
-        is_hook = is_hook or any(
-            lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]
-            for index in range(len(lowered) - 2)
+        is_hook = is_hook or (
+            _is_python_executable(name)
+            and any(
+                lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]
+                for index in range(1, len(lowered) - 2)
+            )
         )
         if not is_hook:
             continue
@@ -481,13 +497,40 @@ def _command_is_available(command: str) -> bool:
     return False
 
 
+def _is_python_executable(name: str) -> bool:
+    return re.fullmatch(
+        r"(?:(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?",
+        name,
+    ) is not None
+
+
 def _exclusive_write(path: Path, text: str) -> None:
     """Create a complete new file without replacing one that already exists."""
 
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
+    temporary_name: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=str(path.parent),
+            prefix="{}.".format(path.name),
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.link(temporary_name, str(path))
+        os.unlink(temporary_name)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def _atomic_write(path: Path, text: str) -> None:

@@ -65,12 +65,22 @@ def save_snapshots(
     if not isinstance(sources, dict):
         sources = {}
         state["sources"] = sources
+    accepted = []
     for snapshot in snapshots:
         source = sources.setdefault(snapshot.source, {})
         if not isinstance(source, dict):
             source = {}
             sources[snapshot.source] = source
+        current = source.get(snapshot.window)
+        if isinstance(current, dict):
+            try:
+                current_captured_at = float(current["captured_at"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                current_captured_at = None
+            if current_captured_at is not None and current_captured_at > snapshot.captured_at:
+                continue
         source[snapshot.window] = snapshot.to_dict()
+        accepted.append(snapshot)
     state["version"] = 1
     if diagnostics is not None:
         stored = state.setdefault("diagnostics", {})
@@ -79,7 +89,7 @@ def save_snapshots(
             state["diagnostics"] = stored
         stored.update(diagnostics)
     write_state(state, state_dir)
-    append_history(snapshots, state_dir)
+    append_history(accepted, state_dir)
     return state
 
 

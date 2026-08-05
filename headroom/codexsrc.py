@@ -181,7 +181,7 @@ def _last_snapshot_in_file(
             for line_number, line in enumerate(handle, 1):
                 if deadline is not None and time.monotonic() >= deadline:
                     notes.append("rollout scan deadline reached while reading {}".format(path))
-                    break
+                    return ()
                 try:
                     payload = json.loads(line)
                 except ValueError:

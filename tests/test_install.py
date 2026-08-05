@@ -417,6 +417,33 @@ class InstallTests(unittest.TestCase):
             self.assertIn("same file as both Claude and Codex", stderr)
             preflight.assert_not_called()
 
+    def test_init_all_print_does_not_compare_or_read_aliased_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "missing" / "codex"
+            aliased_settings = codex_home / "child" / ".." / "hooks.json"
+
+            with mock.patch(
+                "headroom.settings._same_file",
+                side_effect=AssertionError("print must not compare paths"),
+            ) as same_file:
+                result, stdout, stderr = self._run_cli(
+                    [
+                        "init",
+                        "--all",
+                        "--print",
+                        "--settings",
+                        str(aliased_settings),
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            self.assertEqual(result, 0, stderr)
+            self.assertEqual(set(json.loads(stdout)), {"claude", "codex"})
+            same_file.assert_not_called()
+            self.assertFalse((root / "missing").exists())
+
     def test_concurrent_creation_after_preflight_is_never_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
@@ -480,6 +507,91 @@ class InstallTests(unittest.TestCase):
             self.assertIn("restored the previously updated target", stderr)
             self.assertFalse(settings.exists())
             self.assertFalse((codex_home / "hooks.json").exists())
+
+    def test_init_all_does_not_roll_back_a_concurrent_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "claude" / "settings.json"
+            codex_home = root / "codex"
+            concurrent = '{"edited": "after apply"}\n'
+            real_write_prepared = settings_module._write_prepared
+            calls = 0
+
+            def edit_then_fail_second_write(item) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    settings.write_text(concurrent, encoding="utf-8")
+                    raise OSError("simulated Codex write failure")
+                real_write_prepared(item)
+
+            with mock.patch(
+                "headroom.settings._write_prepared",
+                side_effect=edit_then_fail_second_write,
+            ):
+                result, _, stderr = self._run_cli(
+                    [
+                        "init",
+                        "--all",
+                        "--settings",
+                        str(settings),
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            self.assertNotEqual(result, 0)
+            self.assertIn("rollback was incomplete", stderr)
+            self.assertIn(str(settings), stderr)
+            self.assertEqual(settings.read_text(encoding="utf-8"), concurrent)
+
+    def test_first_run_disk_failure_leaves_no_partial_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+
+            with mock.patch(
+                "headroom.settings.os.fsync", side_effect=OSError("disk full")
+            ):
+                result, _, stderr = self._run_init(path)
+
+            self.assertNotEqual(result, 0)
+            self.assertIn("disk full", stderr)
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.glob("settings.json.*.tmp")), [])
+
+    def test_module_tokens_are_not_registration_without_python_launcher(self) -> None:
+        fake = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "echo -m headroom.cli hook",
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text(
+                json.dumps({"hooks": {"UserPromptSubmit": [fake]}}),
+                encoding="utf-8",
+            )
+
+            result, _, stderr = self._run_init(path)
+
+            self.assertEqual(result, 0, stderr)
+            prompt_hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"][
+                "UserPromptSubmit"
+            ]
+            self.assertEqual(len(prompt_hooks), 2)
+
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            (codex_home / "hooks.json").write_text(
+                json.dumps({"hooks": {"UserPromptSubmit": [fake]}}),
+                encoding="utf-8",
+            )
+            _, registration = settings_module.codex_hook_registration(codex_home)
+            self.assertEqual(registration, "not registered")
 
     @staticmethod
     def _run_init(path: Path, *extra_arguments: str):
