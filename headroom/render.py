@@ -86,7 +86,7 @@ def render_hook(
     # not a real usage signal, so it stays isolated from burn-rate composition
     # rather than mixing synthetic severity with a genuine projection.
     burn_warning = (
-        None if forced_severity is not None else _earliest_burn_rate_warning(projections, readings)
+        None if forced_severity is not None else _earliest_burn_rate_warning(projections, readings, now)
     )
     if not actionable and forced_severity is None and burn_warning is None:
         return ""
@@ -156,19 +156,20 @@ def _severity_action(severity: Severity) -> str:
 def _earliest_burn_rate_warning(
     projections: Sequence[BurnRateProjection],
     readings: Sequence[Reading],
+    now: float,
 ) -> Optional[BurnRateProjection]:
     """The single most urgent trustworthy, currently-evidenced burn-rate
     warning, if any.
 
     "Trustworthy" (is the fit internally consistent) and "currently
-    evidenced" (is there a fresh reading confirming the same source and
-    window right now) are both answered by severity.py's policy functions;
-    this only asks both questions and, among the yeses, picks the soonest
-    projected exhaustion. Filters on ``exhaustion_precedes_reset is True``
-    specifically (never truthiness) -- ``False`` means exhaustion is
-    projected AFTER reset (nothing to warn about) and ``None`` means either
-    the reset time is unknown or no projection exists at all; neither is
-    "before reset."
+    evidenced" (is there a fresh reading AND a recent real change confirming
+    the same source and window right now) are both answered by severity.py's
+    policy functions; this only asks both questions and, among the yeses,
+    picks the soonest projected exhaustion. Filters on
+    ``exhaustion_precedes_reset is True`` specifically (never truthiness) --
+    ``False`` means exhaustion is projected AFTER reset (nothing to warn
+    about) and ``None`` means either the reset time is unknown or no
+    projection exists at all; neither is "before reset."
     """
 
     readings_by_window = {(reading.source, reading.window): reading for reading in readings}
@@ -178,7 +179,7 @@ def _earliest_burn_rate_warning(
         if projection.exhaustion_precedes_reset is True
         and burn_rate_projection_is_trustworthy(projection)
         and burn_rate_evidence_is_current(
-            projection, readings_by_window.get((projection.source, projection.window))
+            projection, readings_by_window.get((projection.source, projection.window)), now
         )
     ]
     if not candidates:
@@ -295,7 +296,7 @@ def render_burn_rate_status_lines(
         if not burn_rate_projection_is_trustworthy(projection):
             continue
         if not burn_rate_evidence_is_current(
-            projection, readings_by_window.get((projection.source, projection.window))
+            projection, readings_by_window.get((projection.source, projection.window)), now
         ):
             continue
         exhaustion_at = projection.projected_exhaustion_at

@@ -50,9 +50,17 @@ def _projection(
     effective_intervals: Optional[float] = 5.5,
     zero_delta_fraction: Optional[float] = 0.1,
     longest_above_overall_rate_run: Optional[int] = 1,
+    latest_change_at: Optional[float] = 990.0,
 ) -> BurnRateProjection:
     """Build a projection that clears every trust threshold with margin by
     default, so each test only needs to override the one field it targets.
+
+    ``latest_change_at`` defaults to 990.0: every test in this module that
+    calls ``render_hook``/``render_burn_rate_status_lines`` uses
+    ``now=1_000.0``, so this default is 10 seconds before "now" -- well
+    inside any source's freshness window (300s Claude, 1800s Codex) unless
+    a test deliberately overrides it to exercise
+    ``burn_rate_evidence_is_current``'s staleness check.
     """
 
     declined = reason is not None
@@ -73,6 +81,7 @@ def _projection(
         zero_delta_fraction=None if declined else zero_delta_fraction,
         max_raw_rate_ratio=None if declined else max_raw_rate_ratio,
         longest_above_overall_rate_run=None if declined else longest_above_overall_rate_run,
+        latest_change_at=None if declined else latest_change_at,
     )
 
 
@@ -287,6 +296,15 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
         self.assertEqual(lines, [])
 
+    def test_stalled_trend_says_nothing_in_status_despite_fresh_capture(self) -> None:
+        # Same stalled-trend case as hook's: a fresh capture that only
+        # repeats an old value is not evidence the trend continues.
+        projection = _projection(source="claude", window="short", latest_change_at=600.0)
+        reading = _fresh_reading(source="claude", window="short")
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
+
+        self.assertEqual(lines, [])
+
 
 class RenderHookCompositionTests(unittest.TestCase):
     def _reading(
@@ -378,6 +396,24 @@ class RenderHookCompositionTests(unittest.TestCase):
         # -- there is nothing to confirm the trend is current.
         readings = [self._reading(lower_bound_percent=3.0)]
         projection = _projection(source="claude", window="short")
+        text = render_hook(readings, now=1_000.0, projections=[projection])
+
+        self.assertEqual(text, "")
+
+    def test_stalled_trend_suppresses_hook_warning_despite_fresh_capture(self) -> None:
+        # Codex review, round 2, P1: a FRESH capture only proves a capture
+        # recently happened, not that usage recently MOVED. A projection
+        # whose latest_change_at is far in the past (usage climbed, then
+        # genuinely stalled, but captures kept arriving reporting the same
+        # value) must stay silent even though every trust threshold passes
+        # and the reading itself is fresh -- the whole point of
+        # latest_change_at is to catch exactly this case, which a
+        # FRESH-only check cannot see.
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
+        # now=1_000.0; Claude's freshness window is 300s (see freshness.py),
+        # so a change 400s stale fails while a fresh capture 10s old (from
+        # _fresh_reading's age_seconds=10.0) still passes on its own.
+        projection = _projection(latest_change_at=600.0)
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
         self.assertEqual(text, "")

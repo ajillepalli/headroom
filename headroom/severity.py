@@ -5,6 +5,7 @@ from typing import Optional
 
 from .bounds import Confidence, Reading
 from .burn_rate import BurnRateProjection
+from .freshness import freshness_seconds
 
 
 ESCALATE_BELOW_HEADROOM = 50.0
@@ -193,30 +194,50 @@ def burn_rate_projection_is_trustworthy(projection: BurnRateProjection) -> bool:
 
 
 def burn_rate_evidence_is_current(
-    projection: BurnRateProjection, reading: Optional[Reading]
+    projection: BurnRateProjection, reading: Optional[Reading], now: float
 ) -> bool:
     """Whether there is currently fresh evidence backing this projection's
     trend, not just an internally consistent historical fit.
 
     ``burn_rate_projection_is_trustworthy`` asks whether the projection's own
     measurements are internally consistent; it says nothing about how long
-    ago the sample they were built from was captured. A source that stops
-    reporting mid-window can leave behind a perfectly steady, low-deviation
-    historical trend -- every one of the five thresholds above can pass on
-    data nothing has confirmed in hours. Extrapolating that forward and
-    telling the model "you are on pace to run out" would be presenting a
-    stale extrapolation as a live warning (Codex review, round 1, P2).
+    ago usage last actually MOVED. A source that stops reporting mid-window
+    can leave behind a perfectly steady, low-deviation historical trend --
+    every one of the four thresholds above can pass on data nothing has
+    confirmed in hours. Extrapolating that forward and telling the model
+    "you are on pace to run out" would be presenting a stale extrapolation
+    as a live warning (Codex review, round 1, P2). This check requires two
+    separate things, because they are genuinely different failures:
 
-    This is a second, independent gate for exactly that reason, rather than
-    folded into the five-threshold check above: it answers a different
-    question ("is this still happening") using different evidence (the
-    CURRENT reading for the same exact source and window, not the
-    projection's own history), and reuses the existing freshness machinery
-    (``bounds.Confidence``, ``freshness.py``) instead of inventing a second,
-    parallel staleness threshold. A missing reading (no current data for
-    this source and window at all) or anything less current than
-    ``Confidence.FRESH`` fails this gate, regardless of how clean the
-    projection's own fit looks.
+    * A reading for the exact same source and window with confidence
+      ``Confidence.FRESH`` (``bounds.py``, ``freshness.py``) -- a recent
+      CAPTURE happened at all. A missing reading, or anything less current
+      than ``FRESH``, fails this gate outright.
+    * ``now`` is within the source's freshness window of
+      ``projection.latest_change_at`` -- usage last demonstrably CHANGED
+      recently, not just that a capture recently repeated an old value
+      (Codex review, round 2, P1). A recent, fresh capture that only
+      confirms an old plateau is not evidence a trend continues: a session
+      that climbed steadily and then genuinely stalled can still produce
+      fresh, unremarkable-looking captures indefinitely, and every folded
+      measurement above is blind to a trailing stall by construction (see
+      ``latest_change_at``'s docstring in burn_rate.py) -- it would keep
+      reporting the OLD climb's clean statistics forever. Reusing the same
+      per-source freshness window here (rather than a separate constant) is
+      deliberate: it is already the answer to "how large a gap between
+      captures is still ordinary" for this source, and a gap since the last
+      REAL change is held to the same bar as a gap since the last capture.
+
+    Both are required because they catch different failure shapes: a
+    missing/stale reading with a recent ``latest_change_at`` still fails (no
+    current capture to confirm anything), and a fresh reading with a stale
+    ``latest_change_at`` still fails (captures are current, but nothing has
+    actually moved recently) -- this is the specific case a round-1 version
+    of this function missed, because it checked only reading freshness.
     """
 
-    return reading is not None and reading.confidence is Confidence.FRESH
+    if reading is None or reading.confidence is not Confidence.FRESH:
+        return False
+    if projection.latest_change_at is None:
+        return False
+    return (now - projection.latest_change_at) <= freshness_seconds(projection.source)
