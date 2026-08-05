@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 
+from headroom import codexrpc
 from headroom.bounds import Snapshot
 from headroom.codexrpc import CodexRpcResult
 from headroom.codexsrc import CodexResult
@@ -90,11 +91,16 @@ class CodexRpcTests(unittest.TestCase):
             # cannot be made fully race-proof without a product-code hook for
             # "child has been scheduled" (there is no such signal available
             # today, and this is a test-synchronisation issue, not a product
-            # bug), so instead we use the same 6s budget the product itself
-            # defaults to in real usage (DEFAULT_TIMEOUT_SECONDS in
-            # codexrpc.py) -- more than double the worst spawn jitter we
-            # measured -- to make the residual race negligible in practice.
-            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "6"
+            # bug), so instead we use a budget close to the product's own
+            # DEFAULT_TIMEOUT_SECONDS (6s) in codexrpc.py -- comfortably more
+            # than double the worst spawn jitter we measured -- to make the
+            # residual race negligible in practice. Deliberately not exactly
+            # 6s: that would make this test pass even if the
+            # HEADROOM_CODEX_RPC_TIMEOUT override were silently ignored and
+            # the default always won, see test_timeout_seconds_honors_a_
+            # non_default_override for the direct, timing-independent check
+            # of that parsing path.
+            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "7"
             environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
             environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
             environment["HEADROOM_TEST_RPC_HEARTBEAT"] = str(root / "heartbeat")
@@ -140,6 +146,20 @@ class CodexRpcTests(unittest.TestCase):
                 "child kept heartbeating after its RPC timeout should have killed it",
             )
             self.assertFalse((root / "survived").exists())
+
+    def test_timeout_seconds_honors_a_non_default_override(self) -> None:
+        # A subprocess-timing integration test alone can't prove
+        # HEADROOM_CODEX_RPC_TIMEOUT is actually read: any value close
+        # enough to DEFAULT_TIMEOUT_SECONDS to keep that test fast is
+        # indistinguishable, by wall-clock behavior, from the override
+        # being silently ignored. Exercise the parsing directly instead.
+        notes: list = []
+        self.assertEqual(
+            codexrpc._timeout_seconds({"HEADROOM_CODEX_RPC_TIMEOUT": "7"}, notes),
+            7.0,
+        )
+        self.assertEqual(notes, [])
+        self.assertNotEqual(7.0, codexrpc.DEFAULT_TIMEOUT_SECONDS)
 
     def test_garbage_output_falls_back_to_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
