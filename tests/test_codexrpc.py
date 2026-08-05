@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 
+from headroom import codexrpc
 from headroom.bounds import Snapshot
 from headroom.codexrpc import CodexRpcResult
 from headroom.codexsrc import CodexResult
@@ -81,9 +82,28 @@ class CodexRpcTests(unittest.TestCase):
             root = Path(directory)
             self._write_rollout(root, used_percent=41)
             environment = self._environment(root, "timeout")
-            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "1"
+            # A 1s timeout used to flake under full-suite load: process spawn
+            # plus interpreter startup for the stub child can itself exceed
+            # 1s once the machine is busy (measured up to ~2.8s under heavy
+            # synthetic CPU contention on a 24-core box), so the parent could
+            # kill the child before it was ever scheduled to run its first
+            # line of Python, i.e. before "started" could be written. This
+            # cannot be made fully race-proof without a product-code hook for
+            # "child has been scheduled" (there is no such signal available
+            # today, and this is a test-synchronisation issue, not a product
+            # bug), so instead we use a budget close to the product's own
+            # DEFAULT_TIMEOUT_SECONDS (6s) in codexrpc.py -- comfortably more
+            # than double the worst spawn jitter we measured -- to make the
+            # residual race negligible in practice. Deliberately not exactly
+            # 6s: that would make this test pass even if the
+            # HEADROOM_CODEX_RPC_TIMEOUT override were silently ignored and
+            # the default always won, see test_timeout_seconds_honors_a_
+            # non_default_override for the direct, timing-independent check
+            # of that parsing path.
+            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "7"
             environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
             environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
+            environment["HEADROOM_TEST_RPC_HEARTBEAT"] = str(root / "heartbeat")
 
             document = self._run_json(environment)
 
@@ -94,9 +114,83 @@ class CodexRpcTests(unittest.TestCase):
             diagnostics = document["diagnostics"]["codex"]
             self.assertEqual(diagnostics["source"], "rollout")
             self.assertTrue(any("timed out" in note for note in diagnostics["notes"]))
-            self.assertTrue((root / "started").is_file())
-            time.sleep(0.8)
+            # Poll instead of a single is_file() check: the write already
+            # landed by the time _run_json() returns (the child is reaped
+            # before main() gives control back), but polling with a
+            # generous deadline still proves the child genuinely started
+            # and gives a clear failure if it somehow never did, rather
+            # than depending on exact same-tick filesystem visibility.
+            self._wait_for_marker(root / "started")
+            # Prove the kill actually happened without waiting out the
+            # stub's entire (long, deliberately unresponsive) lifetime: the
+            # stub heartbeats every 0.1s while stalled, so if it is still
+            # alive after _run_json() returned (i.e. after the RPC timeout
+            # should have killed it), a fresh heartbeat will appear within
+            # a short grace window. A fixed sleep sized to the stub's full
+            # stall was tried first and was correct but made this one test
+            # dominate the suite's runtime; comparing heartbeats gives the
+            # same guarantee (confirmed by mocking _stop_process as a
+            # no-op and seeing this correctly fail) much faster.
+            heartbeat_path = root / "heartbeat"
+            self._wait_for_marker(heartbeat_path)
+            before = heartbeat_path.read_text(encoding="utf-8")
+            time.sleep(0.5)
+            after = (
+                heartbeat_path.read_text(encoding="utf-8")
+                if heartbeat_path.exists()
+                else before
+            )
+            self.assertEqual(
+                before,
+                after,
+                "child kept heartbeating after its RPC timeout should have killed it",
+            )
             self.assertFalse((root / "survived").exists())
+
+    def test_timeout_seconds_honors_a_non_default_override(self) -> None:
+        # A subprocess-timing integration test alone can't prove
+        # HEADROOM_CODEX_RPC_TIMEOUT is actually read: any value close
+        # enough to DEFAULT_TIMEOUT_SECONDS to keep that test fast is
+        # indistinguishable, by wall-clock behavior, from the override
+        # being silently ignored. Exercise the parsing directly instead.
+        notes: list = []
+        self.assertEqual(
+            codexrpc._timeout_seconds({"HEADROOM_CODEX_RPC_TIMEOUT": "7"}, notes),
+            7.0,
+        )
+        self.assertEqual(notes, [])
+        self.assertNotEqual(7.0, codexrpc.DEFAULT_TIMEOUT_SECONDS)
+
+    def test_read_rate_limits_wires_the_override_into_the_deadline(self) -> None:
+        # Parsing the override correctly (the test above) and actually using
+        # it to compute rpc_deadline are two different things: a regression
+        # that dropped the parsed value on the floor and fell back to
+        # DEFAULT_TIMEOUT_SECONDS would pass both the integration test
+        # (whose stub outlasts either value) and the isolated parser test
+        # above. Spy on _wait_for_response to see the exact deadline
+        # read_rate_limits computed and hands it, with a fixed clock so the
+        # expected value is exact rather than a real-time approximation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
+                "HEADROOM_CODEX_RPC_TIMEOUT": "7",
+                "HEADROOM_TEST_RPC_MODE": "timeout",
+                "HEADROOM_TEST_RPC_HEARTBEAT": str(root / "heartbeat"),
+            }
+            captured_deadlines: list = []
+
+            def spy(messages, request_id, deadline, notes):
+                captured_deadlines.append(deadline)
+                raise codexrpc._RpcTimeout()
+
+            with mock.patch("headroom.codexrpc.time.monotonic", return_value=1_000.0):
+                with mock.patch(
+                    "headroom.codexrpc._wait_for_response", side_effect=spy
+                ):
+                    codexrpc.read_rate_limits(environ=environment)
+
+            self.assertEqual(captured_deadlines, [1_000.0 + 7.0])
 
     def test_garbage_output_falls_back_to_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -222,6 +316,12 @@ class CodexRpcTests(unittest.TestCase):
                 rollout_results.append(result)
                 return result
 
+            # This is a synthetic fixture (the 94% figure below is fake),
+            # so its hook text must never reach the real stdout: unlike
+            # every sibling test here, this call was missing its
+            # redirect_stdout wrapper, letting the fake reading print to
+            # the terminal and look exactly like genuine usage output.
+            output = StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
                 save_snapshots((stored,))
                 with mock.patch(
@@ -235,9 +335,11 @@ class CodexRpcTests(unittest.TestCase):
                             "headroom.codexsrc.time.monotonic",
                             side_effect=[0.0] * 6 + [float("inf")],
                         ):
-                            result = main(["hook", "--plain"])
+                            with redirect_stdout(output):
+                                result = main(["hook", "--plain"])
 
             self.assertEqual(result, 0)
+            self.assertIn("94% used", output.getvalue())
             self.assertEqual(len(rollout_results), 1)
             self.assertEqual(rollout_results[0].snapshots, ())
             self.assertIn("deadline reached while reading", " ".join(rollout_results[0].notes))
@@ -253,6 +355,18 @@ class CodexRpcTests(unittest.TestCase):
             "HEADROOM_STATE_DIR": str(root / "state"),
             "HEADROOM_TEST_RPC_MODE": mode,
         }
+
+    def _wait_for_marker(self, path: Path, timeout: float = 10.0) -> None:
+        """Poll for a marker file with a generous deadline instead of a
+        single point-in-time check, so a slow-scheduled child under load
+        still gets a fair chance to be observed before we fail the test."""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.02)
+        self.fail("{} was never created within {}s".format(path, timeout))
 
     def _run_json(self, environment: dict[str, str]) -> dict:
         output = StringIO()
