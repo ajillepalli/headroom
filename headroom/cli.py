@@ -12,12 +12,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .bounds import Reading, Snapshot, bound_snapshot
+from .burn_rate import BurnRateProjection, project_exhaustion
 from .claude import parse_stdin
 from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .install_info import format_modified_time, inspect_install, source_commit
-from .render import render_hook, render_report, render_statusline
+from .render import (
+    render_burn_rate_doctor_lines,
+    render_burn_rate_status_lines,
+    render_hook,
+    render_report,
+    render_statusline,
+)
 from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .severity import Severity
 from .settings import (
@@ -163,13 +170,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _refresh_codex(deadline=deadline)
         state = read_state()
         readings = _readings(state, now)
+        projections = _burn_rate_projections(now)
         if arguments.command == "status":
             print(render_report(readings, now))
+            burn_lines = render_burn_rate_status_lines(projections, now)
+            if burn_lines:
+                print("Burn rate")
+                for line in burn_lines:
+                    print(line)
             _print_status_update()
         elif arguments.command == "json":
-            print(json.dumps(_json_document(state, readings), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            print(
+                json.dumps(
+                    _json_document(state, readings, projections),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         elif arguments.command == "hook":
-            text = render_hook(readings, now, forced_severity=_forced_hook_severity())
+            text = render_hook(readings, now, projections=projections, forced_severity=_forced_hook_severity())
             if text:
                 if arguments.plain or not _user_prompt_submit_input():
                     print(text)
@@ -286,9 +306,29 @@ def _readings(state: Dict[str, Any], now: float) -> List[Reading]:
     ]
 
 
-def _json_document(state: Dict[str, Any], readings: Sequence[Reading]) -> Dict[str, Any]:
+def _burn_rate_projections(now: float) -> List[BurnRateProjection]:
+    """Project quota exhaustion from the persisted history file.
+
+    Reads directly from history.jsonl rather than the in-memory readings
+    just refreshed above: burn_rate.project_exhaustion needs the whole
+    recent history to fit a rate, not just the latest snapshot per window.
+    An unreadable or missing history file yields an empty list (see
+    project_exhaustion's own OSError handling), which every caller here
+    already treats the same as "nothing to report."
+    """
+
+    history_path = resolve_state_dir() / "history.jsonl"
+    return project_exhaustion(history_path, now=now)
+
+
+def _json_document(
+    state: Dict[str, Any],
+    readings: Sequence[Reading],
+    projections: Sequence[BurnRateProjection],
+) -> Dict[str, Any]:
     result = dict(state)
     result["readings"] = [reading.to_dict() for reading in readings]
+    result["burn_rate_projections"] = [projection.to_dict() for projection in projections]
     return result
 
 
@@ -334,6 +374,15 @@ def _doctor() -> int:
     notes += codex.rpc.notes + (rollout.notes if rollout is not None else ())
     if notes:
         print("Notes: {}".format("; ".join(dict.fromkeys(notes))))
+    print()
+    print("Burn rate")
+    doctor_now = time.time()
+    burn_lines = render_burn_rate_doctor_lines(_burn_rate_projections(doctor_now), doctor_now)
+    if burn_lines:
+        for line in burn_lines:
+            print(line)
+    else:
+        print("  no usage history recorded")
     _print_update_doctor()
     return 0
 

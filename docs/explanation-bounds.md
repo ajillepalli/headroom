@@ -8,7 +8,9 @@ headroom does not guess current usage from an old sample. It turns each timestam
 
 Usage is monotonic inside one rate-limit window. After a reading says 65% used, later work can raise usage, but usage cannot fall before that window resets. If the snapshot becomes stale before its reset, the only sound statement is that current usage is at least 65%.
 
-That is why a stale reading is rendered as `>=65% used`, not `65% used`. The stored percentage is a lower bound and `certain` is false. headroom does not estimate burn rate or tokens remaining.
+That is why a stale reading is rendered as `>=65% used`, not `65% used`. The stored percentage is a lower bound and `certain` is false. A stale reading stays a lower bound even where a burn-rate projection exists alongside it: the projection is a separate statement about the recorded history, not a replacement for the bound above.
+
+headroom does project quota exhaustion from persisted usage history, fitting a rate from the recent samples in `history.jsonl` for each source and window. That projection declines rather than guesses when the data cannot support it -- too few samples, too short a span, a flat or non-positive fitted rate, and several other structural reasons all produce no projection, with the specific reason reported rather than a number invented to fill the gap. When a projection does exist, it reports the fitted rate, the projected exhaustion time, and eight measurements of how internally consistent that fit was, but it takes no position on whether those measurements are good enough to act on -- that judgment is a policy question answered by the application, not the projection itself. See [the CLI reference's burn-rate section](reference-cli.md#burn-rate-projections) for the full field list and for where that policy lives.
 
 ## An absolute reset ends the old claim
 
@@ -52,4 +54,8 @@ Headroom is `100 - used percentage`.
 
 For a `stale_bounded` reading with less than 50% headroom, headroom raises the base severity by one level and caps it at `critical`. The code names this boundary `ESCALATE_BELOW_HEADROOM = 50.0`. Exactly 50% headroom does not escalate. A `post_reset` reading is always `ok`.
 
-The prompt hook stays silent when all four readings are `ok`. For capture timing and source field names, see [How capture works](explanation-capture.md).
+## A burn-rate projection is not a threshold
+
+The severity ladder above is a policy: it turns a continuous quantity (remaining headroom) into a decision (should this be shown, and how urgently). Burn-rate projections are deliberately built the other way around. The projection itself reports measurements -- a fitted rate, a projected exhaustion time, and eight numbers describing how internally consistent that fit was -- and takes no position on whether those measurements are trustworthy enough to act on. Baking a HIGH/MEDIUM/LOW judgment into the projection was tried and abandoned across several rounds of review: any hard cutoff on a continuous quantity can be approached from just underneath, so the cutoff itself becomes the thing under dispute, not the data. Instead, the trust decision lives beside the severity ladder in the application, using the same kind of reasoning (a named constant, justified by the claim it lets a caller make, not by a target firing rate). `headroom status` and `headroom hook` both apply that decision before showing a projection to anyone; `headroom doctor` and `headroom json` show every projection's own measurements regardless, so the underlying data is always inspectable even when the policy declines to speak.
+
+The prompt hook stays silent when all four rate-limit readings are `ok` and there is no burn-rate projection worth showing. It can still speak when a rate-limit reading is `ok` but a trustworthy projection shows a window running out before its reset -- that is the case the projection exists to catch, since low current usage says nothing about whether the pace it is climbing at will clear the reset in time. For capture timing and source field names, see [How capture works](explanation-capture.md).

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -476,6 +477,291 @@ class CliTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         self.assertEqual(headroom.__version__, match.group(1))
+
+
+def _write_history(state_dir: Path, records) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(record, separators=(",", ":")) for record in records]
+    (state_dir / "history.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _steady_climb_records(now: float, source: str = "claude", window: str = "short"):
+    """Six records, 600s apart, climbing 10 points each interval.
+
+    Every interval carries the same rate, so max_relative_deviation and
+    rate_drift are both 0.0, max_raw_rate_ratio is 1.0 (no burst), the
+    largest single interval supplies only 1/5 of total usage, and there are
+    5 post-folding intervals -- clearing every severity.py trust threshold
+    with margin. The projected exhaustion (40 more points at this rate,
+    40 minutes past the last capture) lands well before the 2-hour resets_at
+    below, so exhaustion_precedes_reset is True.
+    """
+
+    base = now - 3_600.0
+    resets_at = now + 7_200.0
+    return [
+        {
+            "captured_at": base + index * 600.0,
+            "used_percentage": 10.0 * (index + 1),
+            "resets_at": resets_at,
+            "source": source,
+            "window": window,
+        }
+        for index in range(6)
+    ]
+
+
+def _too_few_samples_records(now: float, source: str = "codex", window: str = "weekly"):
+    """Two records: below burn_rate.MIN_SAMPLES, so the projection declines
+    with TOO_FEW_SAMPLES."""
+
+    return [
+        {
+            "captured_at": now - 120.0,
+            "used_percentage": 5.0,
+            "resets_at": now + 500_000.0,
+            "source": source,
+            "window": window,
+        },
+        {
+            "captured_at": now - 60.0,
+            "used_percentage": 6.0,
+            "resets_at": now + 500_000.0,
+            "source": source,
+            "window": window,
+        },
+    ]
+
+
+def _bursty_but_present_records(now: float, source: str = "claude", window: str = "weekly"):
+    """Five monotonic records with wildly uneven per-interval rates.
+
+    A projection exists (reason is None: the fit succeeds) but its
+    max_relative_deviation is well above MAX_TRUSTED_RELATIVE_DEVIATION, so
+    severity.py's policy declines to call it trustworthy. This is the
+    "present but not worth showing" case, distinct from a declined
+    projection (see burn_rate.py's own
+    test_uneven_intervals_still_project_and_report_the_disagreement, which
+    this mirrors).
+    """
+
+    base = now - 7_200.0
+    resets_at = now + 12_800.0
+    offsets_and_usage = ((0.0, 10.0), (1_800.0, 30.0), (3_600.0, 32.0), (5_400.0, 55.0), (7_200.0, 57.0))
+    return [
+        {
+            "captured_at": base + offset,
+            "used_percentage": usage,
+            "resets_at": resets_at,
+            "source": source,
+            "window": window,
+        }
+        for offset, usage in offsets_and_usage
+    ]
+
+
+class BurnRateSurfaceTests(unittest.TestCase):
+    """End-to-end coverage of burn-rate wiring across json, doctor, status,
+    and hook. Unit-level policy and rendering edge cases live in
+    tests/test_burn_rate_policy.py; these tests exist to prove each surface
+    actually reads history.jsonl, calls the right renderer, and does not
+    crash, using real files end to end.
+    """
+
+    def _environment(self, root: Path) -> dict:
+        return {
+            "CODEX_HOME": str(root / "codex-hooks"),
+            "HEADROOM_STATE_DIR": str(root / "state"),
+            "HEADROOM_CODEX_HOME": str(root / "codex"),
+            "HEADROOM_CODEX_RPC": "0",
+        }
+
+    def test_json_burn_rate_projections_is_top_level_not_nested_in_readings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            _write_history(
+                root / "state",
+                _steady_climb_records(now) + _too_few_samples_records(now),
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertIn("burn_rate_projections", document)
+            self.assertNotIn("burn_rate_projections", document.get("readings", {}))
+            projections = {
+                (p["source"], p["window"]): p for p in document["burn_rate_projections"]
+            }
+            self.assertIn(("claude", "short"), projections)
+            self.assertIn(("codex", "weekly"), projections)
+
+            declined = projections[("codex", "weekly")]
+            self.assertEqual(declined["reason"], "too_few_samples")
+            for field in (
+                "max_relative_deviation",
+                "max_usage_share",
+                "intervals_used",
+                "rate_drift",
+                "effective_intervals",
+                "zero_delta_fraction",
+                "max_raw_rate_ratio",
+                "longest_above_overall_rate_run",
+                "projected_exhaustion_at",
+                "exhaustion_precedes_reset",
+            ):
+                self.assertIsNone(declined[field])
+
+            present = projections[("claude", "short")]
+            self.assertIsNone(present["reason"])
+            self.assertIs(present["exhaustion_precedes_reset"], True)
+            for field in (
+                "max_relative_deviation",
+                "max_usage_share",
+                "intervals_used",
+                "rate_drift",
+                "effective_intervals",
+                "zero_delta_fraction",
+                "max_raw_rate_ratio",
+                "longest_above_overall_rate_run",
+                "projected_exhaustion_at",
+                "rate_percent_per_second",
+            ):
+                self.assertIsNotNone(present[field], field)
+
+    def test_doctor_reports_measurements_and_plain_language_decline_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            _write_history(
+                root / "state",
+                _steady_climb_records(now) + _too_few_samples_records(now),
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["doctor"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertIn("Burn rate\n", rendered)
+            self.assertIn("not enough usage samples recorded yet", rendered)
+            self.assertNotIn("too_few_samples", rendered)
+            self.assertIn("exhaustion projected in", rendered)
+            self.assertIn("before reset", rendered)
+            self.assertIn("deviation", rendered)
+
+    def test_status_shows_trustworthy_line_and_omits_untrustworthy_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            _write_history(
+                root / "state",
+                _steady_climb_records(now, window="short")
+                + _bursty_but_present_records(now, window="weekly"),
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["status"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertIn("Burn rate\n", rendered)
+            self.assertIn("Claude 5h burn rate: projected exhaustion", rendered)
+            self.assertNotIn("7d burn rate", rendered)
+            # The ordinary readings section still prints; burn rate does not
+            # crowd it out.
+            self.assertIn("Claude\n", rendered)
+            self.assertIn("Codex\n", rendered)
+
+    def test_hook_speaks_when_trustworthy_projection_precedes_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            _write_history(root / "state", _steady_climb_records(now))
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertIn("Burn rate:", rendered)
+            self.assertIn("Claude 5h", rendered)
+
+    def test_hook_critical_rate_limit_suppresses_burn_rate_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            state_dir = root / "state"
+            _write_history(state_dir, _steady_climb_records(now))
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "codex": {
+                        "weekly": {
+                            "used_percentage": 95.0,
+                            "captured_at": now,
+                            "resets_at": now + 500_000.0,
+                            "window": "weekly",
+                            "source": "codex",
+                            "limit_reached": False,
+                            "raw": {},
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertIn("Usage headroom:", rendered)
+            self.assertIn("Codex", rendered)
+            self.assertNotIn("Burn rate:", rendered)
+
+    def test_hook_exits_zero_with_malformed_state_and_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "state.json").write_text("{not json", encoding="utf-8")
+            (state_dir / "history.jsonl").write_text("{not json\nalso not json\n", encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_statusline_output_is_unaffected_by_burn_rate_projections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            _write_history(root / "state", _steady_climb_records(now))
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    with redirect_stdout(output):
+                        result = cli.main(["statusline"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertNotIn("Burn rate", rendered)
+            self.assertNotIn("burn rate", rendered)
+            self.assertTrue(rendered.startswith("headroom:"))
 
 
 if __name__ == "__main__":

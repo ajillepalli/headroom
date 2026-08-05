@@ -331,6 +331,34 @@ class BurnRateProjection:
     max_raw_rate_ratio: Optional[float] = None
     longest_above_overall_rate_run: Optional[int] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-compatible representation with every field present.
+
+        ``reason`` is serialized as its string value (not the enum member)
+        so a caller debugging "why is there no projection" over JSON gets a
+        stable, documented string rather than a Python repr. This mirrors
+        Snapshot.to_dict and Reading.to_dict in bounds.py.
+        """
+
+        return {
+            "source": self.source,
+            "window": self.window,
+            "rate_percent_per_second": self.rate_percent_per_second,
+            "projected_exhaustion_at": self.projected_exhaustion_at,
+            "exhaustion_precedes_reset": self.exhaustion_precedes_reset,
+            "samples_used": self.samples_used,
+            "span_seconds": self.span_seconds,
+            "reason": self.reason.value if self.reason is not None else None,
+            "max_relative_deviation": self.max_relative_deviation,
+            "max_usage_share": self.max_usage_share,
+            "intervals_used": self.intervals_used,
+            "rate_drift": self.rate_drift,
+            "effective_intervals": self.effective_intervals,
+            "zero_delta_fraction": self.zero_delta_fraction,
+            "max_raw_rate_ratio": self.max_raw_rate_ratio,
+            "longest_above_overall_rate_run": self.longest_above_overall_rate_run,
+        }
+
 
 @dataclass(frozen=True)
 class _HistoryRecord:
