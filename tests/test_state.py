@@ -45,6 +45,52 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(json.load(handle), original)
             self.assertEqual(list(state_dir.glob(".state-*.tmp")), [])
 
+    def test_write_state_retries_a_transient_windows_access_denied_failure(self) -> None:
+        # Reproduced directly under real, heavy concurrent multi-process
+        # load on Windows: os.replace (MoveFileEx) can fail with
+        # PermissionError for a few milliseconds if something external
+        # (antivirus real-time scanning, the Windows Search Indexer) has
+        # the target file open at the exact instant of the rename. This
+        # is not a headroom locking bug -- the lock already guarantees
+        # only one headroom process is ever inside write_state at a time
+        # -- so retrying a BOUNDED number of times, rather than failing
+        # the whole write outright, is the correct response to a purely
+        # external, momentary conflict.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            new_state = {"version": 1, "sources": {"claude": {"marker": "new"}}}
+            real_replace = os.replace
+            calls = []
+
+            def flaky_replace(source, target):
+                calls.append(1)
+                if len(calls) < 3:
+                    raise PermissionError(5, "Access is denied")
+                return real_replace(source, target)
+
+            with mock.patch("headroom.state.os.replace", side_effect=flaky_replace):
+                with mock.patch("headroom.state.time.sleep"):
+                    write_state(new_state, state_dir)
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(read_state(state_dir), new_state)
+
+    def test_write_state_gives_up_after_bounded_retries_on_persistent_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch(
+                "headroom.state.os.replace",
+                side_effect=PermissionError(5, "Access is denied"),
+            ) as replace_mock:
+                with mock.patch("headroom.state.time.sleep"):
+                    with self.assertRaises(PermissionError):
+                        write_state({"version": 1, "sources": {}}, state_dir)
+
+            from headroom.state import _REPLACE_RETRY_ATTEMPTS
+
+            self.assertEqual(replace_mock.call_count, _REPLACE_RETRY_ATTEMPTS)
+            self.assertEqual(list(state_dir.glob(".state-*.tmp")), [])
+
     def test_reset_command_clears_state_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -488,6 +534,99 @@ class StateTests(unittest.TestCase):
             captures = context_captures_from_state(state)
             self.assertIn("session-30", captures)
             self.assertIn("session-5", captures)
+
+    def test_pruning_tolerance_is_not_coupled_to_a_small_configured_freshness_window(
+        self,
+    ) -> None:
+        # Codex review (round 2, P2): an earlier version of the reordering
+        # fix above reused fresh_for_seconds (HEADROOM_FRESH_CONTEXT_SECONDS,
+        # user-configurable) as the pruning sweep's future-tolerance. That
+        # reintroduces the exact same reordering bug the moment someone
+        # configures a freshness window shorter than realistic scheduling
+        # delay -- "how long should a reading stay visible" and "how much
+        # concurrent-writer timing slop is plausible" are unrelated
+        # questions and must not share one knob.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch.dict(os.environ, {"HEADROOM_FRESH_CONTEXT_SECONDS": "10"}):
+                save_snapshots(
+                    (),
+                    state_dir,
+                    context_capture={
+                        "used_percentage": 1.0,
+                        "size": None,
+                        "session_id": "session-30",
+                        "captured_at": 30.0,
+                        "source": "claude",
+                    },
+                )
+                state = save_snapshots(
+                    (),
+                    state_dir,
+                    context_capture={
+                        "used_percentage": 2.0,
+                        "size": None,
+                        "session_id": "session-5",
+                        "captured_at": 5.0,
+                        "source": "claude",
+                    },
+                )
+
+            captures = context_captures_from_state(state)
+            self.assertIn("session-30", captures)
+            self.assertIn("session-5", captures)
+
+    def test_session_recovers_on_its_own_from_a_stuck_future_dated_entry(self) -> None:
+        # Codex review (round 2, P2): a stored entry that is FINITE but
+        # wildly future-dated (not NaN/inf, so the round-1 fix alone does
+        # not catch it -- a hand-edited state.json, or corrupt data from
+        # some other source) made every subsequent legitimate capture for
+        # the SAME session compare as "older" and get rejected forever.
+        # Since a rejected capture also skips the pruning sweep (see
+        # _merge_context_capture), that session could never recover on its
+        # own -- only a DIFFERENT session's write happening to run
+        # afterward could ever clean it up. This writes several ordinary,
+        # real-looking captures for session-a ALONE (no other session
+        # ever writes) and confirms the LATEST one wins.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            hostile_state = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 92.0,
+                                "size": None,
+                                "session_id": "session-a",
+                                "captured_at": 10_000_000_000.0,
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(
+                json.dumps(hostile_state), encoding="utf-8"
+            )
+
+            state = None
+            for captured_at in (1_000.0, 1_001.0, 1_002.0):
+                state = save_snapshots(
+                    (),
+                    state_dir,
+                    context_capture={
+                        "used_percentage": 10.0,
+                        "size": None,
+                        "session_id": "session-a",
+                        "captured_at": captured_at,
+                        "source": "claude",
+                    },
+                )
+
+            captures = context_captures_from_state(state)
+            self.assertEqual(captures["session-a"]["captured_at"], 1_002.0)
+            self.assertEqual(captures["session-a"]["used_percentage"], 10.0)
 
     def test_stale_context_entries_are_pruned_on_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

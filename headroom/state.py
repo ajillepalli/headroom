@@ -43,6 +43,40 @@ _LOCK_FILENAME = ".state.lock"
 # a quick, best-effort write.
 _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.05
+
+# How far a stored context entry's captured_at may sit ahead of another
+# capture's own timestamp before it is treated as implausible rather than
+# as a different session that simply captured, and committed, first.
+# state.py never reads the real clock (see _merge_context_capture's own
+# docstring), so its only proxy for "now" is whichever capture it is
+# currently processing -- and two different sessions' captures can be
+# reordered in EXECUTION relative to when they were originally
+# timestamped (this process's own lock queueing, or plain OS scheduling,
+# can delay one session's write behind another's faster one; reproduced
+# directly with real concurrent processes, not merely theorized).
+#
+# This is deliberately NOT freshness_seconds("context") (the user-facing,
+# environment-overridable "how long is a reading still worth showing"
+# knob): that value answers a completely different question and can be
+# configured arbitrarily small (Codex review round 2, P2) -- reusing it
+# here would make the SAME reordering bug reappear the moment someone
+# sets HEADROOM_FRESH_CONTEXT_SECONDS below their own real-world
+# scheduling delay. This constant instead answers "how much concurrent-
+# process timing slop is plausible on one machine", which is unrelated to
+# how long a caller wants to trust a reading for. An hour comfortably
+# covers realistic lock contention and process-scheduling delays (which
+# this project's own stress testing never observed exceeding single-digit
+# seconds even under dozens of simultaneous processes) while staying
+# orders of magnitude below what a genuinely corrupt or clock-rolled-back
+# entry produces in practice (this project's own tests and hostile-input
+# scenarios use deltas of 10,000+ seconds for exactly that reason) --
+# still catching the failure mode CLOCK_SKEW_ALLOWANCE_SECONDS exists for
+# (context_window.py) without reintroducing the one this constant exists
+# to fix. The final, tight soundness gate on what a user actually SEES
+# remains ContextReading.from_dict's own CLOCK_SKEW_ALLOWANCE_SECONDS,
+# checked with a real time.time() reference at read time; this constant
+# only governs the write-time storage layer's coarser bookkeeping.
+_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS = 3600.0
 # The errno values that mean "someone else holds this lock right now, try
 # again" -- as opposed to "this platform/filesystem cannot do this at all",
 # which retrying will never fix. fcntl.flock(LOCK_NB) raises EWOULDBLOCK (or
@@ -90,7 +124,7 @@ def write_state(state: Dict[str, Any], state_dir: Optional[Path] = None) -> None
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_name, target)
+        _replace_with_retry(temporary_name, target)
         temporary_name = None
     finally:
         if temporary_name is not None:
@@ -98,6 +132,52 @@ def write_state(state: Dict[str, Any], state_dir: Optional[Path] = None) -> None
                 Path(temporary_name).unlink()
             except OSError:
                 pass
+
+
+# How many times to retry os.replace on a transient Windows access-denied
+# failure, and how long to wait between attempts. See
+# _replace_with_retry's own docstring for why this exists.
+_REPLACE_RETRY_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY_SECONDS = 0.02
+
+
+def _replace_with_retry(source: str, target: Path) -> None:
+    """os.replace, retrying a bounded number of times on a transient
+    Windows access-denied failure.
+
+    MoveFileEx (what os.replace wraps on Windows) can fail with
+    ERROR_ACCESS_DENIED (Python's ``PermissionError``) for a few
+    milliseconds if something else has the TARGET file open without
+    FILE_SHARE_DELETE at the exact instant of the rename -- commonly
+    antivirus real-time scanning or the Windows Search Indexer briefly
+    opening a freshly-written file, neither of which headroom controls.
+    Reproduced directly under real, heavy concurrent multi-process load
+    (dozens of separate ``headroom`` processes writing state.json back to
+    back). This is not a headroom locking bug: ``_locked_state_
+    transaction`` already guarantees only one headroom process is ever
+    inside this function at a time, so the OTHER holder of the file here
+    is always something external to headroom. POSIX ``rename(2)``, which
+    os.replace uses on POSIX, has no equivalent failure mode -- there,
+    the first attempt always either succeeds or fails for a durable
+    reason, so this retries a genuine POSIX failure a few times for no
+    benefit, which costs at most a few tens of milliseconds before
+    propagating the same way it always did.
+
+    Only ``PermissionError`` is retried, not every ``OSError``: anything
+    else (a full disk, an invalid path) is not a momentary external lock
+    and would not be fixed by waiting, matching the same
+    retry-only-what-retrying-can-fix principle ``_acquire_lock`` applies
+    to its own lock contention above.
+    """
+
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
 
 
 @contextmanager
@@ -393,6 +473,17 @@ def _should_replace_context_capture(current: Any, capture: Dict[str, Any]) -> bo
     capture always replaces it. Absent a decodable timestamp on the INCOMING
     capture, there is nothing to confirm it is not older than a decodable
     existing entry, so it does not replace one -- silence over a guess.
+
+    A decodable but IMPLAUSIBLY FUTURE-DATED existing entry is treated the
+    same as an undecodable one -- nothing to protect, so a new capture
+    always replaces it. Without this, a stored entry that is finite but
+    wildly future-dated (corrupt data, or a hand-edited state.json) would
+    make every subsequent LEGITIMATE capture for this same session compare
+    as "older" and be rejected forever; since a rejected capture also
+    skips the pruning sweep (see ``_merge_context_capture``), that stuck
+    session could never recover on its own -- only a DIFFERENT session's
+    write happening to run afterward could ever clean it up (Codex review
+    round 2, P2).
     """
 
     if not isinstance(current, dict):
@@ -403,6 +494,15 @@ def _should_replace_context_capture(current: Any, capture: Dict[str, Any]) -> bo
     incoming_captured_at = _decoded_captured_at(capture)
     if incoming_captured_at is None:
         return False
+    if (
+        resolve_age(
+            current_captured_at,
+            incoming_captured_at,
+            skew_allowance_seconds=_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS,
+        )
+        is None
+    ):
+        return True
     return incoming_captured_at >= current_captured_at
 
 
@@ -488,24 +588,23 @@ def _context_entry_is_fresh(value: Any, now: float, fresh_for_seconds: float) ->
     # matter how long it sat there (finding #3, context-window adversarial
     # review, the pruning half of the clock-rollback bug).
     #
-    # The future-tolerance passed here is ``fresh_for_seconds`` itself, NOT
-    # resolve_age's tight decode-time default: this "now" is not a real
-    # clock reading (state.py never calls time.time()), only the MOST
-    # RECENTLY PROCESSED capture's own timestamp, and different sessions'
-    # writes can be reordered in EXECUTION relative to when they were
-    # originally captured (lock contention or process scheduling can delay
-    # one session's write behind another's faster one). Reusing the tight
-    # allowance here let a slower session's older timestamp incorrectly
-    # prune a different, faster session's already-stored, perfectly valid
-    # entry as "implausibly future" -- reproduced directly, not merely
-    # theorized. Using the freshness window itself as the tolerance
-    # absorbs any realistic reordering delay (bounded in practice by
-    # _LOCK_TIMEOUT_SECONDS plus ordinary scheduling jitter, both far
-    # smaller than the window) while a genuinely corrupt, wildly
-    # future-dated entry (the scenario this check exists to catch, e.g. a
-    # hand-edited captured_at millions of seconds ahead) still exceeds it
-    # by a wide margin.
-    age = resolve_age(captured_at, now, skew_allowance_seconds=max(0.0, fresh_for_seconds))
+    # The future-tolerance passed here is
+    # _CROSS_SESSION_REORDERING_TOLERANCE_SECONDS (see that constant's own
+    # comment), NOT resolve_age's tight decode-time default and NOT
+    # fresh_for_seconds: this "now" is not a real clock reading (state.py
+    # never calls time.time()), only the MOST RECENTLY PROCESSED capture's
+    # own timestamp, and different sessions' writes can be reordered in
+    # EXECUTION relative to when they were originally captured. An earlier
+    # version of this fix reused fresh_for_seconds for this tolerance,
+    # which reintroduced the exact same reordering bug the moment
+    # HEADROOM_FRESH_CONTEXT_SECONDS was configured below the real
+    # scheduling delay on a given machine (Codex review round 2, P2) --
+    # the two questions ("how much timing slop between concurrent writers
+    # is plausible" and "how long should a reading still be shown") are
+    # unrelated and must not share one knob.
+    age = resolve_age(
+        captured_at, now, skew_allowance_seconds=_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS
+    )
     if age is None:
         return False
     return age <= max(0.0, fresh_for_seconds)
