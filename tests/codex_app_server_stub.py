@@ -36,12 +36,21 @@ def main() -> int:
     _write_marker("HEADROOM_TEST_RPC_STARTED")
     mode = os.environ.get("HEADROOM_TEST_RPC_MODE", "success")
     if mode == "timeout":
-        # Deliberately outlast the RPC timeout the test configures (see
-        # test_codexrpc.py) by a wide margin, so a slow-to-schedule start
-        # under CPU contention can never let this sleep finish before the
-        # parent's timeout fires and kills this process. Keep this in sync
-        # with STUB_TIMEOUT_STALL_SECONDS in test_codexrpc.py.
-        time.sleep(12.0)
+        # Never respond, and outlast the RPC timeout the test configures
+        # (see test_codexrpc.py) by a wide margin, so a slow-to-schedule
+        # start under CPU contention can never let this loop finish before
+        # the parent's timeout fires and kills this process. Heartbeat
+        # instead of one long sleep so the test can prove termination
+        # quickly (heartbeats stop) rather than waiting out this process's
+        # entire hypothetical lifetime.
+        heartbeat_path = os.environ.get("HEADROOM_TEST_RPC_HEARTBEAT")
+        deadline = time.monotonic() + 30.0
+        beat = 0
+        while time.monotonic() < deadline:
+            if heartbeat_path:
+                Path(heartbeat_path).write_text(str(beat), encoding="utf-8")
+            beat += 1
+            time.sleep(0.1)
         _write_marker("HEADROOM_TEST_RPC_SURVIVED", "survived")
         return 0
     if mode == "garbage":

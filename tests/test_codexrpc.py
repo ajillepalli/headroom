@@ -24,12 +24,6 @@ from headroom.state import read_state, save_snapshots
 
 STUB = Path(__file__).with_name("codex_app_server_stub.py")
 
-# How long the stub deliberately stalls in "timeout" mode before it would
-# otherwise respond (see codex_app_server_stub.py). Kept as a named constant
-# here so the test can compute exactly how much longer to wait for the
-# "survived" marker instead of guessing a worst-case sleep.
-STUB_TIMEOUT_STALL_SECONDS = 12.0
-
 
 class CodexRpcTests(unittest.TestCase):
     def test_statusline_never_starts_app_server(self) -> None:
@@ -103,6 +97,7 @@ class CodexRpcTests(unittest.TestCase):
             environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "6"
             environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
             environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
+            environment["HEADROOM_TEST_RPC_HEARTBEAT"] = str(root / "heartbeat")
 
             document = self._run_json(environment)
 
@@ -119,22 +114,31 @@ class CodexRpcTests(unittest.TestCase):
             # generous deadline still proves the child genuinely started
             # and gives a clear failure if it somehow never did, rather
             # than depending on exact same-tick filesystem visibility.
-            started_path = root / "started"
-            self._wait_for_marker(started_path)
-            # Compute how much longer an un-killed child would still be
-            # stalling, from its *actual* observed start time, rather than
-            # assuming a worst-case start delay: a fixed sleep here was
-            # previously miscalculated and could elapse before the stub's
-            # stall did, letting a broken kill path go unnoticed (confirmed
-            # by mocking _stop_process as a no-op and seeing the test still
-            # pass).
-            remaining_stall = (
-                started_path.stat().st_mtime
-                + STUB_TIMEOUT_STALL_SECONDS
-                - time.time()
+            self._wait_for_marker(root / "started")
+            # Prove the kill actually happened without waiting out the
+            # stub's entire (long, deliberately unresponsive) lifetime: the
+            # stub heartbeats every 0.1s while stalled, so if it is still
+            # alive after _run_json() returned (i.e. after the RPC timeout
+            # should have killed it), a fresh heartbeat will appear within
+            # a short grace window. A fixed sleep sized to the stub's full
+            # stall was tried first and was correct but made this one test
+            # dominate the suite's runtime; comparing heartbeats gives the
+            # same guarantee (confirmed by mocking _stop_process as a
+            # no-op and seeing this correctly fail) much faster.
+            heartbeat_path = root / "heartbeat"
+            self._wait_for_marker(heartbeat_path)
+            before = heartbeat_path.read_text(encoding="utf-8")
+            time.sleep(0.5)
+            after = (
+                heartbeat_path.read_text(encoding="utf-8")
+                if heartbeat_path.exists()
+                else before
             )
-            if remaining_stall > 0:
-                time.sleep(remaining_stall + 1.0)
+            self.assertEqual(
+                before,
+                after,
+                "child kept heartbeating after its RPC timeout should have killed it",
+            )
             self.assertFalse((root / "survived").exists())
 
     def test_garbage_output_falls_back_to_rollout(self) -> None:
