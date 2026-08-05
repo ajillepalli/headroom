@@ -6,11 +6,13 @@ headroom requires Python 3.9 or newer. It has no third-party runtime dependencie
 
 ## Install the published package
 
-The `headroom-cli` package is not published yet. Once it is available, install the command with:
+The `headroom-cli` package is on PyPI. Install the command with:
 
 ```console
 uv tool install headroom-cli
 ```
+
+To upgrade later, run `uv tool upgrade headroom-cli`, or `headroom update` to print the right command for however you installed it.
 
 Then configure Claude Code, Codex, or both:
 
