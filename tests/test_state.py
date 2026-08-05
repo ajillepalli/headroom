@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import errno
 from io import StringIO
 import json
 import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -16,6 +18,8 @@ from headroom.bounds import Snapshot
 from headroom.cli import main
 from headroom.state import (
     _MAX_TRACKED_CONTEXT_SESSIONS,
+    _acquire_lock,
+    _LOCK_TIMEOUT_SECONDS,
     context_captures_from_state,
     read_state,
     save_snapshots,
@@ -174,6 +178,140 @@ class StateTests(unittest.TestCase):
             self.assertEqual(captures["session-a"]["used_percentage"], 8.0)
             self.assertEqual(captures["session-a"]["captured_at"], 1_001.0)
 
+    def test_rejected_out_of_order_capture_does_not_prune_other_sessions(self) -> None:
+        # Codex review (round 1, P2) of the finding #2 fix above: a REJECTED
+        # capture is still a real, valid captured_at -- just an older one.
+        # The old version of _merge_context_capture used it as "now" for
+        # the pruning sweep regardless of whether it was accepted, which
+        # made every genuinely newer entry (for ANY session, not just the
+        # rejected one's own) look implausibly future-dated and erased it.
+        # session-a is captured well ahead of the rejected, out-of-order
+        # write for session-b; it must survive.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            session_a = {
+                "used_percentage": 40.0,
+                "size": None,
+                "session_id": "session-a",
+                "captured_at": 1_000.0,
+                "source": "claude",
+            }
+            session_b_newer = {
+                "used_percentage": 10.0,
+                "size": None,
+                "session_id": "session-b",
+                "captured_at": 1_000.0,
+                "source": "claude",
+            }
+            session_b_stale_out_of_order = {
+                # More than CLOCK_SKEW_ALLOWANCE_SECONDS (5s) older than
+                # both entries above, and rejected for session-b because
+                # session-b already has a newer capture on record.
+                "used_percentage": 5.0,
+                "size": None,
+                "session_id": "session-b",
+                "captured_at": 100.0,
+                "source": "claude",
+            }
+
+            save_snapshots((), state_dir, context_capture=session_a)
+            save_snapshots((), state_dir, context_capture=session_b_newer)
+            state = save_snapshots((), state_dir, context_capture=session_b_stale_out_of_order)
+
+            captures = context_captures_from_state(state)
+            self.assertIn("session-a", captures)
+            self.assertEqual(captures["session-a"]["used_percentage"], 40.0)
+            self.assertEqual(captures["session-b"]["used_percentage"], 10.0)
+
+    def test_non_finite_stored_captured_at_does_not_block_a_valid_replacement(self) -> None:
+        # Codex review (round 1, P2): float("nan")/float("inf") decode
+        # successfully as Python floats (json.loads accepts those
+        # non-standard tokens), so a corrupt PRE-EXISTING stored
+        # captured_at of NaN used to be treated as a "valid, decodable"
+        # timestamp. Every comparison against NaN is false, so a
+        # legitimate new capture for the same session could never satisfy
+        # "incoming >= current" and was rejected forever, leaving the
+        # corrupt entry stuck in place with no way to ever replace it.
+        #
+        # The corrupt entry is written directly into state.json here,
+        # bypassing save_snapshots: routing it through save_snapshots
+        # itself would immediately prune it right back out again in that
+        # SAME call (its own captured_at, NaN, is what that call's pruning
+        # sweep uses as "now", and resolve_age already rejects a
+        # non-finite "now" independently of this fix) -- so a directly
+        # written hostile state.json (a hand edit, or a file from a
+        # pre-fix version of headroom) is what actually exercises the
+        # "already sitting on disk" scenario this fix targets.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            hostile_state = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 92.0,
+                                "size": None,
+                                "session_id": "session-a",
+                                "captured_at": float("nan"),
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(
+                json.dumps(hostile_state, allow_nan=True), encoding="utf-8"
+            )
+
+            valid = {
+                "used_percentage": 10.0,
+                "size": None,
+                "session_id": "session-a",
+                "captured_at": 1_000.0,
+                "source": "claude",
+            }
+            state = save_snapshots((), state_dir, context_capture=valid)
+
+            captures = context_captures_from_state(state)
+            self.assertIn("session-a", captures)
+            self.assertEqual(captures["session-a"]["used_percentage"], 10.0)
+
+    def test_acquire_lock_gives_up_immediately_on_a_permanent_failure(self) -> None:
+        # Codex review (round 1, P2): a broad `except OSError` retried
+        # EVERY failure for the full _LOCK_TIMEOUT_SECONDS window,
+        # including a PERMANENT one (locking unsupported on this
+        # filesystem, a bad descriptor) that retrying can never fix --
+        # adding a needless multi-second stall to every write on such a
+        # host. Only a CONTENDED attempt (another holder in the way,
+        # EACCES/EAGAIN/EWOULDBLOCK) should retry; anything else must give
+        # up on the very first attempt.
+        import headroom.state as state_module
+
+        permanent_error = OSError()
+        permanent_error.errno = errno.ENOTSUP
+
+        with tempfile.TemporaryDirectory() as directory:
+            handle = open(str(Path(directory) / "lock-test"), "a+b")
+            try:
+                if state_module.fcntl is not None:
+                    patcher = mock.patch.object(
+                        state_module.fcntl, "flock", side_effect=permanent_error
+                    )
+                else:
+                    patcher = mock.patch.object(
+                        state_module.msvcrt, "locking", side_effect=permanent_error
+                    )
+                with patcher:
+                    started = time.monotonic()
+                    result = _acquire_lock(handle)
+                    elapsed = time.monotonic() - started
+            finally:
+                handle.close()
+
+        self.assertFalse(result)
+        self.assertLess(elapsed, _LOCK_TIMEOUT_SECONDS / 2)
+
     def test_concurrent_writers_do_not_lose_either_sessions_update(self) -> None:
         """Barrier-forced regression test for finding #1: two save_snapshots
         calls that both read the same on-disk state before either writes
@@ -304,6 +442,52 @@ class StateTests(unittest.TestCase):
             captures = context_captures_from_state(state)
             self.assertNotIn("future-session", captures)
             self.assertIn("new-session", captures)
+
+    def test_reordered_cross_session_writes_do_not_prune_each_other(self) -> None:
+        # Found during verification of the Codex round-1 fixes above, by
+        # stress-testing the real cross-platform lock with genuine
+        # concurrent OS processes rather than only in-process threads: two
+        # DIFFERENT sessions' writes can be reordered in EXECUTION relative
+        # to when they were originally captured (lock contention or
+        # process scheduling can delay one session's write behind
+        # another's faster one). session-30 captures first (captured_at
+        # 30.0) and its write commits first; session-5 captures an
+        # EARLIER wall-clock moment (captured_at 5.0) but its write is
+        # delayed and processes SECOND. Reusing resolve_age's tight,
+        # decode-time clock-skew allowance for this multi-session pruning
+        # sweep let session-5's older timestamp treat session-30's
+        # already-stored, perfectly valid entry as "implausibly future"
+        # and prune it -- reproduced directly with 30 real concurrent
+        # `python` subprocesses before this fix, intermittently losing
+        # entries with no error of any kind.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            save_snapshots(
+                (),
+                state_dir,
+                context_capture={
+                    "used_percentage": 1.0,
+                    "size": None,
+                    "session_id": "session-30",
+                    "captured_at": 30.0,
+                    "source": "claude",
+                },
+            )
+            state = save_snapshots(
+                (),
+                state_dir,
+                context_capture={
+                    "used_percentage": 2.0,
+                    "size": None,
+                    "session_id": "session-5",
+                    "captured_at": 5.0,
+                    "source": "claude",
+                },
+            )
+
+            captures = context_captures_from_state(state)
+            self.assertIn("session-30", captures)
+            self.assertIn("session-5", captures)
 
     def test_stale_context_entries_are_pruned_on_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

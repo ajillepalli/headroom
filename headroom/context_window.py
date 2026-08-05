@@ -41,25 +41,48 @@ from typing import Any, Dict, Optional
 CLOCK_SKEW_ALLOWANCE_SECONDS = 5.0
 
 
-def resolve_age(captured_at: float, now: float) -> Optional[float]:
+def resolve_age(
+    captured_at: float,
+    now: float,
+    skew_allowance_seconds: float = CLOCK_SKEW_ALLOWANCE_SECONDS,
+) -> Optional[float]:
     """Return a captured_at's age relative to now, or None when the pair
     cannot support a sound answer.
 
     None covers two cases (finding #3, context-window adversarial review):
     a non-finite captured_at or now (unreachable through ordinary capture,
     but reachable through a hand-edited or corrupted state.json), and a
-    captured_at dated more than CLOCK_SKEW_ALLOWANCE_SECONDS into the future
+    captured_at dated more than ``skew_allowance_seconds`` into the future
     relative to now (a clock rollback, or corrupt data claiming to be from
     the future). The naive ``max(0.0, now - captured_at)`` clamp used before
     this existed silently turned every future-dated captured_at into age
     0.0 -- "just captured" -- rather than flagging it as unsound, which let
     a stale reading look perpetually fresh once the clock went backwards,
     and also let a pruning sweep keyed on the same clamp retain it forever.
+
+    ``skew_allowance_seconds`` defaults to ``CLOCK_SKEW_ALLOWANCE_SECONDS``
+    (this module's own tight, decode-time tolerance -- appropriate when
+    ``now`` is a real ``time.time()`` reading, as ``ContextReading.
+    from_dict``'s caller always supplies). ``state.py``'s multi-session
+    pruning sweep passes a much wider allowance instead: its own "now" is
+    not a real clock reading at all, only the MOST RECENTLY PROCESSED
+    capture's own timestamp (state.py deliberately never reads the real
+    clock), and different sessions' captures can be reordered in EXECUTION
+    relative to when they were originally timestamped -- a session whose
+    write is delayed behind others (lock contention, process scheduling)
+    can still be processed after a different session's genuinely newer
+    capture already committed. Using the tight decode-time allowance for
+    that sweep would let the slower session's older timestamp prune the
+    faster session's already-stored, perfectly valid entry as
+    "implausibly future" -- confirmed by direct reproduction, not merely
+    theorized. A wider allowance there tolerates realistic cross-session
+    reordering while a genuinely corrupt, wildly future-dated entry (the
+    scenario this function exists to catch) still exceeds it.
     """
 
     if not math.isfinite(captured_at) or not math.isfinite(now):
         return None
-    if captured_at - now > CLOCK_SKEW_ALLOWANCE_SECONDS:
+    if captured_at - now > skew_allowance_seconds:
         return None
     return max(0.0, now - captured_at)
 

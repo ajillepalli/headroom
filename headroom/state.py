@@ -1,7 +1,9 @@
 """Atomic persistence for snapshots and append-only history."""
 
 from contextlib import contextmanager
+import errno
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -41,6 +43,18 @@ _LOCK_FILENAME = ".state.lock"
 # a quick, best-effort write.
 _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.05
+# The errno values that mean "someone else holds this lock right now, try
+# again" -- as opposed to "this platform/filesystem cannot do this at all",
+# which retrying will never fix. fcntl.flock(LOCK_NB) raises EWOULDBLOCK (or
+# the numerically-identical EAGAIN on every platform Python defines both
+# names for) when contended; msvcrt.locking(LK_NBLCK) raises EACCES for the
+# same case (confirmed empirically: contending for an already-locked region
+# raises ``PermissionError(13, 'Permission denied')``). Anything else (e.g.
+# ENOSYS/EINVAL/ENOTSUP on a filesystem that does not support advisory
+# locking at all) is permanent, not contention, and retrying it for the
+# full timeout would only add needless latency to every write on such a
+# host for no chance of eventual success (Codex review, round 1, P2).
+_RETRYABLE_LOCK_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 def read_state(state_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -134,9 +148,10 @@ def _locked_state_transaction(directory: Path):
 
 
 def _acquire_lock(handle: Any) -> bool:
-    """Take an exclusive, non-blocking lock, retrying until it succeeds or
-    _LOCK_TIMEOUT_SECONDS elapses. Never blocks indefinitely (see
-    _locked_state_transaction's docstring for why that matters here).
+    """Take an exclusive, non-blocking lock, retrying only CONTENDED
+    attempts until one succeeds or _LOCK_TIMEOUT_SECONDS elapses. Never
+    blocks indefinitely (see _locked_state_transaction's docstring for why
+    that matters here).
 
     The deadline is computed lazily, only once the FIRST attempt fails,
     rather than unconditionally up front: the overwhelmingly common case is
@@ -160,7 +175,13 @@ def _acquire_lock(handle: Any) -> bool:
             # mechanism exists to take the lock, so proceed unlocked rather
             # than raise (see this module's own docstring above).
             return False
-        except OSError:
+        except OSError as error:
+            if error.errno not in _RETRYABLE_LOCK_ERRNOS:
+                # A permanent failure (locking unsupported on this
+                # filesystem, a bad descriptor, etc.), not another holder
+                # in the way: retrying would only burn the whole timeout
+                # for no chance of success (Codex review, round 1, P2).
+                return False
             if deadline is None:
                 deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
             if time.monotonic() >= deadline:
@@ -299,15 +320,28 @@ def _merge_context_capture(sources: Dict[str, Any], capture: Dict[str, Any]) -> 
     would let one terminal tab's context answer for a different session's
     prompt (the exact bug the ENG review phase caught).
 
-    Pruning runs on every call that supplies a capture, using the new
-    capture's own ``captured_at`` as "now" rather than calling
-    ``time.time()`` here: ``state.py`` otherwise never reads the real clock,
-    every timestamp it handles is passed in, and this keeps that property so
-    callers stay deterministic in tests. A session that stops writing (a
-    closed terminal tab) lingers until the NEXT successful capture from any
-    session sweeps it -- acceptable, since a lingering entry is inert until
-    then (fresh-or-nothing already refuses to read anything stale) and
-    "prune on write" does not require every write to also be the sweep.
+    Pruning runs on every call whose capture was actually ACCEPTED (see
+    below), using that capture's own ``captured_at`` as "now" rather than
+    calling ``time.time()`` here: ``state.py`` otherwise never reads the
+    real clock, every timestamp it handles is passed in, and this keeps
+    that property so callers stay deterministic in tests. A session that
+    stops writing (a closed terminal tab) lingers until the NEXT
+    successful capture from any session sweeps it -- acceptable, since a
+    lingering entry is inert until then (fresh-or-nothing already refuses
+    to read anything stale) and "prune on write" does not require every
+    write to also be the sweep.
+
+    A REJECTED capture (one older than what is already stored for its own
+    session, see ``_should_replace_context_capture``) is never used as
+    "now" for that sweep, even though it is still a real, valid
+    ``captured_at`` value: it is, by definition, older than something
+    already known to be more current, so treating it as "now" would make
+    every genuinely newer entry -- for ANY session, not just this one --
+    look implausibly future-dated to ``_context_entry_is_fresh`` and get
+    pruned, erasing valid readings instead of the stale one that arrived
+    late (Codex review, round 1, P2). Skipping the sweep on a rejected
+    capture only defers cleanup, not correctness: the next ACCEPTED write,
+    from any session, still runs it.
     """
 
     claude_source = sources.setdefault("claude", {})
@@ -321,10 +355,14 @@ def _merge_context_capture(sources: Dict[str, Any], capture: Dict[str, Any]) -> 
 
     session_id = capture.get("session_id")
     captured_at = capture.get("captured_at")
+    accepted = False
     if isinstance(session_id, str) and session_id:
         if _should_replace_context_capture(contexts.get(session_id), capture):
             contexts[session_id] = capture
+            accepted = True
 
+    if not accepted:
+        return
     if not isinstance(captured_at, (int, float)) or isinstance(captured_at, bool):
         return
     fresh_for = freshness_seconds("context")
@@ -369,12 +407,32 @@ def _should_replace_context_capture(current: Any, capture: Dict[str, Any]) -> bo
 
 
 def _decoded_captured_at(value: Any) -> Optional[float]:
+    """A stored entry's decoded captured_at, or None when it is missing,
+    malformed, or non-finite.
+
+    ``float(...)`` does not raise for a stored NaN or +/-inf (JSON's json
+    module accepts those non-standard tokens on decode), so without the
+    ``math.isfinite`` check below a corrupt entry with ``captured_at: NaN``
+    would decode as a "valid" timestamp -- one that a comparison against
+    (``_should_replace_context_capture``'s ``incoming_captured_at >=
+    current_captured_at``) can never satisfy, since NaN compares false
+    against everything. A legitimate new capture would then be rejected
+    forever by that corrupt entry, which the later pruning sweep still
+    correctly deletes (``resolve_age`` already checks finiteness) --
+    leaving the session with the WORST of both outcomes: the good capture
+    discarded and the bad one gone too (Codex review, round 1, P2).
+    Treating a non-finite value the same as absent here means the
+    "nothing to protect against" replacement rule already documented above
+    actually holds for this case too.
+    """
+
     if not isinstance(value, dict):
         return None
     try:
-        return float(value["captured_at"])
+        result = float(value["captured_at"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
+    return result if math.isfinite(result) else None
 
 
 # Staleness pruning above only removes entries past the freshness window; it
@@ -429,7 +487,25 @@ def _context_entry_is_fresh(value: Any, now: float, fresh_for_seconds: float) ->
     # future-dated entry was reported as "fresh" and never pruned, no
     # matter how long it sat there (finding #3, context-window adversarial
     # review, the pruning half of the clock-rollback bug).
-    age = resolve_age(captured_at, now)
+    #
+    # The future-tolerance passed here is ``fresh_for_seconds`` itself, NOT
+    # resolve_age's tight decode-time default: this "now" is not a real
+    # clock reading (state.py never calls time.time()), only the MOST
+    # RECENTLY PROCESSED capture's own timestamp, and different sessions'
+    # writes can be reordered in EXECUTION relative to when they were
+    # originally captured (lock contention or process scheduling can delay
+    # one session's write behind another's faster one). Reusing the tight
+    # allowance here let a slower session's older timestamp incorrectly
+    # prune a different, faster session's already-stored, perfectly valid
+    # entry as "implausibly future" -- reproduced directly, not merely
+    # theorized. Using the freshness window itself as the tolerance
+    # absorbs any realistic reordering delay (bounded in practice by
+    # _LOCK_TIMEOUT_SECONDS plus ordinary scheduling jitter, both far
+    # smaller than the window) while a genuinely corrupt, wildly
+    # future-dated entry (the scenario this check exists to catch, e.g. a
+    # hand-edited captured_at millions of seconds ahead) still exceeds it
+    # by a wide margin.
+    age = resolve_age(captured_at, now, skew_allowance_seconds=max(0.0, fresh_for_seconds))
     if age is None:
         return False
     return age <= max(0.0, fresh_for_seconds)
