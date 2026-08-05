@@ -101,7 +101,7 @@ Capture is the narrow one. Among the first-party clients, the statusline payload
 
 Nothing else observes a first-party client's numbers passively. `/usage` draws its bars for a person to read rather than emitting anything a program can parse, no state or config file records the numbers, no other hook event carries them in its payload, and MCP servers are not given them.
 
-The Agent SDK is the one real alternative, and it is an active route rather than a passive one. Its rate-limit events report utilization against the shared subscription limits, which can include what was spent interactively in Claude Code, so the numbers are relevant. Reading them means running an SDK session and consuming quota to ask, which is a different bargain from observing a payload Claude Code was already producing. headroom watches what is already there and spends nothing.
+One documented active alternative is an Agent SDK session, whose rate-limit events can include utilization for shared subscription limits after a quota-consuming request. Those limits can cover what was spent interactively in Claude Code, so the numbers are relevant, but the events arrive on status changes and the utilization field is optional, so this is not an on-demand reader. For Claude, headroom watches a payload already being produced and spends no additional model quota.
 
 The web has a second constraint. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings. They do not load `~/.claude/settings.json`. `headroom init` writes the user file, so a web session gets no hook today. That is tracked in [issue #36](https://github.com/ajillepalli/headroom/issues/36).
 
