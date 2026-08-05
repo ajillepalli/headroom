@@ -39,8 +39,9 @@ def main() -> int:
         # Deliberately outlast the RPC timeout the test configures (see
         # test_codexrpc.py) by a wide margin, so a slow-to-schedule start
         # under CPU contention can never let this sleep finish before the
-        # parent's timeout fires and kills this process.
-        time.sleep(8.0)
+        # parent's timeout fires and kills this process. Keep this in sync
+        # with STUB_TIMEOUT_STALL_SECONDS in test_codexrpc.py.
+        time.sleep(12.0)
         _write_marker("HEADROOM_TEST_RPC_SURVIVED", "survived")
         return 0
     if mode == "garbage":

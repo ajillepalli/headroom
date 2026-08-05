@@ -24,6 +24,12 @@ from headroom.state import read_state, save_snapshots
 
 STUB = Path(__file__).with_name("codex_app_server_stub.py")
 
+# How long the stub deliberately stalls in "timeout" mode before it would
+# otherwise respond (see codex_app_server_stub.py). Kept as a named constant
+# here so the test can compute exactly how much longer to wait for the
+# "survived" marker instead of guessing a worst-case sleep.
+STUB_TIMEOUT_STALL_SECONDS = 12.0
+
 
 class CodexRpcTests(unittest.TestCase):
     def test_statusline_never_starts_app_server(self) -> None:
@@ -86,12 +92,15 @@ class CodexRpcTests(unittest.TestCase):
             # 1s once the machine is busy (measured up to ~2.8s under heavy
             # synthetic CPU contention on a 24-core box), so the parent could
             # kill the child before it was ever scheduled to run its first
-            # line of Python, i.e. before "started" could be written. 5s
-            # leaves comfortable margin over that measured worst case while
-            # staying well under the stub's 8s deliberate stall, so the
-            # kill still fires for a genuine reason (unresponsive child),
-            # not a scheduling race.
-            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "5"
+            # line of Python, i.e. before "started" could be written. This
+            # cannot be made fully race-proof without a product-code hook for
+            # "child has been scheduled" (there is no such signal available
+            # today, and this is a test-synchronisation issue, not a product
+            # bug), so instead we use the same 6s budget the product itself
+            # defaults to in real usage (DEFAULT_TIMEOUT_SECONDS in
+            # codexrpc.py) -- more than double the worst spawn jitter we
+            # measured -- to make the residual race negligible in practice.
+            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "6"
             environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
             environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
 
@@ -110,8 +119,22 @@ class CodexRpcTests(unittest.TestCase):
             # generous deadline still proves the child genuinely started
             # and gives a clear failure if it somehow never did, rather
             # than depending on exact same-tick filesystem visibility.
-            self._wait_for_marker(root / "started")
-            time.sleep(2.0)
+            started_path = root / "started"
+            self._wait_for_marker(started_path)
+            # Compute how much longer an un-killed child would still be
+            # stalling, from its *actual* observed start time, rather than
+            # assuming a worst-case start delay: a fixed sleep here was
+            # previously miscalculated and could elapse before the stub's
+            # stall did, letting a broken kill path go unnoticed (confirmed
+            # by mocking _stop_process as a no-op and seeing the test still
+            # pass).
+            remaining_stall = (
+                started_path.stat().st_mtime
+                + STUB_TIMEOUT_STALL_SECONDS
+                - time.time()
+            )
+            if remaining_stall > 0:
+                time.sleep(remaining_stall + 1.0)
             self.assertFalse((root / "survived").exists())
 
     def test_garbage_output_falls_back_to_rollout(self) -> None:
