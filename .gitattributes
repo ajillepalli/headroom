@@ -1,0 +1,8 @@
+# Normalise to LF in the repository. The statusline and hook are executed by
+# Claude Code and Codex on Windows, macOS and Linux, so mixed endings would
+# otherwise churn diffs between machines.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
