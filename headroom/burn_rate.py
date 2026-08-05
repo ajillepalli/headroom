@@ -224,8 +224,9 @@ class BurnRateProjection:
       declines -- the gap is silently dropped. But its elapsed time is
       still real and belongs in this ratio's denominator regardless, or
       the overall rate would be computed over less time than the segment
-      actually spanned, inflating both this ratio and
-      ``longest_above_overall_rate_run`` for a reason that has nothing to
+      actually spanned. That would make the overall rate too LARGE, which
+      suppresses this ratio and can shorten
+      ``longest_above_overall_rate_run``, for a reason that has nothing to
       do with the segment's actual burn pattern. [(0,0),(60,10),
       (60.0000005,10)] is the concrete case: the trailing ~5e-7s gap
       carries no usage, so summing only the retained intervals'
@@ -1105,9 +1106,12 @@ def _measure_raw_structure(
     # docstring, "A trailing accumulator...exactly zero") -- no usage was
     # lost, so nothing declines, but that gap's ELAPSED time is real and
     # summing only the retained intervals would exclude it, shrinking the
-    # denominator and inflating both this ratio and
-    # longest_above_overall_rate_run for no reason connected to the
-    # segment's actual burn pattern. [(0,0),(60,10),(60.0000005,10)] is the
+    # denominator. That makes the overall rate too LARGE, which suppresses
+    # this ratio and can shorten longest_above_overall_rate_run, for no
+    # reason connected to the segment's actual burn pattern. Measured on
+    # the case below: excluding the gap gives ratio 1.0 and run 0, while
+    # including it gives 1.0000000083 and 1.
+    # [(0,0),(60,10),(60.0000005,10)] is the
     # concrete case: the final 5e-7s gap carries no usage (delta 0) so it is
     # dropped from _raw_intervals's own elapsed sum, but it still elapsed --
     # sum(_elapsed_list) here would be 60.0, undercounting the true 60.0000005s
