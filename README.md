@@ -22,7 +22,7 @@ The package is not published yet. Once it is published, the shortest path will b
 
 ```console
 uv tool install headroom-cli
-headroom init
+headroom init --all
 headroom status
 ```
 
@@ -36,7 +36,7 @@ uv tool install .
 pip install -e .
 ```
 
-Then run `headroom init` and `headroom status`. See the [installation guide](docs/howto-install.md) for safe previews and the plain-clone fallback.
+Then run `headroom init --all` and `headroom status`. Plain `headroom init` configures Claude Code only, while `--codex` configures Codex only. See the [installation guide](docs/howto-install.md) for safe previews and the plain-clone fallback.
 
 ## Example output
 
@@ -65,5 +65,5 @@ Stop parallel subagent fan-out, use cheaper models, and checkpoint work now.
 | [CLI reference](docs/reference-cli.md) | Every command, flag, environment variable, state file, and exit code. |
 | [Why the bounds are sound](docs/explanation-bounds.md) | Fresh, stale, and post-reset readings, reset validation, and severity. |
 | [How capture works](docs/explanation-capture.md) | Claude statusline input, Codex app-server RPC, and rollout fallback. |
-| [Installation guide](docs/howto-install.md) | Published and clone installs, safe init previews, backups, and fallback commands. |
+| [Installation guide](docs/howto-install.md) | Claude Code settings, the `CODEX_HOME/hooks.json` path, safe init previews, backups, and clone installs. |
 | [Troubleshooting](docs/howto-troubleshoot.md) | Unavailable or stale readings, unknown resets, doctor output, and state reset. |

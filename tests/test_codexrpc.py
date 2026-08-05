@@ -130,6 +130,7 @@ class CodexRpcTests(unittest.TestCase):
 
     def _environment(self, root: Path, mode: str) -> dict[str, str]:
         return {
+            "CODEX_HOME": str(root / "codex-hooks"),
             "HEADROOM_CODEX_HOME": str(root / "codex-home"),
             "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
             "HEADROOM_STATE_DIR": str(root / "state"),

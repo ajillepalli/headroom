@@ -20,7 +20,7 @@ from .install_info import format_modified_time, inspect_install, source_commit
 from .render import render_hook, render_report, render_statusline
 from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .severity import Severity
-from .settings import run_init
+from .settings import codex_hook_registration, run_init
 from .state import (
     clear_state,
     read_state,
@@ -62,13 +62,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print human-readable text even when hook JSON is received",
     )
-    init_parser = subparsers.add_parser("init", help="configure Claude Code")
+    init_parser = subparsers.add_parser("init", help="configure Claude Code and Codex hooks")
+    init_targets = init_parser.add_mutually_exclusive_group()
+    init_targets.add_argument(
+        "--codex",
+        action="store_true",
+        help="configure Codex only",
+    )
+    init_targets.add_argument(
+        "--all",
+        dest="all_targets",
+        action="store_true",
+        help="configure both Claude Code and Codex",
+    )
     init_parser.add_argument(
         "--settings",
         type=Path,
         default=None,
         metavar="PATH",
         help="settings file to update (default: ~/.claude/settings.json)",
+    )
+    init_parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Codex home containing hooks.json (default: CODEX_HOME or ~/.codex)",
     )
     init_parser.add_argument("--dry-run", action="store_true", help="print the diff without writing files")
     init_parser.add_argument("--print", dest="print_only", action="store_true", help="print the settings snippet only")
@@ -94,7 +113,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command == "init":
         try:
-            return run_init(arguments.settings, dry_run=arguments.dry_run, print_only=arguments.print_only)
+            return run_init(
+                arguments.settings,
+                codex=arguments.codex,
+                all_targets=arguments.all_targets,
+                codex_home=arguments.codex_home,
+                dry_run=arguments.dry_run,
+                print_only=arguments.print_only,
+            )
         except OSError as error:
             print("headroom init: {}".format(error), file=sys.stderr)
             return 1
@@ -252,6 +278,9 @@ def _doctor() -> int:
     print("  Version: {}".format(install.version))
     print("  Modified: {}".format(format_modified_time(install.modified_at)))
     print()
+    codex_hooks, codex_hook_status = codex_hook_registration()
+    print("Codex hooks file: {}".format(codex_hooks))
+    print("Codex hook: {}".format(codex_hook_status))
     directory = resolve_state_dir()
     state_path = directory / "state.json"
     state = read_state()
