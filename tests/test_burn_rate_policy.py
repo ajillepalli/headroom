@@ -373,6 +373,25 @@ class RenderBurnRateStatusTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("Codex", lines[0])
 
+    def test_cadence_tolerance_scales_with_the_observed_step_size(self) -> None:
+        # Codex review, round 4, P2: a source moving 5 points per real
+        # change (not the default 1.0) has a true inter-change cadence of
+        # delta/rate, not 1/rate. rate=0.01 gives 1/rate=100s (wrong here)
+        # vs delta/rate=5.0/0.01=500s (correct). A 400s-old change is
+        # inside the correct tolerance (4*500=2000s) but would fail the
+        # wrong one (4*100=400s is not > 400s -- use a value that cleanly
+        # separates both: 1000s clears 2000s but not 400s).
+        now = 1_000.0
+        projection = _projection(
+            latest_change_delta=5.0,
+            latest_change_at=now - 1_000.0,
+            latest_captured_at=now - 10.0,
+        )
+        reading = _fresh_reading()
+        lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
+
+        self.assertEqual(len(lines), 1)
+
 
 class RenderHookCompositionTests(unittest.TestCase):
     def _reading(
