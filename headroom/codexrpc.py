@@ -41,6 +41,7 @@ class _RpcTimeout(_RpcFailure):
 
 def read_rate_limits(
     environ: Optional[Mapping[str, str]] = None,
+    deadline: Optional[float] = None,
 ) -> CodexRpcResult:
     """Query app-server without allowing failures or children to escape."""
 
@@ -65,7 +66,9 @@ def read_rate_limits(
     reader: Optional[threading.Thread] = None
     messages: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue()
     snapshots: Tuple[Snapshot, ...] = ()
-    deadline = time.monotonic() + timeout
+    rpc_deadline = time.monotonic() + timeout
+    if deadline is not None:
+        rpc_deadline = min(rpc_deadline, deadline)
     try:
         process = subprocess.Popen(
             command,
@@ -99,7 +102,7 @@ def read_rate_limits(
                 },
             },
         )
-        _wait_for_response(messages, 1, deadline, notes)
+        _wait_for_response(messages, 1, rpc_deadline, notes)
         _send(
             process.stdin,
             {"jsonrpc": "2.0", "method": "initialized", "params": {}},
@@ -113,7 +116,7 @@ def read_rate_limits(
                 "params": None,
             },
         )
-        response = _wait_for_response(messages, 2, deadline, notes)
+        response = _wait_for_response(messages, 2, rpc_deadline, notes)
         selected = _select_codex_limits(response.get("result"))
         if selected is None:
             notes.append("app-server RPC returned no Codex rate-limit bucket")
@@ -129,9 +132,11 @@ def read_rate_limits(
         notes.append("app-server RPC failed unexpectedly: {}".format(error))
     finally:
         if process is not None:
-            _stop_process(process, notes)
+            _stop_process(process, notes, deadline)
         if reader is not None:
-            reader.join(timeout=0.2)
+            join_timeout = _remaining_timeout(deadline, 0.2)
+            if join_timeout > 0.0:
+                reader.join(timeout=join_timeout)
 
     return CodexRpcResult(snapshots, True, tuple(notes))
 
@@ -259,7 +264,11 @@ def _select_codex_limits(result: Any) -> Optional[Dict[str, Any]]:
     return top_level if isinstance(top_level, dict) else None
 
 
-def _stop_process(process: subprocess.Popen, notes: List[str]) -> None:
+def _stop_process(
+    process: subprocess.Popen,
+    notes: List[str],
+    deadline: Optional[float] = None,
+) -> None:
     try:
         if process.stdin is not None:
             process.stdin.close()
@@ -271,11 +280,13 @@ def _stop_process(process: subprocess.Popen, notes: List[str]) -> None:
         except OSError as error:
             notes.append("could not stop app-server RPC process: {}".format(error))
     try:
-        process.wait(timeout=1.0)
+        process.wait(timeout=_remaining_timeout(deadline, 1.0))
     except subprocess.TimeoutExpired:
         try:
             process.kill()
-            process.wait(timeout=1.0)
+            remaining = _remaining_timeout(deadline, 1.0)
+            if remaining > 0.0:
+                process.wait(timeout=remaining)
         except (OSError, subprocess.TimeoutExpired) as error:
             notes.append("could not reap app-server RPC process: {}".format(error))
     except OSError as error:
@@ -289,3 +300,9 @@ def _stop_process(process: subprocess.Popen, notes: List[str]) -> None:
 
 def _format_timeout(value: float) -> str:
     return "{:g}".format(value)
+
+
+def _remaining_timeout(deadline: Optional[float], maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    return max(0.0, min(maximum, deadline - time.monotonic()))

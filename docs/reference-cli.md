@@ -22,9 +22,9 @@ headroom COMMAND [OPTIONS]
 | `headroom status` | None | Refreshes Codex through the app-server with rollout fallback, updates state, and prints Claude and Codex short and weekly readings. Missing readings are `unavailable`. |
 | `headroom json` | None | Performs the same Codex refresh as `status`, then prints one compact JSON document containing persisted state, diagnostics, and four bounded readings. |
 | `headroom hook` | Optional Claude Code hook JSON | Performs the same Codex refresh, then emits guidance for the highest actionable severity. A `UserPromptSubmit` payload selects the documented JSON envelope. With no hook payload, output is human-readable text. It emits nothing when all readings are `ok`. |
-| `headroom doctor` | None | Reads current Codex sources without updating state, then reports install provenance, paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
+| `headroom doctor` | None | Reads current Codex sources without updating state, then reports install provenance, the Codex hooks path and registration status, state paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
 | `headroom reset` | None | Removes `state.json` and `history.jsonl`. It reports whether anything was removed and leaves other files in the state directory untouched. |
-| `headroom init` | None | Merges the Claude Code statusline and prompt hook into a settings file. See [Installation](howto-install.md). |
+| `headroom init` | None | Merges the Claude Code statusline and prompt hook by default. `--codex` selects the Codex hook, and `--all` configures both. See [Installation](howto-install.md). |
 
 `statusline`, `status`, `json`, `doctor`, and `reset` have no command-specific flags other than help.
 
@@ -44,19 +44,25 @@ This is the documented Claude Code path for adding hook text to the model contex
 
 | Flag | Default | Effect |
 | --- | --- | --- |
+| `--codex` | Off | Configures Codex only. It is mutually exclusive with `--all`. |
+| `--all` | Off | Configures both Claude Code and Codex. Both files are preflighted before either is written. It is mutually exclusive with `--codex`. |
 | `--settings PATH` | `~/.claude/settings.json` | Selects the Claude Code settings file. |
-| `--dry-run` | Off | Prints a unified diff and writes no settings or backup files. If the merged result is unchanged, it prints `headroom init: no changes`. |
-| `--print` | Off | Prints the generated JSON fragment only. It does not read or write the selected settings path. |
+| `--codex-home PATH` | `CODEX_HOME`, then `~/.codex` | Selects the Codex home containing `hooks.json`. |
+| `--dry-run` | Off | Prints a unified diff for every selected target and writes no configuration or backup files. If every merged result is unchanged, it prints `headroom init: no changes`. |
+| `--print` | Off | Prints the selected generated JSON fragment without reading or writing a target. With `--all`, it prints an object containing `claude` and `codex` fragments. |
 | `-h`, `--help` | Off | Prints init help and exits 0. |
 
 When both `--print` and `--dry-run` are present, `--print` takes effect first and emits only the fragment.
+
+With no target flag, init configures Claude Code only. Codex uses `hooks.json` inside the selected Codex home. Its document has only `description` and `hooks` when created fresh, and the `UserPromptSubmit` array contains the required inner `{"hooks": [...]}` wrapper. Existing unrelated keys, events, and prompt entries are preserved. Changed existing files receive a timestamped `.bak` copy first. Invalid JSON is refused with status 1 and left untouched.
 
 ## Environment variables
 
 | Variable | Default | Accepted value and behavior |
 | --- | --- | --- |
+| `CODEX_HOME` | `~/.codex` | Codex home used by `init --codex` and by `doctor` when locating `hooks.json`. `--codex-home` overrides it for init. |
 | `HEADROOM_STATE_DIR` | `~/.headroom` | Directory containing `state.json` and `history.jsonl`. A nonempty value is expanded as a user path. |
-| `HEADROOM_CODEX_HOME` | `~/.codex` | Codex home directory. Rollout fallback reads its `sessions` child directory. |
+| `HEADROOM_CODEX_HOME` | `~/.codex` | Codex home used only for usage capture. Rollout fallback reads its `sessions` child directory. It does not select the hook installation path. |
 | `HEADROOM_CODEX_RPC` | Enabled | The exact value `0` skips the app-server RPC. Every other value, including an unset value, enables it. |
 | `HEADROOM_CODEX_RPC_TIMEOUT` | `6` | Shared timeout in seconds for startup, initialization, and the rate-limit response. It must be finite and greater than zero. An invalid value falls back to 6 seconds and adds a diagnostic note. |
 | `HEADROOM_CODEX_RPC_CMD` | `codex app-server` | App-server command. It may be a JSON array of nonempty strings or a shell-style command string. An empty or unparseable value skips the command and records a note. |
@@ -91,7 +97,7 @@ Claude diagnostics contain an `unparsed` list of parser notes. Codex diagnostics
 | Status | When it is used |
 | --- | --- |
 | `0` | A command completed, help or version information was printed, `hook` had nothing to say, or `statusline` recovered from malformed input or an internal failure. |
-| `1` | `init` could not read, merge, back up, or write settings; `reset` could not remove state; or another on-demand command raised a handled I/O, value, or type error. |
+| `1` | `init` could not read, merge, back up, or write selected configuration; `reset` could not remove state; or another on-demand command raised a handled I/O, value, or type error. |
 | `2` | Command-line parsing failed because the command or arguments were missing or invalid. |
 
 The compatibility script `python install.py` forwards its arguments to `headroom init` and uses the same exit codes.

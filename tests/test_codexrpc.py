@@ -14,7 +14,12 @@ import time
 import unittest
 from unittest import mock
 
+from headroom.bounds import Snapshot
+from headroom.codexrpc import CodexRpcResult
+from headroom.codexsrc import CodexResult
+from headroom import cli, codexsrc
 from headroom.cli import main
+from headroom.state import read_state, save_snapshots
 
 
 STUB = Path(__file__).with_name("codex_app_server_stub.py")
@@ -128,8 +133,121 @@ class CodexRpcTests(unittest.TestCase):
             self.assertFalse(diagnostics["rpc_attempted"])
             self.assertFalse((root / "started").exists())
 
+    def test_hook_uses_total_deadline_bounded_scan_and_stored_state_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            environment = {
+                "CODEX_HOME": str(root / "codex-hooks"),
+                "HEADROOM_CODEX_HOME": str(root / "codex-home"),
+                "HEADROOM_STATE_DIR": str(root / "state"),
+            }
+            stored = Snapshot(
+                used_percentage=94.0,
+                captured_at=now,
+                resets_at=now + 7_200,
+                window="weekly",
+                source="codex",
+            )
+            rpc_result = CodexRpcResult((), True, ("hook deadline reached",))
+            rollout_result = CodexResult((), None, 0, ("rollout scan deadline reached",))
+            output = StringIO()
+            started = time.monotonic()
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                save_snapshots((stored,))
+                with mock.patch("headroom.cli.read_rate_limits", return_value=rpc_result) as rpc:
+                    with mock.patch("headroom.cli.read_latest", return_value=rollout_result) as rollout:
+                        with redirect_stdout(output):
+                            result = main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("94% used", output.getvalue())
+            deadline = rpc.call_args.kwargs["deadline"]
+            self.assertIsNotNone(deadline)
+            self.assertLessEqual(deadline, started + cli.HOOK_DEADLINE_SECONDS + 0.25)
+            self.assertEqual(rollout.call_args.kwargs["deadline"], deadline)
+            self.assertEqual(
+                rollout.call_args.kwargs["max_files"],
+                cli.HOOK_MAX_ROLLOUT_FILES,
+            )
+
+    def test_deadline_mid_rollout_discards_partial_snapshot_and_preserves_newer_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            rollout_dir = root / "codex-home" / "sessions" / "2026" / "08" / "04"
+            rollout_dir.mkdir(parents=True)
+            now = time.time()
+            records = []
+            for captured_at, used_percent in ((now - 120, 12), (now + 1, 96)):
+                records.append(
+                    {
+                        "timestamp": datetime.fromtimestamp(
+                            captured_at, timezone.utc
+                        ).isoformat().replace("+00:00", "Z"),
+                        "payload": {
+                            "rate_limits": {
+                                "limit_id": "codex",
+                                "primary": {
+                                    "used_percent": used_percent,
+                                    "window_minutes": 10_080,
+                                    "resets_at": now + 86_400,
+                                },
+                                "secondary": None,
+                            }
+                        },
+                    }
+                )
+            (rollout_dir / "rollout-deadline.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            stored = Snapshot(
+                used_percentage=94.0,
+                captured_at=now,
+                resets_at=now + 7_200,
+                window="weekly",
+                source="codex",
+            )
+            environment = {
+                "CODEX_HOME": str(root / "codex-hooks"),
+                "HEADROOM_CODEX_HOME": str(root / "codex-home"),
+                "HEADROOM_STATE_DIR": str(state_dir),
+            }
+            rollout_results = []
+
+            def read_real_rollout(**kwargs):
+                result = codexsrc.read_latest(**kwargs)
+                rollout_results.append(result)
+                return result
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                save_snapshots((stored,))
+                with mock.patch(
+                    "headroom.cli.read_rate_limits",
+                    return_value=CodexRpcResult((), True, ("RPC unavailable",)),
+                ):
+                    with mock.patch(
+                        "headroom.cli.read_latest", side_effect=read_real_rollout
+                    ):
+                        with mock.patch(
+                            "headroom.codexsrc.time.monotonic",
+                            side_effect=[0.0] * 6 + [float("inf")],
+                        ):
+                            result = main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(rollout_results), 1)
+            self.assertEqual(rollout_results[0].snapshots, ())
+            self.assertIn("deadline reached while reading", " ".join(rollout_results[0].notes))
+            persisted = read_state(state_dir)["sources"]["codex"]["weekly"]
+            self.assertEqual(persisted["used_percentage"], 94.0)
+            self.assertEqual(persisted["captured_at"], now)
+
     def _environment(self, root: Path, mode: str) -> dict[str, str]:
         return {
+            "CODEX_HOME": str(root / "codex-hooks"),
             "HEADROOM_CODEX_HOME": str(root / "codex-home"),
             "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
             "HEADROOM_STATE_DIR": str(root / "state"),

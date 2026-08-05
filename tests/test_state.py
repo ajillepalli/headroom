@@ -66,6 +66,31 @@ class StateTests(unittest.TestCase):
             self.assertFalse((state_dir / "history.jsonl").exists())
             self.assertTrue(unrelated.is_file())
 
+    def test_older_snapshot_never_replaces_newer_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            newer = Snapshot(
+                used_percentage=91.0,
+                captured_at=200.0,
+                resets_at=None,
+                window="weekly",
+                source="codex",
+            )
+            older = Snapshot(
+                used_percentage=9.0,
+                captured_at=100.0,
+                resets_at=None,
+                window="weekly",
+                source="codex",
+            )
+
+            save_snapshots((newer,), state_dir)
+            state = save_snapshots((older,), state_dir)
+
+            persisted = state["sources"]["codex"]["weekly"]
+            self.assertEqual(persisted["used_percentage"], 91.0)
+            self.assertEqual(persisted["captured_at"], 200.0)
+
 
 if __name__ == "__main__":
     unittest.main()

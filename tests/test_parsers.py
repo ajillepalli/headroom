@@ -274,6 +274,7 @@ class ParserTests(unittest.TestCase):
                 state_dir,
             )
             environment = {
+                "CODEX_HOME": str(Path(directory) / "codex-hooks"),
                 "HEADROOM_STATE_DIR": directory,
                 "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
                 "HEADROOM_CODEX_RPC": "0",

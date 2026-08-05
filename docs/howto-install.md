@@ -12,11 +12,15 @@ The `headroom-cli` package is not published yet. Once it is available, install t
 uv tool install headroom-cli
 ```
 
-Then configure Claude Code:
+Then configure Claude Code, Codex, or both:
 
 ```console
 headroom init
+headroom init --codex
+headroom init --all
 ```
+
+Plain `headroom init` keeps its original behavior and configures Claude Code only. Use `--codex` for Codex only or `--all` for both.
 
 ## Install from a clone
 
@@ -40,10 +44,10 @@ For an editable installation, use pip:
 pip install -e .
 ```
 
-Either installation exposes the `headroom` entry point. Run:
+Either installation exposes the `headroom` entry point. To configure both clients and inspect the readings, run:
 
 ```console
-headroom init
+headroom init --all
 headroom status
 ```
 
@@ -54,6 +58,8 @@ To inspect the JSON fragment without reading or writing a settings file, run:
 ```console
 headroom init --print
 ```
+
+Add `--codex` to preview the verified Codex document. With `--all`, the printed JSON has `claude` and `codex` keys containing the two fragments.
 
 To inspect a unified diff without changing the file or making a backup, run:
 
@@ -67,9 +73,15 @@ To target a test or nondefault file, add:
 headroom init --settings PATH
 ```
 
-The default target is `~/.claude/settings.json`.
+The default Claude Code target is `~/.claude/settings.json`. To select a test or nondefault Codex home, run:
 
-## What init writes
+```console
+headroom init --codex --codex-home PATH
+```
+
+The Codex target is `hooks.json` inside `--codex-home`, then `CODEX_HOME` when that environment variable is set, and otherwise `~/.codex`.
+
+## What init writes for Claude Code
 
 The generated fragment sets a command statusline with a 300-second refresh interval and adds one `UserPromptSubmit` command hook:
 
@@ -99,6 +111,35 @@ The generated fragment sets a command statusline with a 300-second refresh inter
 
 Before changing an existing file, `init` copies it to `settings.json.TIMESTAMP.bak` in the same directory. A new file needs no backup. An unchanged file is neither rewritten nor backed up. Invalid JSON, a non-object top level, a non-object `hooks` value, or a non-array `hooks.UserPromptSubmit` value is refused without a settings change.
 
+## What init writes for Codex
+
+`headroom init --codex` writes this verified shape to the selected `hooks.json`:
+
+```json
+{
+  "description": "headroom",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "headroom hook",
+            "timeoutSec": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The inner object containing `hooks` is required. headroom always emits the PascalCase file event `UserPromptSubmit`; Codex normalizes it internally when it registers the command.
+
+The Codex path uses the same merge discipline as the Claude Code path. It preserves unrelated keys, unrelated hook events, and existing `UserPromptSubmit` entries, then appends the headroom wrapper only when it is absent. Before changing an existing file, it copies the original content to `hooks.json.TIMESTAMP.bak` and prints the backup path. Malformed JSON and incompatible `hooks` shapes are refused without changing the file.
+
+`--dry-run` reads and merges every selected file but writes no file or backup. `--print` reads no selected file and writes nothing. `--all` preflights both files before it creates backups or writes either one. If a later write still fails after the first target was updated, init restores the already-written target and reports the failure. If restoration fails, it explicitly reports that configuration may be partially applied.
+
 ## Configure a plain clone without a command on PATH
 
 The compatibility shim runs the same installer:
@@ -107,9 +148,9 @@ The compatibility shim runs the same installer:
 python install.py
 ```
 
-When no `headroom` executable is on `PATH`, the generated statusline and hook commands use the current Python executable, an absolute checkout path in `PYTHONPATH`, and `python -m headroom.cli`. This lets Claude Code invoke the clone from any working directory. On Windows the environment prefix uses `set "PYTHONPATH=..." &&`; on POSIX systems it uses `PYTHONPATH=...` with shell quoting.
+When no `headroom` executable is on `PATH`, the generated Claude Code statusline and hook commands use the current Python executable, an absolute checkout path in `PYTHONPATH`, and `python -m headroom.cli`. This lets Claude Code invoke the clone from any working directory. On Windows the environment prefix uses `set "PYTHONPATH=..." &&`; on POSIX systems it uses `PYTHONPATH=...` with shell quoting. The verified Codex document always uses the literal command `headroom hook`, so install the entry point before enabling the Codex hook.
 
-`python install.py` accepts `--settings`, `--dry-run`, and `--print` because it forwards them to `headroom init`.
+`python install.py` accepts all init flags because it forwards them to `headroom init`.
 
 ## Verify the setup
 
@@ -120,7 +161,7 @@ headroom status
 headroom doctor
 ```
 
-`status` shows all four source-window combinations. `doctor` identifies the state location and the winning Codex capture source. See [Troubleshooting](howto-troubleshoot.md) for each line.
+`status` shows all four source-window combinations. `doctor` reports the selected Codex hooks file, whether the headroom hook is registered, the state location, and the winning Codex capture source. See [Troubleshooting](howto-troubleshoot.md) for each line.
 
 Run the standard-library test suite from the repository root with:
 
