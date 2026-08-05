@@ -24,7 +24,6 @@ from headroom.render import (
 )
 from headroom.severity import (
     MAX_TRUSTED_RATE_DRIFT,
-    MAX_TRUSTED_RAW_RATE_RATIO,
     MAX_TRUSTED_RELATIVE_DEVIATION,
     MAX_TRUSTED_USAGE_SHARE,
     MIN_TRUSTED_INTERVALS,
@@ -88,6 +87,29 @@ class TrustworthyPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_the_ordinary_real_data_cluster_is_trustworthy(self) -> None:
+        # Regression test for Codex review round 1: with the FIRST version
+        # of this policy, every one of the 58 successful projections found
+        # across this project's own ~/.headroom/history.jsonl (scanned at
+        # every historical capture timestamp) was rejected. This is not a
+        # synthetic "too clean" fixture -- these are the exact measurements
+        # from the largest real cluster (42 of 58) that a recalibration
+        # against that same history now admits, so this test would have
+        # caught the original all-reject bug directly.
+        real_cluster = _projection(
+            max_relative_deviation=1.1564203806074873,
+            max_usage_share=0.2222222222222222,
+            intervals_used=8,
+            rate_drift=0.4080394598657509,
+            max_raw_rate_ratio=73.04056571506035,  # excluded from the gate; still huge
+        )
+        self.assertTrue(burn_rate_projection_is_trustworthy(real_cluster))
+
+        # The other real cluster (16 of 58) is a categorically different,
+        # order-of-magnitude-off shape and must stay rejected.
+        anomalous_cluster = _projection(max_relative_deviation=8.983326548469673)
+        self.assertFalse(burn_rate_projection_is_trustworthy(anomalous_cluster))
+
     def test_reason_guard_overrides_populated_measurement_fields(self) -> None:
         # An unrealistic but adversarial construction: reason is set (so this
         # is, by definition, a declined projection) yet every measurement
@@ -140,11 +162,19 @@ class TrustworthyPolicyTests(unittest.TestCase):
         self.assertTrue(burn_rate_projection_is_trustworthy(at_boundary))
         self.assertFalse(burn_rate_projection_is_trustworthy(just_over))
 
-    def test_max_raw_rate_ratio_boundary(self) -> None:
-        at_boundary = _projection(max_raw_rate_ratio=MAX_TRUSTED_RAW_RATE_RATIO)
-        just_over = _projection(max_raw_rate_ratio=MAX_TRUSTED_RAW_RATE_RATIO + 0.001)
-        self.assertTrue(burn_rate_projection_is_trustworthy(at_boundary))
-        self.assertFalse(burn_rate_projection_is_trustworthy(just_over))
+    def test_max_raw_rate_ratio_does_not_gate_trustworthiness(self) -> None:
+        # Deliberately excluded from the policy: see severity.py's module
+        # comment. It saturates (69-566, ~20x-190x past any threshold that
+        # would still admit real data) on every real successful projection
+        # in this project's own history because headroom's capture cadence
+        # is far finer than a whole percentage point of usage, not because
+        # real usage is unusually bursty -- so it cannot discriminate for
+        # input shaped like headroom's own. A projection with an extreme
+        # max_raw_rate_ratio must still be trustworthy if every OTHER
+        # threshold clears; this pins that down so a future change cannot
+        # silently reintroduce the gate this project measured and removed.
+        extreme = _projection(max_raw_rate_ratio=1_000_000.0)
+        self.assertTrue(burn_rate_projection_is_trustworthy(extreme))
 
 
 class RenderBurnRateDoctorTests(unittest.TestCase):
@@ -178,10 +208,42 @@ class RenderBurnRateDoctorTests(unittest.TestCase):
                 self.assertIn("raw rate ratio", lines[0])
 
 
+def _fresh_reading(
+    *, source: str = "claude", window: str = "short", lower_bound_percent: float = 20.0
+) -> Reading:
+    """A Reading whose confidence is FRESH, matching a projection's default
+    source and window, so severity.burn_rate_evidence_is_current passes."""
+
+    return Reading(
+        certain=True,
+        lower_bound_percent=lower_bound_percent,
+        resets_at=100_000.0,
+        age_seconds=10.0,
+        window=window,
+        source=source,
+        confidence=Confidence.FRESH,
+    )
+
+
+def _stale_reading(
+    *, source: str = "claude", window: str = "short", lower_bound_percent: float = 20.0
+) -> Reading:
+    return Reading(
+        certain=False,
+        lower_bound_percent=lower_bound_percent,
+        resets_at=100_000.0,
+        age_seconds=10_000.0,
+        window=window,
+        source=source,
+        confidence=Confidence.STALE_BOUNDED,
+    )
+
+
 class RenderBurnRateStatusTests(unittest.TestCase):
-    def test_trustworthy_projection_produces_a_line(self) -> None:
+    def test_trustworthy_projection_with_fresh_evidence_produces_a_line(self) -> None:
         projection = _projection(source="codex", window="weekly")
-        lines = render_burn_rate_status_lines([projection], now=1_000.0)
+        reading = _fresh_reading(source="codex", window="weekly")
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
 
         self.assertEqual(len(lines), 1)
         self.assertIn("Codex", lines[0])
@@ -189,7 +251,8 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
     def test_declined_projection_says_nothing(self) -> None:
         projection = _projection(reason=NoProjectionReason.SPAN_TOO_SHORT)
-        lines = render_burn_rate_status_lines([projection], now=1_000.0)
+        reading = _fresh_reading()
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
 
         self.assertEqual(lines, [])
 
@@ -199,7 +262,28 @@ class RenderBurnRateStatusTests(unittest.TestCase):
         # like the declined case, and must not leak the structural reason
         # (there isn't one) or any raw measurement.
         projection = _projection(max_relative_deviation=50.0)
-        lines = render_burn_rate_status_lines([projection], now=1_000.0)
+        reading = _fresh_reading()
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
+
+        self.assertEqual(lines, [])
+
+    def test_trustworthy_projection_without_fresh_evidence_says_nothing(self) -> None:
+        # The fit itself clears every threshold, but nothing CURRENT confirms
+        # it: the only reading for this exact source/window is stale. This
+        # is the freshness gate (severity.burn_rate_evidence_is_current),
+        # distinct from the trust thresholds above.
+        projection = _projection(source="claude", window="short")
+        reading = _stale_reading(source="claude", window="short")
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
+
+        self.assertEqual(lines, [])
+
+    def test_trustworthy_projection_with_no_matching_reading_says_nothing(self) -> None:
+        # No reading at all for this source/window -- there is no current
+        # evidence to confirm, so the gate fails the same way a stale one
+        # would.
+        projection = _projection(source="claude", window="short")
+        lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[])
 
         self.assertEqual(lines, [])
 
@@ -229,7 +313,7 @@ class RenderHookCompositionTests(unittest.TestCase):
         self.assertEqual(render_hook(readings, now=1_000.0), "")
 
     def test_burn_only_speaks_without_a_usage_headroom_line(self) -> None:
-        readings = [self._reading(lower_bound_percent=3.0)]
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
         projection = _projection()
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
@@ -240,7 +324,7 @@ class RenderHookCompositionTests(unittest.TestCase):
 
     def test_notice_or_warn_severity_composes_with_burn_warning(self) -> None:
         # 15% headroom -> WARN (see severity.py's ladder).
-        readings = [self._reading(lower_bound_percent=85.0)]
+        readings = [self._reading(lower_bound_percent=85.0), _fresh_reading()]
         projection = _projection()
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
@@ -249,7 +333,7 @@ class RenderHookCompositionTests(unittest.TestCase):
 
     def test_critical_rate_limit_suppresses_burn_warning(self) -> None:
         # <10% headroom -> CRITICAL.
-        readings = [self._reading(lower_bound_percent=95.0)]
+        readings = [self._reading(lower_bound_percent=95.0), _fresh_reading()]
         projection = _projection()
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
@@ -257,28 +341,49 @@ class RenderHookCompositionTests(unittest.TestCase):
         self.assertNotIn("Burn rate:", text)
 
     def test_exhaustion_after_reset_is_never_spoken_by_hook(self) -> None:
-        readings = [self._reading(lower_bound_percent=3.0)]
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
         projection = _projection(exhaustion_precedes_reset=False)
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
         self.assertEqual(text, "")
 
     def test_exhaustion_with_unknown_reset_is_never_spoken_by_hook(self) -> None:
-        readings = [self._reading(lower_bound_percent=3.0)]
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
         projection = _projection(exhaustion_precedes_reset=None)
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
         self.assertEqual(text, "")
 
     def test_untrustworthy_projection_is_not_spoken_even_when_precedes_reset(self) -> None:
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
+        projection = _projection(max_relative_deviation=MAX_TRUSTED_RELATIVE_DEVIATION + 0.001)
+        text = render_hook(readings, now=1_000.0, projections=[projection])
+
+        self.assertEqual(text, "")
+
+    def test_stale_evidence_suppresses_hook_warning_even_when_trustworthy(self) -> None:
+        # The fit clears every trust threshold and precedes reset, but the
+        # only reading for this source/window is stale -- nothing current
+        # confirms the trend is still happening. This is severity.py's
+        # burn_rate_evidence_is_current gate, distinct from the five
+        # interval-shape thresholds (Codex review, round 1, P2).
+        readings = [self._reading(lower_bound_percent=3.0), _stale_reading()]
+        projection = _projection()
+        text = render_hook(readings, now=1_000.0, projections=[projection])
+
+        self.assertEqual(text, "")
+
+    def test_missing_matching_reading_suppresses_hook_warning(self) -> None:
+        # No reading at all exists for the projection's exact source/window
+        # -- there is nothing to confirm the trend is current.
         readings = [self._reading(lower_bound_percent=3.0)]
-        projection = _projection(max_raw_rate_ratio=1_000.0)
+        projection = _projection(source="claude", window="short")
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
         self.assertEqual(text, "")
 
     def test_forced_severity_isolates_from_burn_rate_composition(self) -> None:
-        readings = [self._reading(lower_bound_percent=3.0)]
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
         projection = _projection()
         text = render_hook(
             readings, now=1_000.0, projections=[projection], forced_severity=Severity.WARN
@@ -288,7 +393,7 @@ class RenderHookCompositionTests(unittest.TestCase):
         self.assertNotIn("Burn rate:", text)
 
     def test_earliest_of_several_trustworthy_warnings_is_selected(self) -> None:
-        readings = [self._reading(lower_bound_percent=3.0)]
+        readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
         soon = _projection(source="claude", window="short", projected_exhaustion_at=1_100.0)
         later = _projection(source="codex", window="weekly", projected_exhaustion_at=5_000.0)
         text = render_hook(readings, now=1_000.0, projections=[later, soon])
@@ -297,10 +402,15 @@ class RenderHookCompositionTests(unittest.TestCase):
         self.assertNotIn("Codex", text)
 
     def test_composed_hook_output_stays_within_word_budget(self) -> None:
-        readings = [self._reading(lower_bound_percent=85.0)]
+        readings = [self._reading(lower_bound_percent=85.0), _fresh_reading()]
         projection = _projection()
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
+        # Confirm both sections actually composed (not silently dropped),
+        # so the word-count assertion below is measuring the real combined
+        # case rather than passing vacuously on a shorter, single-topic text.
+        self.assertIn("Usage headroom:", text)
+        self.assertIn("Burn rate:", text)
         word_count = len(text.split())
         self.assertLessEqual(word_count, 70, text)
 

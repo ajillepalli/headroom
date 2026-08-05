@@ -160,7 +160,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if arguments.command == "doctor":
             return _doctor()
-        now = time.time()
         if arguments.command != "hook" or not arguments.stored_only:
             deadline = (
                 time.monotonic() + HOOK_DEADLINE_SECONDS
@@ -168,12 +167,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else None
             )
             _refresh_codex(deadline=deadline)
+        # Captured AFTER the refresh above (not before): a successful
+        # app-server refresh timestamps its snapshot with its own
+        # time.time() call inside codexrpc.py, which can land after an
+        # earlier `now` here. project_exhaustion discards any history record
+        # whose captured_at exceeds the `now` it is given, so a stale `now`
+        # would silently exclude the snapshot just appended by the refresh
+        # above from every projection this call computes (Codex review,
+        # round 1, P1).
+        now = time.time()
         state = read_state()
         readings = _readings(state, now)
         projections = _burn_rate_projections(now)
         if arguments.command == "status":
             print(render_report(readings, now))
-            burn_lines = render_burn_rate_status_lines(projections, now)
+            burn_lines = render_burn_rate_status_lines(projections, now, readings)
             if burn_lines:
                 print("Burn rate")
                 for line in burn_lines:

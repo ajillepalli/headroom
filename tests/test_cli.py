@@ -486,7 +486,8 @@ def _write_history(state_dir: Path, records) -> None:
 
 
 def _steady_climb_records(now: float, source: str = "claude", window: str = "short"):
-    """Six records, 600s apart, climbing 10 points each interval.
+    """Six records, 600s apart, climbing 10 points each interval, ending 30s
+    ago (within Claude's 300s freshness window -- see freshness.py).
 
     Every interval carries the same rate, so max_relative_deviation and
     rate_drift are both 0.0, max_raw_rate_ratio is 1.0 (no burst), the
@@ -494,10 +495,12 @@ def _steady_climb_records(now: float, source: str = "claude", window: str = "sho
     5 post-folding intervals -- clearing every severity.py trust threshold
     with margin. The projected exhaustion (40 more points at this rate,
     40 minutes past the last capture) lands well before the 2-hour resets_at
-    below, so exhaustion_precedes_reset is True.
+    below, so exhaustion_precedes_reset is True. The last record's fields
+    are also what ``_matching_state_snapshot`` below turns into a FRESH
+    Reading, since severity.burn_rate_evidence_is_current requires one.
     """
 
-    base = now - 3_600.0
+    base = now - 30.0 - 3_000.0
     resets_at = now + 7_200.0
     return [
         {
@@ -509,6 +512,39 @@ def _steady_climb_records(now: float, source: str = "claude", window: str = "sho
         }
         for index in range(6)
     ]
+
+
+def _matching_state_snapshot(records) -> dict:
+    """A state.json snapshot dict matching a history record list's latest
+    entry, so the corresponding Reading is FRESH and
+    severity.burn_rate_evidence_is_current has current evidence to check.
+    Real usage always has this correspondence: the latest history line and
+    the stored state snapshot for a source/window come from the same
+    capture.
+    """
+
+    latest = records[-1]
+    return {
+        "used_percentage": latest["used_percentage"],
+        "captured_at": latest["captured_at"],
+        "resets_at": latest["resets_at"],
+        "window": latest["window"],
+        "source": latest["source"],
+        "limit_reached": False,
+        "raw": {},
+    }
+
+
+def _write_state(state_dir: Path, snapshots) -> None:
+    """Write a state.json whose sources contain each given snapshot dict."""
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    sources: dict = {}
+    for snapshot in snapshots:
+        sources.setdefault(snapshot["source"], {})[snapshot["window"]] = snapshot
+    (state_dir / "state.json").write_text(
+        json.dumps({"version": 1, "sources": sources}), encoding="utf-8"
+    )
 
 
 def _too_few_samples_records(now: float, source: str = "codex", window: str = "weekly"):
@@ -658,11 +694,13 @@ class BurnRateSurfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             now = time.time()
-            _write_history(
-                root / "state",
-                _steady_climb_records(now, window="short")
-                + _bursty_but_present_records(now, window="weekly"),
-            )
+            climb = _steady_climb_records(now, window="short")
+            _write_history(root / "state", climb + _bursty_but_present_records(now, window="weekly"))
+            # A fresh matching reading is required for status to speak about
+            # the trustworthy projection (severity.burn_rate_evidence_is_current);
+            # the bursty/weekly one stays silent on trust grounds alone, so
+            # it needs no matching state entry.
+            _write_state(root / "state", [_matching_state_snapshot(climb)])
             output = io.StringIO()
             with mock.patch.dict(os.environ, self._environment(root), clear=True):
                 with redirect_stdout(output):
@@ -682,7 +720,9 @@ class BurnRateSurfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             now = time.time()
-            _write_history(root / "state", _steady_climb_records(now))
+            climb = _steady_climb_records(now)
+            _write_history(root / "state", climb)
+            _write_state(root / "state", [_matching_state_snapshot(climb)])
             output = io.StringIO()
             with mock.patch.dict(os.environ, self._environment(root), clear=True):
                 with mock.patch("sys.stdin", io.StringIO("")):
@@ -729,6 +769,79 @@ class BurnRateSurfaceTests(unittest.TestCase):
             self.assertIn("Usage headroom:", rendered)
             self.assertIn("Codex", rendered)
             self.assertNotIn("Burn rate:", rendered)
+
+    def test_projection_includes_the_sample_captured_during_this_calls_refresh(self) -> None:
+        # Regression test for Codex review round 1, P1: `now` must be
+        # captured AFTER _refresh_codex runs, not before. A successful
+        # refresh appends a new history record timestamped with its OWN
+        # time.time() call (inside codexrpc.py), which can land after an
+        # earlier `now`. project_exhaustion drops any record whose
+        # captured_at exceeds the `now` it is given, so a premature `now`
+        # would silently exclude the very snapshot this call just captured.
+        #
+        # Two pre-existing records are one short of MIN_SAMPLES (3); the
+        # refresh mock appends a third, in-range record with a real,
+        # currently-captured timestamp. Only a `now` captured after the
+        # refresh is guaranteed to be >= that timestamp.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            anchor = time.time() - 10_000.0
+            history_path = state_dir / "history.jsonl"
+            history_path.write_text(
+                "\n".join(
+                    json.dumps(record, separators=(",", ":"))
+                    for record in (
+                        {
+                            "captured_at": anchor,
+                            "used_percentage": 10.0,
+                            "resets_at": anchor + 50_000.0,
+                            "source": "claude",
+                            "window": "short",
+                        },
+                        {
+                            "captured_at": anchor + 120.0,
+                            "used_percentage": 20.0,
+                            "resets_at": anchor + 50_000.0,
+                            "source": "claude",
+                            "window": "short",
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _append_third_record_during_refresh(deadline=None):
+                with history_path.open("a", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "captured_at": time.time(),
+                            "used_percentage": 30.0,
+                            "resets_at": anchor + 50_000.0,
+                            "source": "claude",
+                            "window": "short",
+                        },
+                        handle,
+                        separators=(",", ":"),
+                    )
+                    handle.write("\n")
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch(
+                    "headroom.cli._refresh_codex", side_effect=_append_third_record_during_refresh
+                ):
+                    with redirect_stdout(output):
+                        result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            projections = {
+                (p["source"], p["window"]): p for p in document["burn_rate_projections"]
+            }
+            self.assertEqual(projections[("claude", "short")]["samples_used"], 3)
 
     def test_hook_exits_zero_with_malformed_state_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

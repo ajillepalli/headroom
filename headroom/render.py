@@ -4,7 +4,12 @@ from typing import Dict, List, Optional, Sequence
 
 from .bounds import Confidence, Reading
 from .burn_rate import BurnRateProjection, NoProjectionReason
-from .severity import Severity, burn_rate_projection_is_trustworthy, reading_severity
+from .severity import (
+    Severity,
+    burn_rate_evidence_is_current,
+    burn_rate_projection_is_trustworthy,
+    reading_severity,
+)
 
 
 def render_statusline(readings: Sequence[Reading], now: float) -> str:
@@ -64,11 +69,13 @@ def render_hook(
       diluted by appending a second topic.
     * Otherwise, a trustworthy burn-rate warning (one whose
       ``exhaustion_precedes_reset`` is ``True`` -- never ``False`` or
-      ``None``, see BurnRateProjection's tri-state docstring -- AND that
-      clears severity.py's trust bar) is shown alongside whatever the
-      severity ladder already has to say. If the ladder has nothing
-      actionable (every reading is OK), the burn-rate lines are the only
-      output. If the ladder has a NOTICE or WARN reading, both appear.
+      ``None``, see BurnRateProjection's tri-state docstring -- that clears
+      severity.py's trust bar AND has a currently FRESH reading confirming
+      the same source and window, per
+      ``severity.burn_rate_evidence_is_current``) is shown alongside
+      whatever the severity ladder already has to say. If the ladder has
+      nothing actionable (every reading is OK), the burn-rate lines are the
+      only output. If the ladder has a NOTICE or WARN reading, both appear.
     * If neither has anything to say, this returns "" and the hook prints
       nothing, matching the documented "silent when nothing actionable"
       hook contract.
@@ -78,7 +85,9 @@ def render_hook(
     # Forced-severity output is a diagnostic test path (HEADROOM_FORCE_SEVERITY),
     # not a real usage signal, so it stays isolated from burn-rate composition
     # rather than mixing synthetic severity with a genuine projection.
-    burn_warning = None if forced_severity is not None else _earliest_burn_rate_warning(projections)
+    burn_warning = (
+        None if forced_severity is not None else _earliest_burn_rate_warning(projections, readings)
+    )
     if not actionable and forced_severity is None and burn_warning is None:
         return ""
 
@@ -146,22 +155,31 @@ def _severity_action(severity: Severity) -> str:
 
 def _earliest_burn_rate_warning(
     projections: Sequence[BurnRateProjection],
+    readings: Sequence[Reading],
 ) -> Optional[BurnRateProjection]:
-    """The single most urgent trustworthy burn-rate warning, if any.
+    """The single most urgent trustworthy, currently-evidenced burn-rate
+    warning, if any.
 
-    "Trustworthy" is answered by severity.py's policy; this only asks the
-    question and, among the trustworthy yeses, picks the soonest projected
-    exhaustion. Filters on ``exhaustion_precedes_reset is True`` specifically
-    (never truthiness) -- ``False`` means exhaustion is projected AFTER
-    reset (nothing to warn about) and ``None`` means either the reset time
-    is unknown or no projection exists at all; neither is "before reset."
+    "Trustworthy" (is the fit internally consistent) and "currently
+    evidenced" (is there a fresh reading confirming the same source and
+    window right now) are both answered by severity.py's policy functions;
+    this only asks both questions and, among the yeses, picks the soonest
+    projected exhaustion. Filters on ``exhaustion_precedes_reset is True``
+    specifically (never truthiness) -- ``False`` means exhaustion is
+    projected AFTER reset (nothing to warn about) and ``None`` means either
+    the reset time is unknown or no projection exists at all; neither is
+    "before reset."
     """
 
+    readings_by_window = {(reading.source, reading.window): reading for reading in readings}
     candidates = [
         projection
         for projection in projections
         if projection.exhaustion_precedes_reset is True
         and burn_rate_projection_is_trustworthy(projection)
+        and burn_rate_evidence_is_current(
+            projection, readings_by_window.get((projection.source, projection.window))
+        )
     ]
     if not candidates:
         return None
@@ -252,23 +270,33 @@ def render_burn_rate_doctor_lines(
 
 
 def render_burn_rate_status_lines(
-    projections: Sequence[BurnRateProjection], now: float
+    projections: Sequence[BurnRateProjection], now: float, readings: Sequence[Reading] = ()
 ) -> List[str]:
     """Render one line per window whose projection exists and, per
-    severity.py's burn-rate policy, is trustworthy enough to show a human.
+    severity.py's burn-rate policy, is trustworthy enough AND currently
+    evidenced enough to show a human.
 
     A declined projection says nothing here -- explaining the structural
     reason is doctor's job (``render_burn_rate_doctor_lines``), not
     status's. This deliberately does not require
-    ``exhaustion_precedes_reset is True``: status reports any trustworthy
+    ``exhaustion_precedes_reset is True``: status reports any qualifying
     projection so a user can see the projected pace even when exhaustion
     falls comfortably after reset, unlike ``hook``, which only ever speaks
-    about the "runs out before reset" case.
+    about the "runs out before reset" case. It does still require
+    ``burn_rate_evidence_is_current`` (a fresh matching reading), for the
+    same reason ``hook`` does: an internally consistent fit built from a
+    source that stopped reporting hours ago is not evidence of a live
+    trend, just a historical one (Codex review, round 1, P2).
     """
 
+    readings_by_window = {(reading.source, reading.window): reading for reading in readings}
     lines: List[str] = []
     for projection in projections:
         if not burn_rate_projection_is_trustworthy(projection):
+            continue
+        if not burn_rate_evidence_is_current(
+            projection, readings_by_window.get((projection.source, projection.window))
+        ):
             continue
         exhaustion_at = projection.projected_exhaustion_at
         if exhaustion_at is None:
