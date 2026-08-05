@@ -11,19 +11,34 @@ import subprocess
 import sys
 
 
-def settings_snippet() -> dict[str, object]:
-    """Return the settings fragment without changing the user's configuration."""
-    hook = Path(__file__).resolve().parent / "hooks" / "headroom-hook.py"
-    command_parts = [sys.executable, str(hook)]
-    hook_command = (
+def shell_command(command_parts: list[str]) -> str:
+    """Return a command line quoted for the current platform's shell."""
+    return (
         subprocess.list2cmdline(command_parts)
         if os.name == "nt"
         else shlex.join(command_parts)
     )
+
+
+def statusline_command() -> str:
+    """Return a statusline command that can run outside the repository."""
+    repository = str(Path(__file__).resolve().parent)
+    command = shell_command(
+        [sys.executable, "-m", "headroom.cli", "statusline"]
+    )
+    if os.name == "nt":
+        return 'set "PYTHONPATH={}" && {}'.format(repository, command)
+    return "PYTHONPATH={} {}".format(shlex.quote(repository), command)
+
+
+def settings_snippet() -> dict[str, object]:
+    """Return the settings fragment without changing the user's configuration."""
+    hook = Path(__file__).resolve().parent / "hooks" / "headroom-hook.py"
+    hook_command = shell_command([sys.executable, str(hook)])
     return {
         "statusLine": {
             "type": "command",
-            "command": "headroom statusline",
+            "command": statusline_command(),
             "refreshInterval": 300,
         },
         "hooks": {

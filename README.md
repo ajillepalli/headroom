@@ -1,0 +1,156 @@
+<p align="center">
+  <strong>headroom</strong><br>
+  <a href="#why-headroom">Why headroom</a> &middot;
+  <a href="#install">Install</a> &middot;
+  <a href="#commands">Commands</a> &middot;
+  <a href="#the-bounds-model">Bounds</a> &middot;
+  <a href="#limits">Limits</a><br><br>
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue.svg">
+  <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-zero-success.svg">
+  <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/python-3.9%2B-blue.svg">
+</p>
+
+## Why headroom
+
+Claude Code and Codex each enforce rolling usage limits. Each tool shows its numbers to a human, but the model never sees them. The model can keep fanning out subagents right up to the wall.
+
+headroom closes that gap. It captures both tools' local rate-limit readings, stores them together, and gives the model a short warning when usage calls for a change in behavior. The prompt hook stays silent when usage is fine.
+
+headroom uses only the Python standard library. It makes no network calls.
+
+## How it works
+
+| Source | Capture path |
+| --- | --- |
+| Claude Code | A configured statusline command receives JSON on standard input. Claude Code 2.1.80 and newer include a `rate_limits` value in that input. headroom searches the payload recursively because the nesting is not fixed. |
+| Codex | headroom reads rollout files below `~/.codex/sessions/YYYY/MM/DD/`. It orders files newest first, stops at the first file with a usable snapshot, and takes the last usable `rate_limits` value in that file. |
+
+Claude capture runs when Claude Code renders its statusline. Codex capture runs when `status`, `json`, or `hook` refreshes state from the newest local session rollout. Both sources accept the field variants present in current payloads, including snake case and camel case names.
+
+Snapshots go to `state.json` under the state directory. Writes replace that file atomically. Each captured snapshot is also appended to `history.jsonl`.
+
+## Install
+
+Use Python 3.9 or newer. From the repository root, run:
+
+```console
+python install.py
+```
+
+The script prints a `settings.json` fragment for the Claude Code statusline and `UserPromptSubmit` hook. Paste that fragment into your Claude Code settings. `install.py` does not find, merge, or edit `settings.json`.
+
+The generated hook command uses the current Python executable and an absolute path to `hooks/headroom-hook.py`. The generated statusline command uses the same Python executable, sets `PYTHONPATH` to this checkout, and runs `python -m headroom.cli statusline`. It therefore works regardless of the directory Claude Code invokes it from. Paths are quoted for the current platform.
+
+## Commands
+
+| Subcommand | What it prints |
+| --- | --- |
+| `statusline` | Reads a Claude statusline JSON document from standard input, stores any snapshots it can parse, and prints one compact line. It prints a fallback line and exits successfully even for malformed input. |
+| `status` | Refreshes Codex state, then prints a multi-line report for Claude and Codex across the short and weekly windows. Missing readings appear as `unavailable`. |
+| `json` | Refreshes Codex state, then prints one compact JSON document with persisted state, diagnostics, and four bounded readings. |
+| `hook` | Refreshes Codex state, then prints guidance for the highest actionable severity. It prints nothing when every reading is `ok`. |
+| `doctor` | Prints the state directory, state-file presence, stored Claude windows, Codex session discovery, the selected rollout, parsed Codex windows, and any scanner notes. It scans Codex without updating state. |
+
+Run a subcommand with this form:
+
+```console
+python -m headroom.cli status
+```
+
+### Observed output
+
+On August 4, 2026, the requested commands used a writable isolated state directory and the real local Codex sessions. They returned the following point-in-time output.
+
+```console
+python -m headroom.cli status
+```
+
+Output:
+
+```text
+Claude
+  5h: unavailable
+  7d: unavailable
+Codex
+  5h: unavailable
+  7d: 3% used [ok], resets in 6d 19h
+```
+
+```console
+python -m headroom.cli doctor
+```
+
+Output:
+
+```text
+State directory: C:\Users\ANANTH~1.JIL\AppData\Local\Temp\headroom-readme-state
+State file: found
+Claude readings: missing
+Codex sessions: found
+Codex rollout: C:\Users\ananth.jillepalli\.codex\sessions\2026\08\04\rollout-2026-08-04T22-27-53-019fd064-7871-7d72-a8ae-b157428f0475.jsonl
+Codex readings: weekly
+```
+
+## The bounds model
+
+The useful result is not a guess at current usage. It is a sound bound derived from a timestamped snapshot.
+
+Usage is monotonic inside one limit window. It can rise, but it cannot fall until the reset. A stale reading therefore gives a lower bound on current usage. If the last reading was 65%, headroom reports `>=65% used`. It never presents that stale value as exact, and it never overestimates usage.
+
+The reset time is absolute. Once `now` passes `resets_at`, the old window is over. headroom treats that snapshot as `post_reset`, sets its lower bound to 0%, and marks it certain and `ok`. It does not carry uncertainty from the previous window into the new one.
+
+This makes staleness mostly harmless. Before the reset, the last value remains a valid lower bound and severity leans toward caution. After the reset, the old reading becomes known-good instead of uncertain. Only a stale reading that has not reached its reset needs a hedge.
+
+The four confidence values are:
+
+| Confidence | Meaning |
+| --- | --- |
+| `fresh` | The snapshot age is within the source freshness interval. Its percentage is shown as exact. |
+| `stale_bounded` | The snapshot is older than that interval and its reset is still ahead. Its percentage is shown with `>=`. |
+| `post_reset` | The recorded reset has passed. The previous window is treated as reset and `ok`. |
+| `unknown` | No valid snapshot exists for that source and window. |
+
+## Severity
+
+Headroom means `100 - used percentage`.
+
+| Severity | Base condition |
+| --- | --- |
+| `ok` | Headroom is greater than 40%. |
+| `notice` | Headroom is from 20% through 40%. |
+| `warn` | Headroom is from 10% up to, but not including, 20%. |
+| `critical` | Headroom is below 10%, or the source says the limit was reached. |
+
+For a `stale_bounded` reading with less than 50% headroom, headroom raises the base severity by one level and caps it at `critical`. The code names this boundary `ESCALATE_BELOW_HEADROOM = 50.0`. A reading at exactly 50% headroom does not escalate. A `post_reset` reading is always `ok`.
+
+## Configuration
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `HEADROOM_STATE_DIR` | `~/.headroom` | Directory for `state.json` and `history.jsonl`. |
+| `HEADROOM_CODEX_HOME` | `~/.codex` | Codex home directory. Sessions are read from its `sessions` child directory. |
+| `HEADROOM_FRESH_CLAUDE_SECONDS` | `300` | Number of seconds a Claude snapshot remains fresh. |
+| `HEADROOM_FRESH_CODEX_SECONDS` | `1800` | Number of seconds a Codex snapshot remains fresh. |
+
+Freshness values must be finite, non-negative numbers.
+
+## Limits
+
+- Neither vendor publishes a token allowance through these sources. headroom reports percent used and reset time. It never reports tokens remaining.
+- Claude readings are only as fresh as the last statusline render.
+- Codex readings update only when a Codex session runs and writes a usable rollout.
+- The Codex short window is often `null`, so it may remain unavailable while the weekly window is present.
+
+## Tests
+
+Run the standard-library test suite from the repository root:
+
+```console
+python -m unittest discover -s tests -t .
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for change guidelines, [SECURITY.md](SECURITY.md) for private vulnerability reports, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+
+## License
+
+headroom is available under the [MIT License](LICENSE.txt).
