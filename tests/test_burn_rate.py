@@ -14,6 +14,7 @@ from unittest import mock
 
 from headroom.burn_rate import (
     MAX_FIT_SAMPLES,
+    MAX_INTERVAL_RATE_RATIO,
     MIN_INTERVAL_SECONDS,
     MIN_INTERVALS_FOR_HIGH_CONFIDENCE,
     MIN_SPAN_TO_HORIZON_RATIO,
@@ -223,6 +224,65 @@ class BurnRateTests(unittest.TestCase):
 
         self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
 
+    # -- Regression tests for the third-round Codex P2 confidence review ---
+
+    def test_dominant_interval_diluted_across_many_samples_is_not_high_confidence(
+        self,
+    ) -> None:
+        # (Codex P2, round 3) 500 one-second intervals: the first interval
+        # alone accounts for 20 of the segment's 99.68 total usage change
+        # (about 20%); the other 498 intervals each add a steady +0.16. The
+        # dominant interval is now diluted across so many agreeing
+        # neighbors that BOTH mean-based dispersion ratios above sit just
+        # under their 0.25 HIGH cutoff (the unweighted ratio lands at
+        # ~0.2485) -- proving that no mean, however weighted, can be
+        # trusted to catch this: growing N is enough to launder any single
+        # outlier through a mean. Only comparing the single worst interval
+        # (rate 20.0) against the group's median (0.16) -- a 125x ratio --
+        # catches it, which is exactly what MAX_INTERVAL_RATE_RATIO checks.
+        records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        usage = 20.0
+        records.append(_HistoryRecord(1.0, None, "claude", "short", usage))
+        for index in range(2, 500):
+            usage += 0.16
+            records.append(
+                _HistoryRecord(float(index), None, "claude", "short", usage)
+            )
+        self.assertEqual(len(records), 500)
+
+        confidence = _confidence_for_records(records)
+
+        self.assertNotEqual(confidence, ProjectionConfidence.HIGH)
+
+    def test_genuinely_steady_series_can_still_reach_high_confidence(self) -> None:
+        # The max-based veto above must not make HIGH unreachable -- if
+        # nothing can ever satisfy it, the confidence metric is useless,
+        # which would be a worse outcome than the bug it fixes. 100
+        # intervals, each within 3% of a 1.0 %/s baseline (a fixed
+        # alternating +/-3% pattern, not real randomness, so this can never
+        # flake), must still clear both the mean-based and max-based checks.
+        records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        usage = 0.0
+        for index in range(1, 101):
+            noise = 0.03 if index % 2 == 0 else -0.03
+            usage += 1.0 + noise
+            records.append(
+                _HistoryRecord(float(index), None, "claude", "short", usage)
+            )
+
+        confidence = _confidence_for_records(records)
+
+        self.assertEqual(confidence, ProjectionConfidence.HIGH)
+
+    def test_max_interval_rate_ratio_threshold_allows_ordinary_jitter(self) -> None:
+        # Sanity check on the constant's value only (mirrors
+        # test_degenerate_interval_threshold_is_positive below): it must be
+        # greater than 1.0 -- a ratio of exactly 1.0 would require every
+        # interval to match the median exactly, which no real sampled data
+        # does, making HIGH permanently unreachable. Coverage that the
+        # constant is actually USED lives in the two tests above.
+        self.assertGreater(MAX_INTERVAL_RATE_RATIO, 1.0)
+
     def test_project_group_hard_invariant_rejects_decrease_if_called_directly(
         self,
     ) -> None:
@@ -295,20 +355,30 @@ class BurnRateTests(unittest.TestCase):
         self.assertFalse(projection.exhaustion_precedes_reset)
 
     def test_only_records_since_latest_reset_are_fitted(self) -> None:
+        # Usage is nondecreasing across the whole history (10 -> 20 -> 21 ->
+        # 31 -> 41): the decrease-based segmentation rule never fires here,
+        # so this is a clean isolation of the resets_at-change rule alone.
+        # (An earlier version of this test used a 99 -> 1 usage drop
+        # alongside the resets_at change; reverting the resets_at rule still
+        # passed, because the decrease itself tripped the OTHER
+        # segmentation rule and segmented the history anyway -- proving
+        # nothing about resets_at specifically. See
+        # test_usage_drop_segments_out_the_stale_window for the decrease
+        # rule's own isolated coverage.)
         projection = self._project(
             [
-                self._record(0.0, 95.0, resets_at=1_000.0),
-                self._record(60.0, 99.0, resets_at=1_000.0),
-                self._record(120.0, 1.0, resets_at=5_000.0),
+                self._record(0.0, 10.0, resets_at=1_000.0),
+                self._record(60.0, 20.0, resets_at=1_000.0),
+                self._record(120.0, 21.0, resets_at=5_000.0),
                 self._record(1_920.0, 31.0, resets_at=5_000.0),
-                self._record(3_720.0, 61.0, resets_at=5_000.0),
+                self._record(3_720.0, 41.0, resets_at=5_000.0),
             ]
         )[0]
 
         self.assertEqual(projection.samples_used, 3)
         self.assertEqual(projection.span_seconds, 3_600.0)
         self.assertAlmostEqual(
-            projection.rate_percent_per_second or 0.0, 1.0 / 60.0
+            projection.rate_percent_per_second or 0.0, 1.0 / 180.0
         )
         self.assertIsNotNone(projection.projected_exhaustion_at)
         self.assertFalse(projection.exhaustion_precedes_reset)

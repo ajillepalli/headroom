@@ -40,6 +40,25 @@ MAX_FIT_SAMPLES = 500
 # independent interval before that claim is defensible.
 MIN_INTERVALS_FOR_HIGH_CONFIDENCE = 3
 
+# HIGH confidence asserts that EVERY interval sampled the same underlying
+# rate, not merely that the intervals agree "on average". A mean-based
+# statistic -- however it is weighted -- can always be satisfied by one
+# catastrophic interval as long as enough agreeing intervals surround it,
+# because averaging is precisely the operation that dilutes an outlier by
+# the size of the crowd around it. This is a hard mathematical ceiling: no
+# choice of weights fixes it (three rounds of review confirmed that: a
+# sign-based check, then a recency-weighted mean, then the worse of a
+# recency-weighted and an unweighted mean all still passed a 500-interval
+# segment where a single interval carried 20% of the total usage change).
+# The only fix is a check that a mean can never launder: the single WORST
+# interval, compared on its own to the group's median rate. A factor of 4
+# marks the line between "noisy but recognizably the same rate" and "a
+# different regime entirely" -- ordinary sampling jitter on a steady
+# process moves a reading by tens of percent, not by multiples of itself,
+# so an interval running at 4x (or 1/4) the median rate is not the same
+# process sampled twice, and HIGH must not claim it is.
+MAX_INTERVAL_RATE_RATIO = 4.0
+
 
 class ProjectionConfidence(str, Enum):
     """How consistently the history supports the fitted direction."""
@@ -401,6 +420,22 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     inconsistency -- a recent burst or a single buried outlier -- can veto
     HIGH confidence.
 
+    Both of the above are still MEANS, and a mean of N numbers can always be
+    kept small by making N large enough: a single interval consuming 20% of
+    the segment's total usage change, spread across 500 total intervals,
+    produces an unweighted mean deviation ratio that lands just UNDER the
+    HIGH cutoff (proven in
+    test_dominant_interval_diluted_across_many_samples_is_not_high_confidence
+    below). No mean-based statistic can close this gap, because dilution by
+    sample count is exactly what a mean does. What cannot be diluted by
+    sample count is a MAXIMUM: comparing each interval's rate to the
+    group's median individually, keeping only the single worst ratio. See
+    MAX_INTERVAL_RATE_RATIO for what that ratio means and why 4x is the
+    cutoff. The mean-based ratios above are kept because they still add
+    value for cases the max-based check does not target (e.g. broad,
+    evenly-spread disagreement where no single interval is an outlier), but
+    HIGH now also requires the max-based check to pass on its own.
+
     HIGH additionally requires at least MIN_INTERVALS_FOR_HIGH_CONFIDENCE
     independent intervals: two intervals agreeing is one coincidence, not a
     demonstrated pattern, and is indistinguishable from chance agreement.
@@ -438,9 +473,25 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     unweighted_ratio = (unweighted_deviation / len(intervals)) / abs(center)
     dispersion_ratio = max(weighted_ratio, unweighted_ratio)
 
+    # The max-based veto: how far the SINGLE worst interval sits from the
+    # median, as a multiple (>= 1.0), regardless of how many agreeing
+    # intervals surround it. An interval at exactly the median rate scores
+    # 1.0; an interval at 0 while the median is positive scores infinity,
+    # since a rate of zero is not "close to" a positive median by any
+    # multiple -- it is a different regime (e.g. a stall), which is exactly
+    # the kind of single-interval evidence a mean can hide but a max cannot.
+    max_interval_ratio = 1.0
+    for rate in intervals:
+        higher, lower = (rate, center) if rate >= center else (center, rate)
+        if lower <= 0.0:
+            max_interval_ratio = math.inf
+            break
+        max_interval_ratio = max(max_interval_ratio, higher / lower)
+
     if (
         len(intervals) >= MIN_INTERVALS_FOR_HIGH_CONFIDENCE
         and dispersion_ratio <= 0.25
+        and max_interval_ratio <= MAX_INTERVAL_RATE_RATIO
     ):
         return ProjectionConfidence.HIGH
     if dispersion_ratio <= 0.75:
