@@ -90,10 +90,16 @@ Claude Code runs in several places, and capture and injection do not reach the s
 
 | Surface | Claude capture | Injection |
 | --- | --- | --- |
-| Terminal CLI | yes | yes |
-| Desktop app | no documented mechanism | yes |
-| VS Code and JetBrains extensions | no documented mechanism | yes |
-| Claude Code on the web | no documented mechanism | project or organization settings |
+| Local terminal | yes | yes |
+| Local Desktop app | no documented mechanism | yes |
+| Local VS Code and JetBrains extensions | no documented mechanism | yes |
+| Claude Code on the web | no documented mechanism | not available to headroom |
+| Remote terminal over SSH or in a container | yes, where headroom is installed and configured there | yes, against that machine's state |
+| Remote Desktop or IDE session | no documented mechanism | only where headroom is installed with its state |
+
+The word local is doing real work in those rows, and the two columns answer different questions. Capture needs a terminal status line, which is why every non-terminal row reads the same way wherever it runs. Injection needs the `headroom` command and its state directory on whichever machine the session executes on.
+
+That second requirement is what the web fails, and it is not unique to the web. A Desktop or IDE session pointed at a cloud machine, an SSH host, or a dev container is on the far side of the same line. A remote terminal is the case worth calling out separately: install and configure headroom on that host and it captures and injects there perfectly well, reporting that machine's view rather than your laptop's.
 
 Injection is the documented case. The hooks documentation states that hooks run wherever Claude Code runs, covering terminal sessions, IDE extensions, the Desktop app, and the web. Firing is not the same as being configured, so a surface warns only where the headroom hook is actually installed for it.
 
@@ -103,7 +109,9 @@ Nothing else observes a first-party client's numbers passively. `/usage` draws i
 
 One documented active alternative is an Agent SDK session, whose rate-limit events can include utilization for shared subscription limits after a quota-consuming request. Those limits can cover what was spent interactively in Claude Code, so the numbers are relevant, but the events arrive on status changes and the utilization field is optional, so this is not an on-demand reader. For Claude, headroom watches a payload already being produced and spends no additional model quota.
 
-The web has a second constraint. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings. They do not load `~/.claude/settings.json`. `headroom init` writes the user file, so a web session gets no hook today. That is tracked in [issue #36](https://github.com/ajillepalli/headroom/issues/36).
+The web is out of reach, and not merely unconfigured. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings, and not from the `~/.claude/settings.json` that `headroom init` writes. Registering the hook there would make it fire, and it would then fail, because a web session runs on Anthropic-managed infrastructure rather than on your machine. The `headroom` command is installed locally and is not part of the repository clone, so it is not on that machine's path, and `~/.headroom/state.json` is written by your statusline and does not exist there either. Installing headroom through a cloud setup script does not help, because that copy would start with empty state and report nothing while looking configured.
+
+Reaching web sessions would mean reading state from a network service instead of a local file, which is a different tool. [Issue #36](https://github.com/ajillepalli/headroom/issues/36) records the reasoning and is closed.
 
 Codex is not affected the same way when the app-server RPC answers. That query asks the account for its own limits, so the result does not depend on which client spent the quota, and GUI and IDE use stays visible. The rollout fallback is different: it reads local session records, so it sees only work done by a client that wrote rollouts on this machine. `doctor` reports which source won, and the distinction matters whenever RPC fails or is disabled.
 
