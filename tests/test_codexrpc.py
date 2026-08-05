@@ -81,7 +81,17 @@ class CodexRpcTests(unittest.TestCase):
             root = Path(directory)
             self._write_rollout(root, used_percent=41)
             environment = self._environment(root, "timeout")
-            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "1"
+            # A 1s timeout used to flake under full-suite load: process spawn
+            # plus interpreter startup for the stub child can itself exceed
+            # 1s once the machine is busy (measured up to ~2.8s under heavy
+            # synthetic CPU contention on a 24-core box), so the parent could
+            # kill the child before it was ever scheduled to run its first
+            # line of Python, i.e. before "started" could be written. 5s
+            # leaves comfortable margin over that measured worst case while
+            # staying well under the stub's 8s deliberate stall, so the
+            # kill still fires for a genuine reason (unresponsive child),
+            # not a scheduling race.
+            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "5"
             environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
             environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
 
@@ -94,8 +104,14 @@ class CodexRpcTests(unittest.TestCase):
             diagnostics = document["diagnostics"]["codex"]
             self.assertEqual(diagnostics["source"], "rollout")
             self.assertTrue(any("timed out" in note for note in diagnostics["notes"]))
-            self.assertTrue((root / "started").is_file())
-            time.sleep(0.8)
+            # Poll instead of a single is_file() check: the write already
+            # landed by the time _run_json() returns (the child is reaped
+            # before main() gives control back), but polling with a
+            # generous deadline still proves the child genuinely started
+            # and gives a clear failure if it somehow never did, rather
+            # than depending on exact same-tick filesystem visibility.
+            self._wait_for_marker(root / "started")
+            time.sleep(2.0)
             self.assertFalse((root / "survived").exists())
 
     def test_garbage_output_falls_back_to_rollout(self) -> None:
@@ -222,6 +238,12 @@ class CodexRpcTests(unittest.TestCase):
                 rollout_results.append(result)
                 return result
 
+            # This is a synthetic fixture (the 94% figure below is fake),
+            # so its hook text must never reach the real stdout: unlike
+            # every sibling test here, this call was missing its
+            # redirect_stdout wrapper, letting the fake reading print to
+            # the terminal and look exactly like genuine usage output.
+            output = StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
                 save_snapshots((stored,))
                 with mock.patch(
@@ -235,9 +257,11 @@ class CodexRpcTests(unittest.TestCase):
                             "headroom.codexsrc.time.monotonic",
                             side_effect=[0.0] * 6 + [float("inf")],
                         ):
-                            result = main(["hook", "--plain"])
+                            with redirect_stdout(output):
+                                result = main(["hook", "--plain"])
 
             self.assertEqual(result, 0)
+            self.assertIn("94% used", output.getvalue())
             self.assertEqual(len(rollout_results), 1)
             self.assertEqual(rollout_results[0].snapshots, ())
             self.assertIn("deadline reached while reading", " ".join(rollout_results[0].notes))
@@ -253,6 +277,18 @@ class CodexRpcTests(unittest.TestCase):
             "HEADROOM_STATE_DIR": str(root / "state"),
             "HEADROOM_TEST_RPC_MODE": mode,
         }
+
+    def _wait_for_marker(self, path: Path, timeout: float = 10.0) -> None:
+        """Poll for a marker file with a generous deadline instead of a
+        single point-in-time check, so a slow-scheduled child under load
+        still gets a fair chance to be observed before we fail the test."""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.02)
+        self.fail("{} was never created within {}s".format(path, timeout))
 
     def _run_json(self, environment: dict[str, str]) -> dict:
         output = StringIO()
