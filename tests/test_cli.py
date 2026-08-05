@@ -1102,6 +1102,165 @@ class ContextSurfaceTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue(output.getvalue().strip())
 
+    def test_unexpected_exception_during_statusline_still_prints_a_fallback_and_exits_0(
+        self,
+    ) -> None:
+        # finding #16 (context-window adversarial review): the test above
+        # feeds malformed JSON that parse_stdin's own defensive parsing
+        # already handles without raising, so it exercises a fully-handled
+        # path -- removing _statusline's blanket `except Exception`
+        # fallback entirely would still pass it. This injects a genuinely
+        # unexpected exception, well past parsing, to exercise the
+        # fallback itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = json.dumps(
+                {"session_id": "session-a", "context_window": {"used_percentage": 50}}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(payload)):
+                    with mock.patch(
+                        "headroom.cli.save_snapshots", side_effect=RuntimeError("boom")
+                    ):
+                        with redirect_stdout(output):
+                            result = cli.main(["statusline"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue().strip(), "headroom: usage unavailable")
+
+    def test_hook_ignores_a_state_entry_whose_own_session_id_disagrees_with_its_key(
+        self,
+    ) -> None:
+        # finding #5 (context-window adversarial review, THE most
+        # important finding of that round): a corrupt or hand-edited
+        # state.json can hold an entry under key "session-a" whose own
+        # session_id field claims a different session ("session-b").
+        # Trusting the dictionary key alone would let that mismatched
+        # entry answer for the hook's real running session (session-a);
+        # the fix requires the decoded value to agree with the key it was
+        # found under.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 95.0,
+                                "session_id": "session-b",
+                                "captured_at": time.time(),
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            hook_input = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a"}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_lone_surrogate_session_id_in_state_heals_instead_of_exiting_1(self) -> None:
+        # finding #9 (context-window adversarial review): a state.json
+        # entry keyed by a session_id containing a lone UTF-16 surrogate
+        # (reachable via JSON's \uXXXX escapes, or a hand edit) crashes
+        # write_state's json.dump(..., ensure_ascii=False) call -- which
+        # runs on nearly every command via _refresh_codex, not just ones
+        # that touch context -- turning one bad entry into a permanent
+        # exit-1 for `headroom json`. Rejecting it only at decode time
+        # (ContextReading.from_dict) is not enough on its own: the very
+        # first _refresh_codex call still tries to re-persist the
+        # untouched corrupt entry before ever reaching that decode path.
+        # It must be scrubbed from the stored state itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 10.0,
+                                "session_id": "\ud800",
+                                "captured_at": time.time(),
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertEqual(document.get("context_readings", {}), {})
+            # The next command's own read-merge-write heals the file: the
+            # bad entry must not still be sitting on disk waiting to crash
+            # the NEXT command too.
+            healed_state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                healed_state.get("sources", {}).get("claude", {}).get("context", {}), {}
+            )
+
+    def test_json_does_not_expose_a_stale_capture_via_raw_sources(self) -> None:
+        # finding #7 (context-window adversarial review): _json_document
+        # used to shallow-copy state, so sources.claude.context still
+        # shared the same nested dict as the real state -- a stale capture
+        # excluded from the curated, fresh-filtered context_readings key
+        # was still directly readable off the raw sources subtree right
+        # next to it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            stale_captured_at = time.time() - 10_000.0  # well past the 300s default window
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 92.0,
+                                "session_id": "session-a",
+                                "captured_at": stale_captured_at,
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertEqual(document.get("context_readings", {}), {})
+            self.assertNotIn("context", document.get("sources", {}).get("claude", {}))
+
     def test_json_emits_context_readings_keyed_by_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1119,7 +1278,16 @@ class ContextSurfaceTests(unittest.TestCase):
             self.assertEqual(result, 0)
             document = json.loads(output.getvalue())
             self.assertIn("context_readings", document)
-            self.assertNotIn("context_readings", document.get("readings", {}))
+            # finding #14 (context-window adversarial review): "readings"
+            # is a LIST of dicts, so ``"context_readings" not in
+            # document.get("readings", {})`` only ever asked whether that
+            # exact string was an ELEMENT of the list -- always true,
+            # regardless of whether the key leaked into a reading dict.
+            # This checks every reading dict directly instead.
+            readings = document.get("readings", [])
+            self.assertTrue(readings)
+            for reading in readings:
+                self.assertNotIn("context_readings", reading)
             self.assertEqual(document["context_readings"]["session-a"]["used_percent"], 30.0)
 
     def test_doctor_reports_ok_context_line(self) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 
 from headroom.bounds import Confidence, Reading
+from headroom.burn_rate import BurnRateProjection
 from headroom.context_window import ContextReading
 from headroom.render import (
     render_context_doctor_line,
@@ -35,6 +36,36 @@ def _reading(
         age_seconds=age_seconds,
         fresh=fresh,
         session_id=session_id,
+    )
+
+
+def _burn_rate_projection(
+    now: float, source: str = "codex", window: str = "weekly"
+) -> BurnRateProjection:
+    """A projection built to clear every burn_rate_projection_is_trustworthy
+    and burn_rate_evidence_is_current threshold, for a Reading built by
+    _rate_reading(...) (confidence FRESH, age_seconds=0.0) at the same
+    ``now`` and the same (source, window)."""
+
+    return BurnRateProjection(
+        source=source,
+        window=window,
+        rate_percent_per_second=0.01,
+        projected_exhaustion_at=now + 100.0,
+        exhaustion_precedes_reset=True,
+        samples_used=10,
+        span_seconds=1_000.0,
+        max_relative_deviation=1.0,
+        max_usage_share=0.2,
+        intervals_used=6,
+        rate_drift=0.1,
+        effective_intervals=5.0,
+        zero_delta_fraction=0.1,
+        max_raw_rate_ratio=1.0,
+        longest_above_overall_rate_run=1,
+        latest_change_at=now,
+        latest_change_delta=1.0,
+        latest_captured_at=now,
     )
 
 
@@ -87,6 +118,36 @@ class ContextReadingCodecTests(unittest.TestCase):
         self.assertTrue(exactly_fresh.fresh)
         self.assertFalse(one_second_stale.fresh)
 
+    def test_clock_rollback_does_not_keep_a_stale_reading_fresh(self) -> None:
+        # finding #3 (context-window adversarial review): a stored
+        # captured_at=1000 read back against a rolled-back now=0 used to
+        # clamp age to max(0.0, 0 - 1000) == 0.0 -- "just captured" -- so a
+        # 92%-used reading stayed reported as fresh forever, instead of
+        # the future-dated captured_at being recognized as unsound.
+        stored = {
+            "used_percentage": 92.0,
+            "session_id": "s-1",
+            "captured_at": 1_000.0,
+        }
+
+        with self.assertRaises((KeyError, TypeError, ValueError, OverflowError)):
+            ContextReading.from_dict(stored, now=0.0, fresh_for_seconds=300.0)
+
+    def test_ordinary_clock_skew_within_the_allowance_is_still_accepted(self) -> None:
+        # The fix for finding #3 must not reject an ordinary, tiny amount
+        # of clock skew between two nearby time.time() calls in the same
+        # pipeline -- only a captured_at implausibly far in the future.
+        stored = {
+            "used_percentage": 10.0,
+            "session_id": "s-1",
+            "captured_at": 1_000.0,
+        }
+
+        reading = ContextReading.from_dict(stored, now=999.0, fresh_for_seconds=300.0)
+
+        self.assertEqual(reading.age_seconds, 0.0)
+        self.assertTrue(reading.fresh)
+
     def test_from_dict_raises_defensively_on_bad_data(self) -> None:
         cases = (
             {},  # missing everything
@@ -100,16 +161,57 @@ class ContextReadingCodecTests(unittest.TestCase):
                 with self.assertRaises((KeyError, TypeError, ValueError, OverflowError)):
                     ContextReading.from_dict(stored, now=1_000.0, fresh_for_seconds=300.0)
 
+    def test_corrupt_state_percentages_are_rejected_not_rendered(self) -> None:
+        # finding #4 (context-window adversarial review): the PARSE path
+        # (claude.py) already validates used_percentage into [0, 100], but
+        # the DECODE path (this method) previously passed a stored value
+        # straight through with no bound at all, so a hand-edited or
+        # corrupted state.json could reach hook/status/json output as
+        # "150% used", "nan% used", or "inf% used".
+        for used_percentage in (150.0, float("nan"), float("inf"), float("-inf"), -5.0):
+            with self.subTest(used_percentage=used_percentage):
+                stored = {
+                    "used_percentage": used_percentage,
+                    "session_id": "s-1",
+                    "captured_at": 900.0,
+                }
+                with self.assertRaises((KeyError, TypeError, ValueError, OverflowError)):
+                    ContextReading.from_dict(stored, now=1_000.0, fresh_for_seconds=300.0)
+
+    def test_lone_surrogate_session_id_is_rejected_not_decoded(self) -> None:
+        # finding #9 (context-window adversarial review): a lone UTF-16
+        # surrogate (reachable via JSON's \uXXXX escapes, paired or not)
+        # decodes as an ordinary Python str here, then fails much later at
+        # json.dumps(..., ensure_ascii=False) time, turning `headroom
+        # json`'s exit code into 1. Rejecting it at decode keeps the rest
+        # of the pipeline's "corrupt state collapses to silence" behavior.
+        stored = {
+            "used_percentage": 10.0,
+            "session_id": "\ud800",
+            "captured_at": 900.0,
+        }
+        with self.assertRaises((KeyError, TypeError, ValueError, OverflowError)):
+            ContextReading.from_dict(stored, now=1_000.0, fresh_for_seconds=300.0)
+
 
 class SeverityLadderTests(unittest.TestCase):
     def test_context_ladder_matches_the_rate_ladder_exactly(self) -> None:
         # CEO review: the ladder must be reused, not a differentiated copy.
-        # Same headroom value, same severity, regardless of which signal.
+        # Same headroom value, same severity, regardless of which signal --
+        # checked against an ACTUAL ContextReading run through
+        # context_reading_severity, not an algebraic identity. (finding
+        # #12, context-window adversarial review: the original version of
+        # this test compared severity_for_headroom(headroom) against
+        # severity_for_headroom(100.0 - (100.0 - headroom)), which is true
+        # by arithmetic alone and exercises context_reading_severity not at
+        # all -- it would still pass if that function stopped calling
+        # severity_for_headroom entirely.)
         for headroom in (100.0, 60.1, 60.0, 40.1, 40.0, 20.1, 20.0, 10.1, 10.0, 0.0):
             with self.subTest(headroom=headroom):
+                reading = _reading(used_percent=100.0 - headroom)
                 self.assertEqual(
+                    context_reading_severity(reading),
                     severity_for_headroom(headroom),
-                    severity_for_headroom(100.0 - (100.0 - headroom)),
                 )
 
     def test_context_severity_thresholds(self) -> None:
@@ -234,8 +336,24 @@ class HookArbitrationTests(unittest.TestCase):
     def test_critical_rate_alone_still_suppresses_burn_rate_not_context(self) -> None:
         # Burn-rate stays suppressed on a CRITICAL rate line (existing
         # rule); the trailing context clause is still allowed alongside it.
+        # finding #13 (context-window adversarial review): the original
+        # version of this test passed no projection at all, so "Burn rate:"
+        # not in text was true regardless of whether the suppression rule
+        # existed -- it exercised nothing. This supplies a projection that
+        # clears every burn_rate_projection_is_trustworthy and
+        # burn_rate_evidence_is_current threshold, first confirming (on an
+        # OK rate reading) that it WOULD render on its own, then checking
+        # that a CRITICAL rate line suppresses it anyway.
+        now = 1_000.0
+        projection = _burn_rate_projection(now)
+
+        sanity_text = render_hook([_rate_reading(10.0)], now=now, projections=[projection])
+        self.assertIn("Burn rate:", sanity_text)
+
         readings = [_rate_reading(99.0)]
-        text = render_hook(readings, now=1_000.0, context=_reading(used_percent=85.0))
+        text = render_hook(
+            readings, now=now, projections=[projection], context=_reading(used_percent=85.0)
+        )
         self.assertNotIn("Burn rate:", text)
         self.assertIn("Context is also at warn", text)
 

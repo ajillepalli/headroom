@@ -5,9 +5,15 @@
     "fsync",
     "headroom",
     "jsonl",
+    "monkeypatches",
+    "NBLCK",
     "pycache",
     "statusline",
     "subagent",
+    "uncontended",
+    "unencodable",
+    "UNLCK",
+    "unopenable",
     "unparsed"
   ]
 }

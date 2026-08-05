@@ -21,7 +21,47 @@ reading (see cli.py).
 """
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Optional
+
+
+# Ordinary wall-clock behavior (NTP step corrections, VM pause/resume, or
+# simply reading two different process's time.time() calls a moment apart)
+# can put a capture's own recorded captured_at a hair ahead of a caller's
+# later `now`. update_check.py's CLOCK_SKEW_ALLOWANCE_SECONDS (5 minutes)
+# exists for the same reason but is deliberately NOT reused here: that
+# allowance is sized against a 24-HOUR cache window, where 5 minutes is a
+# rounding error. Context's own freshness window defaults to 300 SECONDS
+# (freshness.py) -- reusing a 300-second allowance here would let a reading
+# dated up to the ENTIRE freshness window into the future still count as
+# "fresh", which defeats fresh-or-nothing rather than merely tolerating
+# ordinary skew. A much smaller allowance, sized to how far apart two nearby
+# time.time() calls in the same statusline/hook pipeline can plausibly land,
+# still absorbs real skew without swallowing the window it is meant to bound.
+CLOCK_SKEW_ALLOWANCE_SECONDS = 5.0
+
+
+def resolve_age(captured_at: float, now: float) -> Optional[float]:
+    """Return a captured_at's age relative to now, or None when the pair
+    cannot support a sound answer.
+
+    None covers two cases (finding #3, context-window adversarial review):
+    a non-finite captured_at or now (unreachable through ordinary capture,
+    but reachable through a hand-edited or corrupted state.json), and a
+    captured_at dated more than CLOCK_SKEW_ALLOWANCE_SECONDS into the future
+    relative to now (a clock rollback, or corrupt data claiming to be from
+    the future). The naive ``max(0.0, now - captured_at)`` clamp used before
+    this existed silently turned every future-dated captured_at into age
+    0.0 -- "just captured" -- rather than flagging it as unsound, which let
+    a stale reading look perpetually fresh once the clock went backwards,
+    and also let a pruning sweep keyed on the same clamp retain it forever.
+    """
+
+    if not math.isfinite(captured_at) or not math.isfinite(now):
+        return None
+    if captured_at - now > CLOCK_SKEW_ALLOWANCE_SECONDS:
+        return None
+    return max(0.0, now - captured_at)
 
 
 @dataclass(frozen=True)
@@ -80,12 +120,54 @@ class ContextReading:
 
         captured_at = float(value["captured_at"])
         used_percent = float(value["used_percentage"])
+        if not math.isfinite(used_percent) or used_percent < 0.0 or used_percent > 100.0:
+            # The PARSE path (claude.py's _context_percent) already rejects
+            # anything outside [0, 100] before a capture is ever stored; the
+            # DECODE path did not, so a hand-edited or corrupted state.json
+            # could report "150% used" or worse (finding #4, context-window
+            # adversarial review). Mirroring the same bound here closes that
+            # gap; a rejection collapses to the same silence as every other
+            # bad-data case this method already raises for.
+            raise ValueError("used_percentage out of range")
         session_id = str(value["session_id"])
         if not session_id:
             raise ValueError("empty session_id")
+        try:
+            session_id.encode("utf-8")
+        except UnicodeEncodeError as error:
+            # A lone UTF-16 surrogate (reachable through a hand-crafted or
+            # corrupted state.json: JSON's \uXXXX escapes accept any code
+            # unit, paired or not) decodes here as an ordinary Python str
+            # and then fails much later at json.dumps(..., ensure_ascii=False)
+            # time (finding #9), turning `headroom json`'s exit code into 1.
+            # Rejecting it here, at decode time, keeps that surface's exit
+            # code intact through the same "corrupt state collapses to
+            # silence" path every other bad-data case in this method takes,
+            # rather than switching every writer to ensure_ascii=True.
+            raise ValueError("session_id is not valid Unicode") from error
         size_raw = value.get("size")
-        size = int(size_raw) if size_raw is not None else None
-        age = max(0.0, float(now) - captured_at)
+        if size_raw is None:
+            size = None
+        elif isinstance(size_raw, bool):
+            raise ValueError("size must not be a boolean")
+        elif isinstance(size_raw, int):
+            size = size_raw
+        elif isinstance(size_raw, float):
+            # int() TRUNCATES a fractional float (int(1.9) == 1) instead of
+            # rejecting it, which would report a size the payload never
+            # actually supplied (the same failure mode as finding #10 in
+            # claude.py's parse-side _context_size, mirrored here for the
+            # decode path).
+            if not math.isfinite(size_raw) or not size_raw.is_integer():
+                raise ValueError("size must be an integer-valued number")
+            size = int(size_raw)
+        else:
+            size = int(size_raw)
+        if size is not None and size <= 0:
+            raise ValueError("size must be positive")
+        age = resolve_age(captured_at, float(now))
+        if age is None:
+            raise ValueError("captured_at is non-finite or implausibly far in the future")
         fresh = age <= max(0.0, float(fresh_for_seconds))
         return cls(
             used_percent=used_percent,

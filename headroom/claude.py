@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import math
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -26,6 +27,12 @@ _SESSION_ID_KEY = "session_id"
 # nothing to report) from "context_window_size present but invalid" (size
 # drops to None too, but a diagnostic note is warranted).
 _INVALID_CONTEXT_SIZE = object()
+# Real session_ids are UUIDs (~36 characters); this is generous headroom for
+# whatever format a future Claude Code version might use, while still
+# bounding a pathological or hostile payload from being accepted and then
+# stored as both a dict key and a value without limit (finding #8,
+# context-window adversarial review).
+_MAX_SESSION_ID_LENGTH = 256
 
 
 @dataclass(frozen=True)
@@ -207,11 +214,26 @@ def _extract_context(
     if not isinstance(session_id, str) or not session_id:
         notes.append({"path": list(path), "reason": "missing session_id"})
         return None, tuple(notes)
+    if len(session_id) > _MAX_SESSION_ID_LENGTH:
+        # An oversized session_id accepted here would be stored as both a
+        # state.json dict key and a value with no bound (finding #8,
+        # context-window adversarial review); reject the whole capture
+        # rather than silently truncating or accepting it.
+        notes.append({"path": list(path), "reason": "session_id exceeds max length"})
+        return None, tuple(notes)
 
     used = _context_percent(value, _USED_KEYS)
     remaining = _context_percent(value, _CONTEXT_REMAINING_KEYS)
     if used is not None and remaining is not None:
         if abs((used + remaining) - 100.0) > 0.5:
+            # Both fields are individually valid but contradict each other
+            # (e.g. {"used_percentage": 5, "remaining_percentage": 5},
+            # which implies 95% used if remaining is trusted instead).
+            # Reporting either one would assert something the payload
+            # itself does not actually support, so the whole capture is
+            # rejected (finding #6, context-window adversarial review)
+            # rather than silently preferring "used" the way an earlier
+            # version of this function did.
             notes.append(
                 {
                     "path": list(path),
@@ -219,7 +241,8 @@ def _extract_context(
                     "value": {"used": used, "remaining": remaining},
                 }
             )
-        # used wins when both are present and valid (validation table).
+            return None, tuple(notes)
+        # used wins when both are present, valid, and agree (validation table).
     elif used is None and remaining is not None:
         # remaining was already validated into [0, 100] by _context_percent
         # before this subtraction runs.
@@ -260,7 +283,15 @@ def _context_percent(value: Dict[str, Any], keys: Sequence[str]) -> Optional[flo
 
 def _context_size(value: Dict[str, Any]) -> Any:
     """The validated context window token size, or _INVALID_CONTEXT_SIZE
-    when present but unusable. Absent is None, distinct from invalid."""
+    when present but unusable. Absent is None, distinct from invalid.
+
+    Only a positive integer-valued number, or a string of decimal digits,
+    is accepted. Python's int() on a float silently TRUNCATES a fractional
+    value (int(1.9) == 1) rather than rejecting it, which would report a
+    context_window_size the payload never actually supplied (finding #10,
+    context-window adversarial review) -- a payload reporting a fractional
+    token count is not "size 1 with some noise", it is not a usable size.
+    """
 
     key = _first_key(value, _CONTEXT_SIZE_KEYS)
     if key is None:
@@ -268,10 +299,17 @@ def _context_size(value: Dict[str, Any]) -> Any:
     raw = value.get(key)
     if isinstance(raw, bool):
         return _INVALID_CONTEXT_SIZE
-    try:
+    if isinstance(raw, int):
+        size = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw) or not raw.is_integer():
+            return _INVALID_CONTEXT_SIZE
         size = int(raw)
-    except (TypeError, ValueError, OverflowError):
-        return _INVALID_CONTEXT_SIZE
+    else:
+        try:
+            size = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return _INVALID_CONTEXT_SIZE
     if size <= 0:
         return _INVALID_CONTEXT_SIZE
     return size

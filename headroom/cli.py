@@ -1,6 +1,7 @@
 """Command-line entry point for headroom."""
 
 import argparse
+import copy
 from dataclasses import dataclass
 from importlib import metadata
 import json
@@ -303,6 +304,21 @@ def _context_reading_for_session(
         reading = ContextReading.from_dict(raw, now, freshness_seconds("context"))
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
+    # The dict KEY is trusted only as far as context_captures_from_state's
+    # own lookup goes; the stored VALUE carries its own session_id field
+    # (claude.py writes both when a capture is first stored), and the two
+    # are meant to always agree. A mismatch -- a corrupt state.json, a hand
+    # edit, or a latent bug elsewhere that wrote an entry under the wrong
+    # key -- must not let one session's reading answer for a different one:
+    # that is the entire reason context is keyed by session in the first
+    # place (finding #5, context-window adversarial review, the single most
+    # important finding of that round). Requiring the decoded value to
+    # agree with ``session_id`` here checks it against BOTH the dictionary
+    # key used to look it up (the lookup above already required that) and
+    # the session this hook is actually running as (this function's own
+    # parameter), closing both directions of that leak in one comparison.
+    if reading.session_id != session_id:
+        return None
     return reading if reading.fresh else None
 
 
@@ -480,7 +496,21 @@ def _json_document(
     projections: Sequence[BurnRateProjection],
     now: float,
 ) -> Dict[str, Any]:
-    result = dict(state)
+    # A shallow dict(state) copy still shares every NESTED dict with state
+    # itself, including sources["claude"]["context"] -- so a stale capture
+    # already excluded from context_readings below by the fresh-only filter
+    # would otherwise still be readable straight off the raw document at
+    # sources.claude.context, undermining the whole point of filtering it
+    # (finding #7, context-window adversarial review). A deep copy, plus
+    # dropping the raw context subtree entirely, makes context_readings the
+    # ONLY way this document exposes context -- there is no second, stale
+    # copy sitting next to it.
+    result = copy.deepcopy(state)
+    sources = result.get("sources")
+    if isinstance(sources, dict):
+        claude_source = sources.get("claude")
+        if isinstance(claude_source, dict):
+            claude_source.pop("context", None)
     result["readings"] = [reading.to_dict() for reading in readings]
     result["burn_rate_projections"] = [projection.to_dict() for projection in projections]
     # Keyed by session_id, not last-write-wins: json has no stdin and no

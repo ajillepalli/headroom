@@ -134,7 +134,13 @@ class ParserTests(unittest.TestCase):
             any(note.get("reason") == "invalid context percentage" for note in result.context_unparsed)
         )
 
-    def test_context_used_wins_and_notes_mismatch_with_remaining(self) -> None:
+    def test_contradictory_used_and_remaining_rejects_the_whole_capture(self) -> None:
+        # finding #6 (context-window adversarial review): used=81 and
+        # remaining=5 individually pass validation but contradict each
+        # other (they imply 81% and 95% used respectively). An earlier
+        # version of _extract_context let "used" win silently here, which
+        # asserts something the payload itself does not actually support.
+        # The whole capture is rejected instead, with a diagnostic note.
         payload = {
             "session_id": "s-1",
             "context_window": {"used_percentage": 81, "remaining_percentage": 5},
@@ -142,7 +148,7 @@ class ParserTests(unittest.TestCase):
 
         result = parse_payload(payload, captured_at=1_785_920_000.0)
 
-        self.assertEqual(result.context["used_percentage"], 81.0)
+        self.assertIsNone(result.context)
         self.assertTrue(
             any(
                 note.get("reason") == "used and remaining do not sum to 100"
@@ -163,6 +169,73 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(
             any(note.get("reason") == "invalid context_window_size" for note in result.context_unparsed)
         )
+
+    def test_fractional_context_window_size_is_rejected_not_truncated(self) -> None:
+        # finding #10 (context-window adversarial review): int(1.9) == 1 in
+        # Python, so a naive int(raw) call would silently report size 1 --
+        # a number the payload never actually supplied. A fractional size
+        # must be rejected outright, not rounded or truncated.
+        payload = {
+            "session_id": "s-1",
+            "context_window": {"used_percentage": 50, "context_window_size": 1.9},
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertIsNotNone(result.context)
+        self.assertIsNone(result.context["size"])
+        self.assertTrue(
+            any(note.get("reason") == "invalid context_window_size" for note in result.context_unparsed)
+        )
+
+    def test_oversized_session_id_yields_no_capture(self) -> None:
+        # finding #8 (context-window adversarial review): an unbounded
+        # session_id would be accepted and stored as both a state.json dict
+        # key and a value, with no limit on how large it can be.
+        payload = {
+            "session_id": "s" * 10_000_000,
+            "context_window": {"used_percentage": 50},
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertIsNone(result.context)
+        self.assertTrue(
+            any(
+                note.get("reason") == "session_id exceeds max length"
+                for note in result.context_unparsed
+            )
+        )
+
+    def test_nested_context_window_never_becomes_a_rate_window_at_any_depth(self) -> None:
+        # finding #15 (context-window adversarial review): the existing #9
+        # regression test (test_context_window_is_excluded_even_if_it_has_
+        # a_duration above) only covers a context_window subtree sitting
+        # directly under a key the walk visits -- it would still pass if
+        # the exclusion guard in parse_payload were weakened from
+        # ``any(part in _CONTEXT_WINDOW_KEYS for part in path)`` to
+        # ``path[-1] in _CONTEXT_WINDOW_KEYS`` (checking only the
+        # immediate parent key instead of every ancestor). This payload
+        # nests a second used_percentage/window_minutes dict INSIDE the
+        # context_window subtree, at a path whose own last element is not
+        # "context_window" -- a path[-1]-only guard would let it through
+        # as a genuine rate-limit window while every pre-existing test
+        # still passes.
+        payload = {
+            "session_id": "s-1",
+            "context_window": {
+                "used_percentage": 81,
+                "child": {
+                    "used_percentage": 50,
+                    "window_minutes": 300,
+                },
+            },
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.snapshots, ())
+        self.assertEqual(result.context["used_percentage"], 81.0)
 
     def test_context_camel_case_fields_parse(self) -> None:
         payload = {
