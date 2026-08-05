@@ -321,6 +321,38 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
         self.assertEqual(lines, [])
 
+    def test_capture_identity_check_rejects_a_near_but_distinct_capture_at_epoch_scale(
+        self,
+    ) -> None:
+        # (Codex review, round 5, P2) math.isclose's default rel_tol=1e-9
+        # scales with the LARGER magnitude being compared. At a realistic
+        # epoch timestamp (~1.7e9), that default alone contributes roughly
+        # 1.7 SECONDS of tolerance -- nearly 2000x looser than the intended
+        # 1ms abs_tol -- so two genuinely distinct captures 1.5s apart would
+        # have been wrongly accepted as the same event before rel_tol was
+        # pinned to 0.0. This gap (1.5s) is deliberately smaller than that
+        # old bug's effective tolerance (~1.7s) but far larger than the
+        # 1ms this check is actually supposed to allow.
+        now = 1_700_000_000.0
+        projection = _projection(
+            source="claude",
+            window="short",
+            latest_change_at=now - 10.0,
+            latest_captured_at=now - 10.0,
+        )
+        reading = Reading(
+            certain=True,
+            lower_bound_percent=20.0,
+            resets_at=now + 100_000.0,
+            age_seconds=8.5,  # captured_at = now - 8.5, 1.5s off latest_captured_at
+            window="short",
+            source="claude",
+            confidence=Confidence.FRESH,
+        )
+        lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
+
+        self.assertEqual(lines, [])
+
     def test_trustworthy_projection_with_no_matching_reading_says_nothing(self) -> None:
         # No reading at all for this source/window -- there is no current
         # evidence to confirm, so the gate fails the same way a stale one

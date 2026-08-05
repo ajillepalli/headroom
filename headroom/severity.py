@@ -309,7 +309,17 @@ def burn_rate_evidence_is_current(
         # division below never sees a non-positive divisor.
         return False
     reading_captured_at = now - reading.age_seconds
-    if not math.isclose(reading_captured_at, projection.latest_captured_at, abs_tol=1e-3):
+    # rel_tol=0.0 is required, not just the default: math.isclose's default
+    # rel_tol=1e-9 scales with the LARGER magnitude of the two values being
+    # compared, and epoch timestamps are ~1.7e9, so the default relative
+    # component alone contributes roughly 1.7 SECONDS of tolerance --
+    # almost 2000x looser than the 1ms abs_tol this line asks for, and wide
+    # enough to accept two genuinely distinct capture events as if they
+    # were the same one (Codex review, round 5, P2). Pinning rel_tol to
+    # 0.0 makes abs_tol the only tolerance in effect, as intended.
+    if not math.isclose(
+        reading_captured_at, projection.latest_captured_at, rel_tol=0.0, abs_tol=1e-3
+    ):
         return False
     expected_interval_seconds = projection.latest_change_delta / projection.rate_percent_per_second
     return (now - projection.latest_change_at) <= STALE_TREND_TOLERANCE * expected_interval_seconds
