@@ -94,9 +94,12 @@ Claude Code runs in several places, and capture and injection do not reach the s
 | Local Desktop app | no documented mechanism | yes |
 | Local VS Code and JetBrains extensions | no documented mechanism | yes |
 | Claude Code on the web | no documented mechanism | not available to headroom |
-| Any remote session, including cloud, SSH, and container | no documented mechanism | only where headroom is installed with its state |
+| Remote terminal over SSH or in a container | yes, where headroom is installed and configured there | yes, against that machine's state |
+| Remote Desktop or IDE session | no documented mechanism | only where headroom is installed with its state |
 
-The word local is doing real work in that table. The dividing line is not which client you opened, it is whether the session runs on the machine that holds the `headroom` command and its state directory. A Desktop or IDE session pointed at a cloud machine, an SSH host, or a dev container is on the far side of that line, the same as the web.
+The word local is doing real work in those rows, and the two columns answer different questions. Capture needs a terminal status line, which is why every non-terminal row reads the same way wherever it runs. Injection needs the `headroom` command and its state directory on whichever machine the session executes on.
+
+That second requirement is what the web fails, and it is not unique to the web. A Desktop or IDE session pointed at a cloud machine, an SSH host, or a dev container is on the far side of the same line. A remote terminal is the case worth calling out separately: install and configure headroom on that host and it captures and injects there perfectly well, reporting that machine's view rather than your laptop's.
 
 Injection is the documented case. The hooks documentation states that hooks run wherever Claude Code runs, covering terminal sessions, IDE extensions, the Desktop app, and the web. Firing is not the same as being configured, so a surface warns only where the headroom hook is actually installed for it.
 
