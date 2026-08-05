@@ -51,13 +51,68 @@ MIN_INTERVALS_FOR_HIGH_CONFIDENCE = 3
 # recency-weighted and an unweighted mean all still passed a 500-interval
 # segment where a single interval carried 20% of the total usage change).
 # The only fix is a check that a mean can never launder: the single WORST
-# interval, compared on its own to the group's median rate. A factor of 4
-# marks the line between "noisy but recognizably the same rate" and "a
-# different regime entirely" -- ordinary sampling jitter on a steady
-# process moves a reading by tens of percent, not by multiples of itself,
-# so an interval running at 4x (or 1/4) the median rate is not the same
-# process sampled twice, and HIGH must not claim it is.
-MAX_INTERVAL_RATE_RATIO = 4.0
+# interval, compared on its own to the group's median rate.
+#
+# A fourth round found this cap (originally 4x, i.e. "off by a factor of
+# 4") still too permissive: an interval at 3.99x the median passed it while
+# carrying 84.7% of the segment's total usage. HIGH claims the median rate
+# describes every interval, so the bar has to be "recognizably the same
+# rate", not merely "the same order of magnitude". 25% relative deviation
+# marks that line -- ordinary sampling jitter and reporting-granularity
+# rounding on a steady process moves a reading by single-digit to
+# low-double-digit percent (see the quantization fixtures in the test
+# suite, built from this project's own captured history), not by a
+# quarter of itself, so an interval 25% off the median is already
+# behaving like a different regime, and HIGH must not claim otherwise.
+# This is stated as a DEVIATION (|rate - median| / median), not a
+# multiplicative ratio like the old constant: deviation is symmetric
+# around zero and gives a rate of exactly 0 a finite, still-well-over-cutoff
+# score (1.0) instead of requiring a special-cased infinity.
+#
+# One consequence worth being explicit about: this per-interval deviation
+# cap is now numerically at least as strict as the old mean-based
+# dispersion check above, at every possible input. A mean (weighted or
+# not) of a set of per-interval deviation ratios can never exceed the
+# largest ratio in that set -- that is what "mean" means. So once every
+# interval's individual deviation is capped at 0.25, the weighted and
+# unweighted dispersion ratios are *already* bounded by 0.25 too; checking
+# them again for HIGH would be checking something already guaranteed.
+# HIGH below therefore gates on this per-interval cap alone (plus the
+# usage-share cap next to it); dispersion_ratio is kept only to place
+# MEDIUM vs LOW, where it still does real work.
+MAX_INTERVAL_RATE_DEVIATION = 0.25
+
+# The deviation cap above bounds a RATIO -- how far off the median an
+# interval's rate runs -- but the harm HIGH must guard against is a
+# question of SHARE: how much of the segment's total usage change that one
+# interval is responsible for. These are different quantities and a bound
+# on one does not bound the other: an interval can sit well inside the
+# rate-deviation cap and still supply nearly all of the observed usage, if
+# it is simply much longer than the intervals around it (this is exactly
+# how the round-4 fixture passed the old ratio-only gate: 3.99x is a
+# tight ratio, but that one interval was 1000 seconds long against
+# neighbors 60 seconds long, so it carried the overwhelming majority of
+# the evidence). HIGH claims the fitted rate is corroborated by the
+# segment as a whole, not smuggled in by one interval that simply
+# happened to run the longest. A cap of 0.5 encodes "no single interval
+# may supply a MAJORITY of the observed usage change" -- if a single
+# interval accounts for more than half, the other intervals combined
+# supply less evidence than that one interval alone, and the claim that
+# "every interval agrees" has degenerated into "one interval, weakly
+# seconded by a minority of the total evidence."
+#
+# This does mean a genuinely steady rate sampled very unevenly -- one
+# interval spanning most of the segment's elapsed time (e.g. a long idle
+# gap between captures) -- can be held to MEDIUM even though its rate
+# matches everyone else's exactly. That is a real, known trade-off, not an
+# oversight: seen in isolation, a single dominant-by-duration interval is
+# indistinguishable from a single dominant-by-anomaly interval (the exact
+# failure this cap exists to catch), and nothing in a single pairwise
+# comparison can tell those two cases apart. Preferring the occasional
+# false MEDIUM on legitimately steady but unevenly-sampled data over a
+# false HIGH on data actually dominated by one bad interval is the
+# intended, conservative choice.
+MAX_INTERVAL_USAGE_SHARE = 0.5
 
 
 class ProjectionConfidence(str, Enum):
@@ -424,17 +479,35 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     kept small by making N large enough: a single interval consuming 20% of
     the segment's total usage change, spread across 500 total intervals,
     produces an unweighted mean deviation ratio that lands just UNDER the
-    HIGH cutoff (proven in
+    (then 0.25) HIGH cutoff (proven in
     test_dominant_interval_diluted_across_many_samples_is_not_high_confidence
     below). No mean-based statistic can close this gap, because dilution by
     sample count is exactly what a mean does. What cannot be diluted by
     sample count is a MAXIMUM: comparing each interval's rate to the
     group's median individually, keeping only the single worst ratio. See
-    MAX_INTERVAL_RATE_RATIO for what that ratio means and why 4x is the
-    cutoff. The mean-based ratios above are kept because they still add
-    value for cases the max-based check does not target (e.g. broad,
-    evenly-spread disagreement where no single interval is an outlier), but
-    HIGH now also requires the max-based check to pass on its own.
+    MAX_INTERVAL_RATE_DEVIATION for what that ratio means.
+
+    A fourth round found even the max-based check gameable, by a route the
+    ratio alone cannot see: an interval can sit just inside the ratio cap
+    and still supply almost all of the segment's usage, if it simply runs
+    much longer than its neighbors (a 1000-second interval at 3.99x the
+    median rate next to twelve 60-second intervals -- comfortably under
+    the old 4x cap, but 84.7% of the segment's total usage change came from
+    that one interval). Rate ratio and usage share are different
+    quantities; a bound on one does not bound the other. See
+    MAX_INTERVAL_USAGE_SHARE for what that second, independent bound means.
+    Both this cap and MAX_INTERVAL_RATE_DEVIATION can veto HIGH on their
+    own; HIGH requires both to pass.
+
+    The mean-based dispersion ratio computed above is, as of the
+    MAX_INTERVAL_RATE_DEVIATION tightening, mathematically unable to
+    exceed that per-interval cap once every interval individually passes
+    it (a mean of values each <= X is itself <= X), so it is no longer
+    checked again for HIGH -- checking it would only ever restate a
+    conclusion the per-interval cap already reached. It still decides
+    MEDIUM vs LOW below, where no per-interval or share-based cap
+    substitutes for it: broad, evenly-spread disagreement with no single
+    outlier interval is exactly the shape it exists to catch.
 
     HIGH additionally requires at least MIN_INTERVALS_FOR_HIGH_CONFIDENCE
     independent intervals: two intervals agreeing is one coincidence, not a
@@ -442,15 +515,23 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     """
 
     intervals = []
+    # Raw (signed, un-normalized) usage delta per interval, kept parallel to
+    # intervals so the usage-share check below can weigh each interval by
+    # how much of the segment's total change it actually contributed,
+    # independent of how that delta and the interval's elapsed time combine
+    # into a rate.
+    deltas = []
     for index in range(1, len(records)):
         previous = records[index - 1]
         current = records[index]
         elapsed = current.captured_at - previous.captured_at
         if elapsed < MIN_INTERVAL_SECONDS:
             continue
-        rate = (current.used_percentage - previous.used_percentage) / elapsed
+        delta = current.used_percentage - previous.used_percentage
+        rate = delta / elapsed
         if math.isfinite(rate):
             intervals.append(rate)
+            deltas.append(delta)
 
     if len(intervals) < 2:
         # Only one independent interval means there is no second, separate
@@ -474,24 +555,27 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     dispersion_ratio = max(weighted_ratio, unweighted_ratio)
 
     # The max-based veto: how far the SINGLE worst interval sits from the
-    # median, as a multiple (>= 1.0), regardless of how many agreeing
-    # intervals surround it. An interval at exactly the median rate scores
-    # 1.0; an interval at 0 while the median is positive scores infinity,
-    # since a rate of zero is not "close to" a positive median by any
-    # multiple -- it is a different regime (e.g. a stall), which is exactly
-    # the kind of single-interval evidence a mean can hide but a max cannot.
-    max_interval_ratio = 1.0
-    for rate in intervals:
-        higher, lower = (rate, center) if rate >= center else (center, rate)
-        if lower <= 0.0:
-            max_interval_ratio = math.inf
-            break
-        max_interval_ratio = max(max_interval_ratio, higher / lower)
+    # median, regardless of how many agreeing intervals surround it. An
+    # interval at exactly the median rate scores 0.0; stated as a deviation
+    # rather than a ratio, a rate of 0 against a positive median scores a
+    # finite 1.0 (100% off) rather than needing a special-cased infinity --
+    # see MAX_INTERVAL_RATE_DEVIATION for why 0.25 is the cutoff.
+    max_relative_deviation = max(abs(rate - center) / abs(center) for rate in intervals)
+
+    # The share-based veto: how much of the segment's total usage change
+    # the single largest interval is responsible for. Guarded against
+    # total_delta <= 0 even though it should be unreachable here (center
+    # != 0 was already checked, and usage is non-decreasing within a
+    # segment, so the deltas summed below should be positive) -- treating
+    # that impossible case as maximal share is the fail-safe direction: it
+    # can only ever cost an unwarranted HIGH, never grant one.
+    total_delta = sum(deltas)
+    max_usage_share = (max(deltas) / total_delta) if total_delta > 0.0 else 1.0
 
     if (
         len(intervals) >= MIN_INTERVALS_FOR_HIGH_CONFIDENCE
-        and dispersion_ratio <= 0.25
-        and max_interval_ratio <= MAX_INTERVAL_RATE_RATIO
+        and max_relative_deviation <= MAX_INTERVAL_RATE_DEVIATION
+        and max_usage_share <= MAX_INTERVAL_USAGE_SHARE
     ):
         return ProjectionConfidence.HIGH
     if dispersion_ratio <= 0.75:
