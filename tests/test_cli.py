@@ -843,6 +843,55 @@ class BurnRateSurfaceTests(unittest.TestCase):
             }
             self.assertEqual(projections[("claude", "short")]["samples_used"], 3)
 
+    def test_burn_rate_projections_skips_oversized_history_file(self) -> None:
+        # Regression test for Codex review round 2, P2: project_exhaustion's
+        # cost grows with the whole history file's size, which is unbounded
+        # over an install's lifetime. _burn_rate_projections's max_history_bytes
+        # short-circuits before that read when given a bound.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            climb = _steady_climb_records(now)
+            _write_history(root / "state", climb)
+            history_path = root / "state" / "history.jsonl"
+            actual_size = history_path.stat().st_size
+
+            with mock.patch.dict(os.environ, {"HEADROOM_STATE_DIR": str(root / "state")}, clear=True):
+                unbounded = cli._burn_rate_projections(now)
+                bounded_under = cli._burn_rate_projections(now, max_history_bytes=actual_size + 1)
+                bounded_over = cli._burn_rate_projections(now, max_history_bytes=actual_size - 1)
+
+            self.assertTrue(unbounded)
+            self.assertTrue(bounded_under)
+            self.assertEqual(bounded_over, [])
+
+    def test_hook_path_alone_applies_the_history_size_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            climb = _steady_climb_records(now)
+            _write_history(root / "state", climb)
+            _write_state(root / "state", [_matching_state_snapshot(climb)])
+            history_path = root / "state" / "history.jsonl"
+            # A bound below the real file's size, applied only where the
+            # hook command actually passes one.
+            with mock.patch.object(cli, "HOOK_MAX_HISTORY_BYTES", history_path.stat().st_size - 1):
+                environment = self._environment(root)
+                json_output = io.StringIO()
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with redirect_stdout(json_output):
+                        cli.main(["json"])
+                document = json.loads(json_output.getvalue())
+                self.assertTrue(document["burn_rate_projections"])
+
+                hook_output = io.StringIO()
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with mock.patch("sys.stdin", io.StringIO("")):
+                        with redirect_stdout(hook_output):
+                            result = cli.main(["hook", "--plain"])
+                self.assertEqual(result, 0)
+                self.assertNotIn("Burn rate:", hook_output.getvalue())
+
     def test_hook_exits_zero_with_malformed_state_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

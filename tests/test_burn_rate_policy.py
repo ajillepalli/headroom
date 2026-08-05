@@ -298,12 +298,40 @@ class RenderBurnRateStatusTests(unittest.TestCase):
 
     def test_stalled_trend_says_nothing_in_status_despite_fresh_capture(self) -> None:
         # Same stalled-trend case as hook's: a fresh capture that only
-        # repeats an old value is not evidence the trend continues.
-        projection = _projection(source="claude", window="short", latest_change_at=600.0)
+        # repeats an old value is not evidence the trend continues. The
+        # default projection's rate (0.01%/s) implies a ~100s inter-change
+        # interval; a 1000s-old latest_change_at is 10x that, comfortably
+        # past STALE_TREND_TOLERANCE (4x), not a boundary-adjacent value.
+        projection = _projection(source="claude", window="short", latest_change_at=0.0)
         reading = _fresh_reading(source="claude", window="short")
         lines = render_burn_rate_status_lines([projection], now=1_000.0, readings=[reading])
 
         self.assertEqual(lines, [])
+
+    def test_slow_genuine_trend_is_not_mistaken_for_stalled(self) -> None:
+        # Codex review, round 3, P1: Codex weekly usage climbing one whole
+        # percentage point every 2 hours (7,200s) is a real, steady trend.
+        # Its OWN implied inter-change interval is 7,200s, which is already
+        # 4x Codex's 1,800s freshness window -- a first version of this
+        # gate compared latest_change_at against that fixed window and
+        # rejected this exact shape of trend for roughly three quarters of
+        # every tick cycle. now is set just under one full tick after the
+        # last observed change (as stale as this trend's own cadence can
+        # honestly get before the next point should land), which must still
+        # pass under the rate-relative tolerance.
+        now = 1_000_000.0
+        rate = 1.0 / 7_200.0
+        projection = _projection(
+            source="codex",
+            window="weekly",
+            rate_percent_per_second=rate,
+            latest_change_at=now - 7_000.0,
+        )
+        reading = _fresh_reading(source="codex", window="weekly")
+        lines = render_burn_rate_status_lines([projection], now=now, readings=[reading])
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Codex", lines[0])
 
 
 class RenderHookCompositionTests(unittest.TestCase):
@@ -410,10 +438,13 @@ class RenderHookCompositionTests(unittest.TestCase):
         # latest_change_at is to catch exactly this case, which a
         # FRESH-only check cannot see.
         readings = [self._reading(lower_bound_percent=3.0), _fresh_reading()]
-        # now=1_000.0; Claude's freshness window is 300s (see freshness.py),
-        # so a change 400s stale fails while a fresh capture 10s old (from
-        # _fresh_reading's age_seconds=10.0) still passes on its own.
-        projection = _projection(latest_change_at=600.0)
+        # now=1_000.0; the default projection's rate (0.01%/s) implies a
+        # ~100s inter-change interval, so STALE_TREND_TOLERANCE (4x) allows
+        # up to 400s. A 1000s-old latest_change_at is 10x the implied
+        # interval, comfortably past tolerance -- not a boundary-adjacent
+        # value -- while the fresh capture itself (age_seconds=10.0) still
+        # passes the separate FRESH-reading half of the check on its own.
+        projection = _projection(latest_change_at=0.0)
         text = render_hook(readings, now=1_000.0, projections=[projection])
 
         self.assertEqual(text, "")

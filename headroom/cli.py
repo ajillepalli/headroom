@@ -51,6 +51,22 @@ class _CodexRefreshResult:
 
 HOOK_DEADLINE_SECONDS = 7.0
 HOOK_MAX_ROLLOUT_FILES = 32
+# history.jsonl is append-only and, absent a marked reset, grows for the
+# life of an install (see burn_rate.py's own MAX_FIT_SAMPLES comment) --
+# project_exhaustion reads, JSON-parses, and groups the WHOLE file before
+# its 500-sample fit cap ever applies, so its cost grows with lifetime
+# capture count, not with anything hook's own HOOK_DEADLINE_SECONDS budget
+# accounts for (Codex review, round 2, P2). A long-running install could
+# see this work grow large enough to threaten the hook's external timeout
+# (the generated Codex hook config carries its own 30s timeoutSec). This is
+# a size-based heuristic, not a measured bound: real captures here run
+# roughly 150-250 bytes/line, so 20 MB is on the order of 100,000 lines,
+# comfortably parseable in a second or two on modest hardware while still
+# covering months of ordinary use. Skipping burn-rate projections outright
+# past this size (rather than reading a prefix or a tail) keeps the
+# behavior simple and honest: a caller sees no projections, not a
+# projection quietly built from a truncated slice of history.
+HOOK_MAX_HISTORY_BYTES = 20_000_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,7 +194,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         now = time.time()
         state = read_state()
         readings = _readings(state, now)
-        projections = _burn_rate_projections(now)
+        projections = _burn_rate_projections(
+            now,
+            max_history_bytes=HOOK_MAX_HISTORY_BYTES if arguments.command == "hook" else None,
+        )
         if arguments.command == "status":
             print(render_report(readings, now))
             burn_lines = render_burn_rate_status_lines(projections, now, readings)
@@ -314,7 +333,9 @@ def _readings(state: Dict[str, Any], now: float) -> List[Reading]:
     ]
 
 
-def _burn_rate_projections(now: float) -> List[BurnRateProjection]:
+def _burn_rate_projections(
+    now: float, max_history_bytes: Optional[int] = None
+) -> List[BurnRateProjection]:
     """Project quota exhaustion from the persisted history file.
 
     Reads directly from history.jsonl rather than the in-memory readings
@@ -323,9 +344,24 @@ def _burn_rate_projections(now: float) -> List[BurnRateProjection]:
     An unreadable or missing history file yields an empty list (see
     project_exhaustion's own OSError handling), which every caller here
     already treats the same as "nothing to report."
+
+    ``max_history_bytes``, when given, skips the (unbounded-cost) read
+    entirely once the file exceeds that size, returning an empty list the
+    same way an unreadable file does -- see HOOK_MAX_HISTORY_BYTES for why
+    the hook path passes this and status/json/doctor do not. The size check
+    itself is a cheap stat(), so this adds negligible cost on every call.
     """
 
     history_path = resolve_state_dir() / "history.jsonl"
+    if max_history_bytes is not None:
+        try:
+            if history_path.stat().st_size > max_history_bytes:
+                return []
+        except OSError:
+            # Missing, unreadable, or otherwise unstat-able: let
+            # project_exhaustion's own OSError handling decide, same as the
+            # unbounded path below.
+            pass
     return project_exhaustion(history_path, now=now)
 
 

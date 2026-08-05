@@ -5,7 +5,6 @@ from typing import Optional
 
 from .bounds import Confidence, Reading
 from .burn_rate import BurnRateProjection
-from .freshness import freshness_seconds
 
 
 ESCALATE_BELOW_HEADROOM = 50.0
@@ -138,6 +137,25 @@ MIN_TRUSTED_INTERVALS = 5
 # admitting the ordinary cluster and rejecting the outliers.
 MAX_TRUSTED_RATE_DRIFT = 0.45
 
+# STALE_TREND_TOLERANCE: how many multiples of a projection's own implied
+# inter-change interval (1 / rate_percent_per_second -- how long the fitted
+# rate itself predicts between whole-percentage-point changes) may pass
+# since latest_change_at before the trend is considered stalled rather than
+# merely between ticks. This is used by burn_rate_evidence_is_current, not
+# burn_rate_projection_is_trustworthy: it answers "is this still moving",
+# not "is the fit internally consistent." 1.0 would reject a perfectly
+# healthy trend for roughly half of every real tick cycle purely from
+# Poisson-like variance in exactly when a whole point lands (see that
+# function's docstring for the concrete Codex-weekly counterexample that
+# broke a fixed-window version of this check). 4.0 tolerates a tick running
+# several times longer than its own average without yet calling it stalled,
+# while still catching a trend that has gone many multiples of its own
+# expected cadence without a single further point -- which is what
+# genuinely happened in the round-2 stalled-session counterexample
+# (a trend whose own cadence implied a tick roughly every 60-100s, silent
+# for 300-400s afterward: several times over, not a little over).
+STALE_TREND_TOLERANCE = 4.0
+
 # max_raw_rate_ratio and zero_delta_fraction are deliberately NOT part of
 # this policy, even though burn_rate.py reports them specifically to catch
 # what the folded fields above can smooth away (see BurnRateProjection's
@@ -213,31 +231,51 @@ def burn_rate_evidence_is_current(
       ``Confidence.FRESH`` (``bounds.py``, ``freshness.py``) -- a recent
       CAPTURE happened at all. A missing reading, or anything less current
       than ``FRESH``, fails this gate outright.
-    * ``now`` is within the source's freshness window of
-      ``projection.latest_change_at`` -- usage last demonstrably CHANGED
-      recently, not just that a capture recently repeated an old value
-      (Codex review, round 2, P1). A recent, fresh capture that only
-      confirms an old plateau is not evidence a trend continues: a session
-      that climbed steadily and then genuinely stalled can still produce
-      fresh, unremarkable-looking captures indefinitely, and every folded
-      measurement above is blind to a trailing stall by construction (see
-      ``latest_change_at``'s docstring in burn_rate.py) -- it would keep
-      reporting the OLD climb's clean statistics forever. Reusing the same
-      per-source freshness window here (rather than a separate constant) is
-      deliberate: it is already the answer to "how large a gap between
-      captures is still ordinary" for this source, and a gap since the last
-      REAL change is held to the same bar as a gap since the last capture.
+    * ``now`` is within a tolerance of ``projection.latest_change_at`` --
+      usage last demonstrably CHANGED recently, not just that a capture
+      recently repeated an old value (Codex review, round 2, P1). A recent,
+      fresh capture that only confirms an old plateau is not evidence a
+      trend continues: a session that climbed steadily and then genuinely
+      stalled can still produce fresh, unremarkable-looking captures
+      indefinitely, and every folded measurement above is blind to a
+      trailing stall by construction (see ``latest_change_at``'s docstring
+      in burn_rate.py) -- it would keep reporting the OLD climb's clean
+      statistics forever.
+
+      The tolerance is ``STALE_TREND_TOLERANCE`` multiples of the
+      projection's OWN implied inter-change interval (1 / rate), not a
+      fixed per-source constant. A first version of this check reused the
+      per-source freshness window (300s Claude, 1800s Codex) here, on the
+      theory that it already answers "how large a gap between captures is
+      still ordinary." That was wrong for a genuinely slow trend: Codex
+      weekly usage climbing 1 whole point every 2 hours is a perfectly real,
+      steady trend whose OWN inter-tick gap (7200s) is several times longer
+      than Codex's 1800s freshness window, so a fixed window rejected such
+      a trend for roughly three quarters of every tick cycle even though
+      nothing was actually wrong with it (Codex review, round 3, P1). The
+      right comparison is the rate's OWN cadence: how long would this
+      projection's fitted rate itself predict between whole-point changes,
+      and is the observed gap since the last one within a reasonable
+      multiple of that.
 
     Both are required because they catch different failure shapes: a
     missing/stale reading with a recent ``latest_change_at`` still fails (no
     current capture to confirm anything), and a fresh reading with a stale
     ``latest_change_at`` still fails (captures are current, but nothing has
-    actually moved recently) -- this is the specific case a round-1 version
-    of this function missed, because it checked only reading freshness.
+    actually moved recently relative to the rate's own implied cadence) --
+    this is the specific case a round-1 version of this function missed,
+    because it checked only reading freshness.
     """
 
     if reading is None or reading.confidence is not Confidence.FRESH:
         return False
-    if projection.latest_change_at is None:
+    if projection.latest_change_at is None or projection.rate_percent_per_second is None:
         return False
-    return (now - projection.latest_change_at) <= freshness_seconds(projection.source)
+    if projection.rate_percent_per_second <= 0.0:
+        # Structurally unreachable through project_exhaustion (a successful
+        # projection's rate is already required to be strictly positive --
+        # see burn_rate.py's NON_POSITIVE_RATE decline), but guarded so a
+        # division below never sees a non-positive divisor.
+        return False
+    expected_interval_seconds = 1.0 / projection.rate_percent_per_second
+    return (now - projection.latest_change_at) <= STALE_TREND_TOLERANCE * expected_interval_seconds
