@@ -2,12 +2,14 @@
 
 import argparse
 from dataclasses import dataclass
+from importlib import metadata
 import json
 from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import __version__
 from .bounds import Reading, Snapshot, bound_snapshot
 from .claude import parse_stdin
 from .codexrpc import CodexRpcResult, read_rate_limits
@@ -37,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the command parser."""
 
     parser = argparse.ArgumentParser(prog="headroom")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s {}".format(_installed_version()),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in (
         "statusline",
@@ -58,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--dry-run", action="store_true", help="print the diff without writing files")
     init_parser.add_argument("--print", dest="print_only", action="store_true", help="print the settings snippet only")
     return parser
+
+
+def _installed_version() -> str:
+    try:
+        return metadata.version("headroom-cli")
+    except metadata.PackageNotFoundError:
+        return __version__
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

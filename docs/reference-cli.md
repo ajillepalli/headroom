@@ -12,6 +12,8 @@ headroom COMMAND [OPTIONS]
 
 `headroom -h` and `headroom --help` print top-level help. Every subcommand also accepts `-h` and `--help`. Help exits with status 0. A missing command, an unknown command, or an unrecognized flag is rejected by `argparse` and exits with status 2.
 
+`headroom --version` prints the installed package version and exits with status 0 without requiring a command. When distribution metadata is unavailable, such as when running directly from a source checkout, it prints the package's source version.
+
 ## Commands
 
 | Command | Input | Output and side effects |
@@ -75,7 +77,7 @@ Claude diagnostics contain an `unparsed` list of parser notes. Codex diagnostics
 
 | Status | When it is used |
 | --- | --- |
-| `0` | A command completed, help was printed, `hook` had nothing to say, or `statusline` recovered from malformed input or an internal failure. |
+| `0` | A command completed, help or version information was printed, `hook` had nothing to say, or `statusline` recovered from malformed input or an internal failure. |
 | `1` | `init` could not read, merge, back up, or write settings; `reset` could not remove state; or another on-demand command raised a handled I/O, value, or type error. |
 | `2` | Command-line parsing failed because the command or arguments were missing or invalid. |
 
