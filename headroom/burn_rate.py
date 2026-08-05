@@ -172,31 +172,59 @@ class BurnRateProjection:
     and a low ``max_usage_share`` and still rest on very little independent
     evidence if ``effective_intervals`` is far below ``intervals_used``.
 
-    ``max_relative_deviation_raw``, ``max_usage_share_raw``,
-    ``intervals_used_raw``, ``rate_drift_raw``, and ``effective_intervals_raw``
-    are the same five measures computed the same way, EXCEPT that zero-delta
-    intervals are never folded forward -- every raw gap between consecutive
-    captures is its own interval, quantized zero-delta readings included.
-    Folding and not-folding are not "which one is right"; they answer
-    different questions. The folded fields above answer "once whole-point
-    quantization is accounted for, how consistent does this rate look?" The
-    raw fields answer "how consistent do the individual captures look,
-    exactly as recorded?" Folding is exactly the operation that merges
-    elapsed time across a run of identical readings, and merging elapsed time
-    is what makes a genuine sub-second burst buried in a long flat run read
-    as an ordinary, unremarkable rate once it is averaged over that whole
-    run -- the same arithmetic that rescues quantized data from looking
-    maximally unstable also launders a real burst into looking steady. A
-    caller cannot get both readings from the folded fields alone: a folded
-    ``max_relative_deviation`` near 0 is consistent with either "genuinely
-    steady" or "a burst folding smoothed over", and only the raw counterpart
-    distinguishes them. A LARGE GAP between a folded value and its raw
-    counterpart is itself the signal: it means the segment is either
-    quantized (folded looks better than raw) or bursty in a way folding
-    smoothed over (raw looks far worse than folded), and a caller that cares
-    about which should inspect both, not just one. All ten of these fields
-    (five folded, five raw) are None exactly when no projection was made
-    (``reason`` is set); a projection with measurements always has both.
+    ``zero_delta_fraction`` and ``max_raw_rate_ratio`` are two RAW (never
+    zero-delta-folded) structural measurements reported alongside the five
+    folded ones above. They replace an earlier five-field raw mirror of the
+    same five folded measurements (``max_relative_deviation_raw`` and its
+    four siblings), which a round of adversarial review proved did not
+    discriminate what it was added to discriminate: an ordinary
+    quantized-steady series and a genuine sub-second burst produced
+    IDENTICAL values on every one of those ten fields, because any series
+    containing so much as one zero-delta gap saturates the raw deviation at
+    exactly 1.0 -- and real data is full of zero-delta gaps (that is the
+    whole reason folding exists; see the folded fields above). The
+    five-field mirror was a saturation flag wearing a measurement's name,
+    not a discriminator. These two fields are built directly from the raw
+    (unfolded) gaps between consecutive captures instead, and answer two
+    different, narrower questions the folded fields cannot answer alone:
+
+    ``zero_delta_fraction`` is the fraction of raw gaps between consecutive
+    captures whose usage delta is EXACTLY zero. This is "how quantized is
+    this data" made explicit -- the same fact folding uses internally
+    (merging exactly these gaps forward) but never previously reported on
+    its own. LOW (near 0.0) means almost every capture recorded some
+    change; HIGH (near 1.0) means most captures are quantization repeats of
+    the previous reading. On its own this says nothing about whether the
+    underlying rate is steady or bursty -- a quantized-steady series and a
+    quantized burst can report the same fraction of zero-delta gaps -- which
+    is exactly why it is reported alongside, not instead of,
+    ``max_raw_rate_ratio``, rather than relied on by itself.
+
+    ``max_raw_rate_ratio`` is the largest single raw interval's rate,
+    divided by the segment's OVERALL rate (total usage delta over total
+    elapsed time -- the rate the segment would report if treated as one
+    interval start to finish). Because the overall rate is the
+    elapsed-time-weighted average of every raw interval's rate, this ratio
+    is always >= 1.0, with equality only when every raw interval runs at
+    exactly the same rate. LOW (near 1.0) means no single raw interval ran
+    meaningfully faster than the segment's overall pace -- consistent with a
+    genuinely steady rate, quantized or not. HIGH means one raw interval's
+    rate hugely exceeds the segment average: the signature of a genuine
+    burst, which is exactly the case a folded field can smooth away
+    (folding merges a burst's neighboring flat gaps into it, diluting its
+    rate down toward the ordinary-looking average of the whole merged
+    span). A caller who sees a low folded ``max_relative_deviation`` next to
+    a high ``max_raw_rate_ratio`` is looking at a burst folding smoothed
+    over, not a genuinely steady rate.
+
+    Both fields are computed over the raw (unfolded) view: every gap
+    between consecutive captures is its own interval, zero-delta gaps
+    included, except that a gap whose own accumulated elapsed time is below
+    MIN_INTERVAL_SECONDS is still carried forward (see
+    ``_consecutive_intervals``) rather than divided into float noise. Both
+    are None exactly when no projection was made (``reason`` is set), same
+    as the five folded fields; a projection with measurements always has
+    both.
     """
 
     source: str
@@ -212,11 +240,8 @@ class BurnRateProjection:
     intervals_used: Optional[int] = None
     rate_drift: Optional[float] = None
     effective_intervals: Optional[float] = None
-    max_relative_deviation_raw: Optional[float] = None
-    max_usage_share_raw: Optional[float] = None
-    intervals_used_raw: Optional[int] = None
-    rate_drift_raw: Optional[float] = None
-    effective_intervals_raw: Optional[float] = None
+    zero_delta_fraction: Optional[float] = None
+    max_raw_rate_ratio: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -480,11 +505,8 @@ def _project_group(
         intervals_used=measurements.intervals_used,
         rate_drift=measurements.rate_drift,
         effective_intervals=measurements.effective_intervals,
-        max_relative_deviation_raw=measurements.max_relative_deviation_raw,
-        max_usage_share_raw=measurements.max_usage_share_raw,
-        intervals_used_raw=measurements.intervals_used_raw,
-        rate_drift_raw=measurements.rate_drift_raw,
-        effective_intervals_raw=measurements.effective_intervals_raw,
+        zero_delta_fraction=measurements.zero_delta_fraction,
+        max_raw_rate_ratio=measurements.max_raw_rate_ratio,
     )
 
 
@@ -514,9 +536,9 @@ class _RateUnderflowedToZero(Exception):
 
 @dataclass(frozen=True)
 class _IntervalMeasurements:
-    """The ten diagnostic numbers (five folded, five raw) reported alongside
-    a successful projection. See BurnRateProjection's docstring for what
-    each pair means and why both are reported.
+    """The seven diagnostic numbers (five folded, two raw structural)
+    reported alongside a successful projection. See BurnRateProjection's
+    docstring for what each one means and why both views are reported.
     """
 
     max_relative_deviation: float
@@ -524,11 +546,8 @@ class _IntervalMeasurements:
     intervals_used: int
     rate_drift: float
     effective_intervals: float
-    max_relative_deviation_raw: float
-    max_usage_share_raw: float
-    intervals_used_raw: int
-    rate_drift_raw: float
-    effective_intervals_raw: float
+    zero_delta_fraction: float
+    max_raw_rate_ratio: float
 
 
 def _consecutive_intervals(
@@ -569,11 +588,12 @@ def _consecutive_intervals(
       independent evidence manufactures instability out of quantization
       alone. This folding is exact, not a tuned tolerance: it only merges
       intervals that reported literally no change. With
-      ``fold_zero_delta=False`` every gap becomes its own interval, zero-delta
-      ones included -- this is what the ``*_raw`` diagnostic fields are built
-      from, and it is also what lets a genuine sub-second burst show up as a
-      single wildly-off-median interval instead of being averaged away into
-      the long flat run around it.
+      ``fold_zero_delta=False`` every gap becomes its own interval,
+      zero-delta ones included -- this is the raw view ``zero_delta_fraction``
+      and ``max_raw_rate_ratio`` are built from, and it is also what lets a
+      genuine sub-second burst show up as a single wildly-off-average
+      interval instead of being averaged away into the long flat run
+      around it.
 
     A carried-forward accumulator can end up with a strictly positive delta
     whose rate underflows to exactly 0.0 on division (e.g. a denormal delta
@@ -584,6 +604,25 @@ def _consecutive_intervals(
     agreement but is really a measurement failure. ``_RateUnderflowedToZero``
     is raised instead in that case, for the caller to turn into a declined
     projection.
+
+    A nonzero accumulator can also survive all the way to the end of the
+    loop below, past the last gap, still short of MIN_INTERVAL_SECONDS --
+    e.g. records ending [...,(60, 10), (60.0000005, 11)], where the final
+    gap's ~5e-7s never clears the threshold and there is no further gap
+    left to carry it forward into. Every other carry-forward case in this
+    function has a "next" interval to fold into; this one does not, and an
+    earlier version of this function simply dropped it, which silently
+    broke usage conservation (the segment's reported deltas summed to less
+    than its actual total usage change). The fix folds it BACKWARD into the
+    last already-measured interval instead of forward: widening that
+    interval's own delta and elapsed time by the leftover amounts and
+    recomputing its rate. That is the conservation-preserving choice that
+    invents nothing -- it is the same "merge a too-short gap into a real
+    interval" operation used everywhere else in this function, just run in
+    the only direction available at the end of a segment. A trailing
+    accumulator whose leftover delta is exactly zero needs no such fix: it
+    contributes nothing to the usage total either way, so it can still be
+    dropped cleanly the same as before.
     """
 
     rates: List[float] = []
@@ -612,6 +651,43 @@ def _consecutive_intervals(
             elapsed_list.append(accumulated_elapsed)
         accumulated_delta = 0.0
         accumulated_elapsed = 0.0
+
+    if accumulated_delta != 0.0:
+        # See the docstring above: this is the terminal remainder, real
+        # usage with no following gap to carry it into. Fold it backward
+        # into the last measured interval so it is not silently dropped.
+        if rates:
+            deltas[-1] += accumulated_delta
+            elapsed_list[-1] += accumulated_elapsed
+            merged_rate = deltas[-1] / elapsed_list[-1]
+            if merged_rate == 0.0:
+                # deltas[-1] is strictly positive after the merge (it is a
+                # non-negative prior value plus a strictly positive
+                # accumulated_delta, since usage never decreases within a
+                # segment), so a zero merged_rate here is the same
+                # underflow-not-genuine-zero failure the loop above already
+                # guards against, not trivial agreement.
+                raise _RateUnderflowedToZero(
+                    f"terminal delta {accumulated_delta!r} merged into the "
+                    "previous interval underflowed its rate to zero"
+                )
+            rates[-1] = merged_rate
+        else:
+            # No previous interval exists to merge into. Structurally
+            # unreachable through project_exhaustion: _project_group only
+            # reaches this function after MIN_SPAN_SECONDS (>=60s of total
+            # span) and FLAT_USAGE (a nonzero total delta) have both been
+            # established, which together guarantee at least one interval
+            # flushes in the loop above before any trailing sub-threshold
+            # remainder could appear. Declined rather than assumed away, in
+            # case a future direct caller reaches this function with
+            # unsegmented or single-gap input.
+            raise _RateUnderflowedToZero(
+                f"terminal delta {accumulated_delta!r} over "
+                f"{accumulated_elapsed!r}s has no prior interval to merge "
+                "into"
+            )
+
     return rates, deltas, elapsed_list
 
 
@@ -632,7 +708,8 @@ def _folded_intervals(
 def _raw_intervals(
     records: List[_HistoryRecord],
 ) -> Tuple[List[float], List[float], List[float]]:
-    """The (rate, delta, elapsed) triples the ``*_raw`` diagnostic fields use.
+    """The (rate, delta, elapsed) triples ``zero_delta_fraction`` and
+    ``max_raw_rate_ratio`` are built from.
 
     Same as ``_folded_intervals`` except zero-delta gaps are never folded
     forward -- every raw gap between consecutive captures is its own
@@ -659,15 +736,16 @@ def _relative_difference(value: float, baseline: float) -> float:
     instead of reaching here -- see _consecutive_intervals), so every rate
     and every half-segment rate built from the folded view is itself
     strictly positive, and the baseline==0.0 branch below can never actually
-    run through project_exhaustion for the folded fields. The raw view (used
-    for the ``*_raw`` diagnostic fields) does NOT carry that guarantee --
-    zero-delta gaps are kept as their own zero-rate intervals there by
-    design, so the raw median genuinely can be 0.0, and this branch is very
-    much reachable through project_exhaustion for those fields. It is kept
-    as an explicit branch rather than an assumption so this function stays
-    correct either way, and so the zero-baseline convention itself stays
-    directly testable without needing to defeat the folding guarantee to
-    construct a test case.
+    run through project_exhaustion for the folded fields. This function has
+    no other caller (the raw view's ``zero_delta_fraction`` and
+    ``max_raw_rate_ratio`` are computed by ``_measure_raw_structure``
+    without going through ``_relative_difference`` at all), so the
+    baseline==0.0 branch is unreachable through project_exhaustion
+    entirely. It is kept as an explicit branch rather than an assumption so
+    this function stays correct if a future caller reaches it with a
+    genuinely zero baseline, and so the zero-baseline convention itself
+    stays directly testable without needing to defeat the folding guarantee
+    to construct a test case.
     """
     if baseline == 0.0:
         return 0.0 if value == 0.0 else 1.0
@@ -676,8 +754,8 @@ def _relative_difference(value: float, baseline: float) -> float:
 
 @dataclass(frozen=True)
 class _SingleViewMeasurements:
-    """The five summary numbers for one view (folded or raw) of a segment's
-    consecutive intervals. See _measure_view for how these are computed and
+    """The five folded summary numbers for a segment's consecutive
+    intervals. See _measure_view for how these are computed and
     BurnRateProjection's docstring for what each one means.
     """
 
@@ -691,10 +769,11 @@ class _SingleViewMeasurements:
 def _measure_view(
     rates: List[float], deltas: List[float], elapsed_list: List[float]
 ) -> Optional[_SingleViewMeasurements]:
-    """Reduce one view's (rate, delta, elapsed) triples to five summary
-    numbers. Shared by both the folded and the raw view -- the two views
-    differ only in which triples _consecutive_intervals hands them, not in
-    how those triples are summarized.
+    """Reduce the folded (rate, delta, elapsed) triples to five summary
+    numbers. Only ever called on the folded view -- the raw view's two
+    structural numbers are computed separately by
+    ``_measure_raw_structure``, which does not need a median or a
+    per-interval deviation.
     """
 
     if not rates:
@@ -775,22 +854,108 @@ def _measure_view(
     )
 
 
+@dataclass(frozen=True)
+class _RawStructuralMeasurements:
+    """The two raw (never zero-delta-folded) structural numbers. See
+    BurnRateProjection's docstring for what each one means and why the
+    folded fields cannot substitute for them.
+    """
+
+    zero_delta_fraction: float
+    max_raw_rate_ratio: float
+
+
+def _measure_raw_structure(
+    records: List[_HistoryRecord],
+) -> Optional[_RawStructuralMeasurements]:
+    """Reduce the raw (unfolded) view of a segment's intervals to
+    ``zero_delta_fraction`` and ``max_raw_rate_ratio``.
+
+    This replaced a five-field raw mirror of the folded summary numbers
+    (built by running the raw triples through ``_measure_view``, the same
+    function the folded view uses). A round of adversarial review proved
+    that mirror did not discriminate a quantized-steady series from a
+    genuine burst -- both saturate ``_measure_view``'s median-based
+    deviation at 1.0 the moment the raw view contains any zero-delta gap,
+    which real data always does. These two numbers are computed directly
+    instead, without ever taking a median of the raw rates.
+
+    May raise _RateUnderflowedToZero -- from ``_raw_intervals`` itself (a
+    per-interval underflow, see ``_consecutive_intervals``), or from the
+    overall-rate division below (a whole-segment underflow, the same
+    failure mode at a different granularity). Either way the caller
+    (``_interval_measurements``) lets it propagate to ``_project_group``,
+    which declines the whole projection rather than report a ratio built
+    on an unrepresentable rate.
+    """
+
+    rates, deltas, elapsed_list = _raw_intervals(records)
+    if not rates:
+        # Mirrors _measure_view's own guard and is unreachable through
+        # project_exhaustion for the same reason: a nonzero total delta
+        # (already established before this function is ever reached)
+        # guarantees the raw accumulator closes on at least one interval.
+        # Kept so a future direct caller gets "no measurement" instead of a
+        # crash from max()/sum() on empty input.
+        return None
+
+    zero_delta_fraction = sum(1 for delta in deltas if delta == 0.0) / len(deltas)
+
+    # The overall rate is the elapsed-time-weighted average of every raw
+    # interval's rate: sum(delta)/sum(elapsed) == sum(rate*elapsed)/sum(elapsed).
+    # That makes it a fixed reference point comparable across segments with
+    # different interval counts, unlike comparing against the (also
+    # interval-count-sensitive) median _measure_view uses for the folded
+    # deviation.
+    total_delta = sum(deltas)
+    total_elapsed = sum(elapsed_list)
+    overall_rate = total_delta / total_elapsed
+    if overall_rate == 0.0:
+        # total_delta > 0 here is the same invariant _measure_view relies
+        # on (this function is never reached unless latest_usage >
+        # first_usage), so a zero overall rate is float underflow, not
+        # genuine zero usage -- the same failure _RateUnderflowedToZero
+        # already names at the single-interval level. Dividing by it would
+        # report an infinite ratio for data that is not infinitely bursty,
+        # so this declines instead. Structurally this should be
+        # unreachable in practice (every per-gap delta that fed total_delta
+        # already passed through _raw_intervals's own underflow guard), but
+        # is guarded rather than assumed away.
+        raise _RateUnderflowedToZero(
+            f"total delta {total_delta!r} over {total_elapsed!r}s "
+            "underflowed to a zero overall rate"
+        )
+
+    max_raw_rate_ratio = max(rates) / overall_rate
+    if not math.isfinite(zero_delta_fraction) or not math.isfinite(max_raw_rate_ratio):
+        # Never let a non-finite diagnostic escape, matching every other
+        # finiteness gate in this module.
+        return None
+
+    return _RawStructuralMeasurements(
+        zero_delta_fraction=zero_delta_fraction,
+        max_raw_rate_ratio=max_raw_rate_ratio,
+    )
+
+
 def _interval_measurements(
     records: List[_HistoryRecord],
 ) -> Optional[_IntervalMeasurements]:
-    """Measure how consistent the segment's intervals are, folded and raw.
+    """Measure how consistent the segment's intervals are: five folded
+    summary numbers plus two raw structural numbers.
 
-    See BurnRateProjection's docstring for what each of the ten numbers
+    See BurnRateProjection's docstring for what each of the seven numbers
     means and why the library reports both views instead of collapsing them
     into a tier. May raise _RateUnderflowedToZero -- see
-    _consecutive_intervals -- which the caller (_project_group) turns into a
-    declined projection rather than catching here, so it stays distinct from
-    the ordinary "no measurement" None case below.
+    _consecutive_intervals and _measure_raw_structure -- which the caller
+    (_project_group) turns into a declined projection rather than catching
+    here, so it stays distinct from the ordinary "no measurement" None case
+    below.
     """
 
     folded = _measure_view(*_folded_intervals(records))
-    raw = _measure_view(*_raw_intervals(records))
-    if folded is None or raw is None:
+    raw_structure = _measure_raw_structure(records)
+    if folded is None or raw_structure is None:
         return None
 
     return _IntervalMeasurements(
@@ -799,9 +964,6 @@ def _interval_measurements(
         intervals_used=folded.intervals_used,
         rate_drift=folded.rate_drift,
         effective_intervals=folded.effective_intervals,
-        max_relative_deviation_raw=raw.max_relative_deviation,
-        max_usage_share_raw=raw.max_usage_share,
-        intervals_used_raw=raw.intervals_used,
-        rate_drift_raw=raw.rate_drift,
-        effective_intervals_raw=raw.effective_intervals,
+        zero_delta_fraction=raw_structure.zero_delta_fraction,
+        max_raw_rate_ratio=raw_structure.max_raw_rate_ratio,
     )
