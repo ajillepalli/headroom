@@ -22,6 +22,7 @@ from headroom.burn_rate import (
     NoProjectionReason,
     _HistoryRecord,
     _RateUnderflowedToZero,
+    _TerminalRemainderUnmergeable,
     _folded_intervals,
     _interval_measurements,
     _pairwise_slopes,
@@ -97,6 +98,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertIsNone(projection.effective_intervals)
         self.assertIsNone(projection.zero_delta_fraction)
         self.assertIsNone(projection.max_raw_rate_ratio)
+        self.assertIsNone(projection.longest_above_overall_rate_run)
 
     def test_flat_usage_yields_no_projection_and_reason(self) -> None:
         projection = self._project(
@@ -850,10 +852,24 @@ class BurnRateTests(unittest.TestCase):
         # ~60s intervals with a 1-point delta each -- no zero-delta gap
         # anywhere in the folded view, and both intervals run at
         # essentially the same rate.
-        # Raw: the unfolded view keeps the 96->96 gap as its own zero-delta
-        # interval and the 96->97 sub-microsecond jump as its own
-        # near-instantaneous one, so half the raw gaps are zero-delta and
-        # the fastest raw interval runs at 2x the overall rate.
+        #
+        # (MEDIUM finding, round 9) This is also the exact fixture the
+        # round-9 review used to prove zero_delta_fraction was wrong: there
+        # are THREE raw capture-to-capture gaps here (96->96, 96->97,
+        # 97->98), and exactly ONE of them (96->96) has a zero delta, so the
+        # correct fraction is 1/3. The pre-fix code instead built
+        # zero_delta_fraction from _raw_intervals's coalesced (rate, delta,
+        # elapsed) triples, where the unconditional MIN_INTERVAL_SECONDS
+        # carry-forward (see _consecutive_intervals) merges the
+        # 60.0000005s sub-microsecond gap into its neighbor even in the
+        # "raw" view -- collapsing three raw gaps into two measured
+        # intervals and reporting 1/2. zero_delta_fraction is now computed
+        # directly from adjacent record pairs (_raw_zero_delta_fraction),
+        # independent of that coalescing, so it reports the true 1/3.
+        # max_raw_rate_ratio is unaffected by this fix -- it legitimately is
+        # built from the coalesced raw intervals, not individual gaps -- so
+        # it still measures the fastest raw interval running at 2x the
+        # overall rate.
         records = [
             _HistoryRecord(0.0, None, "claude", "short", 96.0),
             _HistoryRecord(60.0, None, "claude", "short", 96.0),
@@ -866,8 +882,12 @@ class BurnRateTests(unittest.TestCase):
 
         # The folded view has no zero-delta interval at all -- sourcing
         # zero_delta_fraction from folded_deltas would report 0.0, not the
-        # true 0.5.
+        # true 1/3.
         self.assertNotIn(0.0, folded_deltas)
+        # The coalesced raw-interval view still merges the sub-microsecond
+        # gap into its neighbor (two measured intervals, one zero-delta) --
+        # this is exactly the intermediate representation that must NOT be
+        # what zero_delta_fraction is computed from.
         self.assertEqual(raw_deltas.count(0.0), 1)
         self.assertEqual(len(raw_deltas), 2)
 
@@ -881,8 +901,121 @@ class BurnRateTests(unittest.TestCase):
         self.assertEqual(measurements.intervals_used, 2)
         self._assertClose(measurements.effective_intervals, 2.0)
 
-        self._assertClose(measurements.zero_delta_fraction, 0.5)
+        self._assertClose(measurements.zero_delta_fraction, 1.0 / 3.0)
         self._assertClose(measurements.max_raw_rate_ratio, 2.0)
+
+    def test_max_raw_rate_ratio_never_reports_below_its_documented_floor(
+        self,
+    ) -> None:
+        # (MEDIUM finding, round 9) The input straight from the finding:
+        # [(0,0),(227.5307793480892,0.00011422248629255103),
+        # (90941578.55322355,45.65348582499713)] computes a raw ratio of
+        # 0.9999999999999998 before clamping -- a hair under the documented
+        # ">= 1.0" floor, from the two divisions (the per-interval rate and
+        # the overall rate) rounding independently, not from any interval
+        # genuinely running slower than the segment's average. Asserting
+        # exactly 1.0 (not merely ">= 1.0" or "close to 1.0") is the point:
+        # a >= assertion would have passed even on the un-clamped
+        # 0.9999999999999998, which is exactly the vacuous-test failure
+        # mode this file has been warned about across multiple rounds.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 0.0),
+            _HistoryRecord(
+                227.5307793480892,
+                None,
+                "claude",
+                "short",
+                0.00011422248629255103,
+            ),
+            _HistoryRecord(
+                90941578.55322355, None, "claude", "short", 45.65348582499713
+            ),
+        ]
+
+        measurements = _interval_measurements(records)
+
+        assert measurements is not None
+        self.assertEqual(measurements.max_raw_rate_ratio, 1.0)
+
+    def test_longest_above_overall_rate_run_separates_clustered_from_alternating_burn(
+        self,
+    ) -> None:
+        # (MEDIUM finding, round 9) The finding's exact counterexample:
+        # series A (60-second deltas [10,10,1,1,10,10,1,1], clustered) and
+        # series B ([10,1,10,1,10,1,10,1], the same eight deltas strictly
+        # alternating) produce IDENTICAL values on every one of the seven
+        # pre-round-9 measurements, the fitted rate, and the exhaustion
+        # time -- proven below -- because all seven are order-blind (a max,
+        # a median, a sum, or a sum of squares over the same multiset of
+        # rates). longest_above_overall_rate_run is the one field built to
+        # look at order, and it is the only field where A and B disagree:
+        # A's two "10" deltas each come in an adjacent pair (two runs of
+        # length 2), B's four "10" deltas are never adjacent to each other
+        # (every run has length 1).
+        def build(deltas: list[float]) -> list[_HistoryRecord]:
+            records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+            elapsed = 0.0
+            usage = 0.0
+            for delta in deltas:
+                elapsed += 60.0
+                usage += delta
+                records.append(_HistoryRecord(elapsed, None, "claude", "short", usage))
+            return records
+
+        series_a = build([10.0, 10.0, 1.0, 1.0, 10.0, 10.0, 1.0, 1.0])
+        series_b = build([10.0, 1.0, 10.0, 1.0, 10.0, 1.0, 10.0, 1.0])
+
+        measurements_a = _interval_measurements(series_a)
+        measurements_b = _interval_measurements(series_b)
+        assert measurements_a is not None
+        assert measurements_b is not None
+
+        # All seven pre-round-9 fields agree exactly between A and B --
+        # this is the order-blindness the finding demonstrated, confirmed
+        # here so the comparison below is meaningful.
+        self.assertEqual(
+            measurements_a.max_relative_deviation, measurements_b.max_relative_deviation
+        )
+        self.assertEqual(measurements_a.max_usage_share, measurements_b.max_usage_share)
+        self.assertEqual(measurements_a.intervals_used, measurements_b.intervals_used)
+        self.assertEqual(measurements_a.rate_drift, measurements_b.rate_drift)
+        self.assertEqual(
+            measurements_a.effective_intervals, measurements_b.effective_intervals
+        )
+        self.assertEqual(
+            measurements_a.zero_delta_fraction, measurements_b.zero_delta_fraction
+        )
+        self.assertEqual(
+            measurements_a.max_raw_rate_ratio, measurements_b.max_raw_rate_ratio
+        )
+
+        # The fitted rate and exhaustion time agree too -- the whole
+        # projection, not just the diagnostics, is order-blind without this
+        # field.
+        projection_a = _project_group(
+            ("claude", "short"), series_a, series_a[-1].captured_at + 1.0
+        )
+        projection_b = _project_group(
+            ("claude", "short"), series_b, series_b[-1].captured_at + 1.0
+        )
+        self.assertEqual(
+            projection_a.rate_percent_per_second, projection_b.rate_percent_per_second
+        )
+        self.assertEqual(
+            projection_a.projected_exhaustion_at, projection_b.projected_exhaustion_at
+        )
+
+        # The new field is where A and B stop looking alike.
+        self.assertEqual(measurements_a.longest_above_overall_rate_run, 2)
+        self.assertEqual(measurements_b.longest_above_overall_rate_run, 1)
+        self.assertEqual(
+            projection_a.longest_above_overall_rate_run,
+            measurements_a.longest_above_overall_rate_run,
+        )
+        self.assertEqual(
+            projection_b.longest_above_overall_rate_run,
+            measurements_b.longest_above_overall_rate_run,
+        )
 
     def test_usage_is_conserved_across_folded_and_raw_intervals(self) -> None:
         # (HIGH finding, round 6, method requirement) Whatever folding or
@@ -931,17 +1064,14 @@ class BurnRateTests(unittest.TestCase):
         long_zero_run.append(_HistoryRecord(elapsed, None, "claude", "short", 100.0))
         fixtures.append(long_zero_run)
 
-        # (HIGH finding, round 7) The terminal case the round-6 conservation
-        # test missed: the segment's very LAST gap is sub-microsecond, so
-        # there is no following gap to carry its delta forward into. An
-        # earlier version of this fix dropped it outright, reporting
-        # deltas summing to 10 while the segment's true total is 11.
-        terminal_sub_microsecond = [
-            _HistoryRecord(0.0, None, "claude", "short", 0.0),
-            _HistoryRecord(60.0, None, "claude", "short", 10.0),
-            _HistoryRecord(60.0000005, None, "claude", "short", 11.0),
-        ]
-        fixtures.append(terminal_sub_microsecond)
+        # A segment whose very LAST gap is sub-microsecond (no following gap
+        # to carry its delta into) is deliberately NOT included in this
+        # conservation loop as of round 9: it no longer returns a
+        # conserved-but-smeared triple, it raises
+        # _TerminalRemainderUnmergeable instead (see
+        # test_terminal_sub_microsecond_interval_declines_rather_than_
+        # merges_backward below). Conservation only has something to check
+        # when a triple is actually returned.
 
         for records in fixtures:
             expected_total = records[-1].used_percentage - records[0].used_percentage
@@ -995,49 +1125,41 @@ class BurnRateTests(unittest.TestCase):
         self._assertClose(measurements.max_relative_deviation, 0.7979797979797981)
         self._assertClose(measurements.max_usage_share, 0.898989898989899)
 
-    def test_terminal_sub_microsecond_interval_merges_backward_not_dropped(
+    def test_terminal_sub_microsecond_interval_declines_rather_than_merges_backward(
         self,
     ) -> None:
-        # (HIGH finding, round 7) The input straight from the finding: the
-        # segment's LAST gap, not an interior one, is sub-microsecond --
-        # (60, 10) -> (60.0000005, 11) is a 1-point jump over ~5e-7s. Unlike
-        # the interior case above, there is no following gap to carry this
-        # delta forward into. The pre-fix code simply dropped it: the
-        # accumulator held a nonzero delta when the loop ended and was
-        # discarded unflushed, so both the folded and raw views reported
-        # deltas summing to 10 while the segment's true total usage change
-        # is 11 -- silently broken conservation on a successful projection.
-        #
-        # The fix folds the leftover BACKWARD into the last already-
-        # measured interval (the only interval that exists here, from the
-        # very first gap) instead of dropping it: one merged interval
-        # covering the full 60.0000005s span with the full 11.0-point
-        # delta, not two.
+        # (HIGH finding, round 9) The segment's LAST gap, not an interior
+        # one, is sub-microsecond -- (60, 10) -> (60.0000005, 11) is a
+        # 1-point jump over ~5e-7s. There is no following gap to carry this
+        # delta forward into. Two earlier fixes got this wrong in two
+        # different ways: an original version dropped the remainder
+        # outright (broken conservation -- reported deltas summed to 10
+        # while the true total is 11); a round-7 fix instead merged it
+        # BACKWARD into the preceding interval, which fixed conservation
+        # but invented a rate that interval never actually ran at (round 9
+        # found the catastrophic version of this: see the test below).
+        # Neither is correct. This asserts the current, correct behavior:
+        # both views raise _TerminalRemainderUnmergeable rather than
+        # returning any triple at all.
         records = [
             _HistoryRecord(0.0, None, "claude", "short", 0.0),
             _HistoryRecord(60.0, None, "claude", "short", 10.0),
             _HistoryRecord(60.0000005, None, "claude", "short", 11.0),
         ]
 
-        folded_rates, folded_deltas, folded_elapsed = _folded_intervals(records)
-        raw_rates, raw_deltas, raw_elapsed = _raw_intervals(records)
+        with self.assertRaises(_TerminalRemainderUnmergeable):
+            _folded_intervals(records)
+        with self.assertRaises(_TerminalRemainderUnmergeable):
+            _raw_intervals(records)
 
-        # One interval, not two: the terminal remainder had nowhere to
-        # stand on its own, so it was absorbed into the interval before it
-        # rather than reported (or dropped) separately.
-        self.assertEqual(len(folded_deltas), 1)
-        self.assertEqual(len(raw_deltas), 1)
-        self._assertClose(folded_deltas[0], 11.0)
-        self._assertClose(raw_deltas[0], 11.0)
-        self._assertClose(folded_elapsed[0], 60.0000005)
-        self._assertClose(raw_elapsed[0], 60.0000005)
-        self.assertAlmostEqual(sum(folded_deltas), 11.0)
-        self.assertAlmostEqual(sum(raw_deltas), 11.0)
-
-        # The whole projection must still succeed end to end (this is not a
-        # decline case -- the data is perfectly good evidence, just
-        # unevenly split across a too-short final gap), with the
-        # conservation-correct measurements reaching the caller.
+        # End to end: project_exhaustion must decline with the distinct new
+        # reason, not silently drop the remainder (the caller is told, via
+        # `reason`) and not report a projection built on a fabricated rate.
+        # Asserting the exact reason and that every measurement field is
+        # None -- not just that "something" changed -- is the method
+        # requirement: a vacuous version of this test (e.g. only checking
+        # `projection.reason is not None`) would still pass if the decline
+        # fell through to the wrong reason.
         projection = self._project(
             [
                 self._record(0.0, 0.0),
@@ -1046,10 +1168,41 @@ class BurnRateTests(unittest.TestCase):
             ],
             now=61.0,
         )[0]
-        self.assertIsNone(projection.reason)
-        self.assertIsNotNone(projection.projected_exhaustion_at)
-        self.assertEqual(projection.intervals_used, 1)
-        self._assertClose(projection.max_usage_share, 1.0)
+        self.assertEqual(
+            projection.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertIsNone(projection.projected_exhaustion_at)
+        self._assertNoMeasurements(projection)
+
+    def test_terminal_sub_microsecond_burst_no_longer_reports_as_perfectly_steady(
+        self,
+    ) -> None:
+        # (HIGH finding, round 9) The finding's exact input: [(0,0),(60,1),
+        # (60.0000005,99)]. The segment's true story is a catastrophic
+        # ~196,000,000 %/s terminal jump (98 points over ~5e-7s) -- but the
+        # round-7 backward-merge fix smeared that jump across the preceding
+        # 60-second interval, reporting max_relative_deviation=0.0 and
+        # max_raw_rate_ratio=1.0: the tool claiming perfectly steady usage
+        # for data that was anything but. Declining is the correct outcome
+        # here, not a number that contradicts what the data showed.
+        projection = self._project(
+            [
+                self._record(0.0, 0.0),
+                self._record(60.0, 1.0),
+                self._record(60.0000005, 99.0),
+            ],
+            now=61.0,
+        )[0]
+        self.assertEqual(
+            projection.reason, NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE
+        )
+        self.assertIsNone(projection.projected_exhaustion_at)
+        self._assertNoMeasurements(projection)
+        # The specific old lie this replaces: neither field may report the
+        # smoothed-over "nothing happened" values the backward merge used
+        # to produce.
+        self.assertIsNone(projection.max_relative_deviation)
+        self.assertIsNone(projection.max_raw_rate_ratio)
 
     def test_positive_delta_underflowing_to_zero_rate_is_declined(self) -> None:
         # (MEDIUM finding, round 6) Disproves the old docstring claim that a

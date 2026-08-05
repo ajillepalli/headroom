@@ -49,6 +49,7 @@ class NoProjectionReason(str, Enum):
     NON_FINITE_RESULT = "non_finite_result"
     PROJECTED_EXHAUSTION_IN_PAST = "projected_exhaustion_in_past"
     RATE_UNDERFLOWED_TO_ZERO = "rate_underflowed_to_zero"
+    TERMINAL_REMAINDER_UNMERGEABLE = "terminal_remainder_unmergeable"
 
 
 @dataclass(frozen=True)
@@ -198,15 +199,28 @@ class BurnRateProjection:
     underlying rate is steady or bursty -- a quantized-steady series and a
     quantized burst can report the same fraction of zero-delta gaps -- which
     is exactly why it is reported alongside, not instead of,
-    ``max_raw_rate_ratio``, rather than relied on by itself.
+    ``max_raw_rate_ratio``, rather than relied on by itself. It is computed
+    directly from every adjacent pair of records (see
+    ``_raw_zero_delta_fraction``), independent of the elapsed-time
+    carry-forward and folding ``_consecutive_intervals`` applies when
+    building measurement intervals -- it is a property of the raw captures,
+    not of any interval those captures get grouped into.
 
     ``max_raw_rate_ratio`` is the largest single raw interval's rate,
     divided by the segment's OVERALL rate (total usage delta over total
     elapsed time -- the rate the segment would report if treated as one
     interval start to finish). Because the overall rate is the
     elapsed-time-weighted average of every raw interval's rate, this ratio
-    is always >= 1.0, with equality only when every raw interval runs at
-    exactly the same rate. LOW (near 1.0) means no single raw interval ran
+    is mathematically always >= 1.0, with equality only when every raw
+    interval runs at exactly the same rate -- but that holds for the exact
+    real-number ratio, not for what floating-point division actually
+    computes. Two divisions (the per-interval rate and the overall rate)
+    each round independently, and an ordinary-looking input can land the
+    computed ratio a hair under 1.0 (e.g. 0.9999999999999998) even though
+    no interval genuinely ran slower than the segment's average. The
+    reported value is clamped to 1.0 from below to keep the field's
+    documented floor honest in float, not just in the real numbers it
+    approximates. LOW (near 1.0) means no single raw interval ran
     meaningfully faster than the segment's overall pace -- consistent with a
     genuinely steady rate, quantized or not. HIGH means one raw interval's
     rate hugely exceeds the segment average: the signature of a genuine
@@ -217,14 +231,54 @@ class BurnRateProjection:
     a high ``max_raw_rate_ratio`` is looking at a burst folding smoothed
     over, not a genuinely steady rate.
 
-    Both fields are computed over the raw (unfolded) view: every gap
-    between consecutive captures is its own interval, zero-delta gaps
-    included, except that a gap whose own accumulated elapsed time is below
-    MIN_INTERVAL_SECONDS is still carried forward (see
-    ``_consecutive_intervals``) rather than divided into float noise. Both
-    are None exactly when no projection was made (``reason`` is set), same
-    as the five folded fields; a projection with measurements always has
-    both.
+    ``max_raw_rate_ratio`` is computed over the raw (unfolded) INTERVAL
+    view: every gap between consecutive captures is its own interval,
+    zero-delta gaps included, except that a gap whose own accumulated
+    elapsed time is below MIN_INTERVAL_SECONDS is still carried forward
+    (see ``_consecutive_intervals``) rather than divided into float noise.
+    ``zero_delta_fraction`` deliberately does NOT go through that same
+    interval-building step -- it is measured directly from raw adjacent
+    RECORD pairs (see ``_raw_zero_delta_fraction``), because the
+    elapsed-time carry-forward can coalesce a sub-threshold gap into a
+    neighbor and change how many zero-delta gaps a per-interval count would
+    see. All three raw fields (``zero_delta_fraction``,
+    ``max_raw_rate_ratio``, and ``longest_above_overall_rate_run`` below)
+    are still None exactly when no projection was made (``reason`` is
+    set), same as the five folded fields; a projection with measurements
+    always has all three.
+
+    ``longest_above_overall_rate_run`` is the length of the longest run of
+    CONSECUTIVE raw intervals (same raw view as ``max_raw_rate_ratio``)
+    whose individual rate exceeds the segment's overall rate. Every field
+    above is order-blind: computing any of them on a shuffled copy of the
+    same intervals gives the same answer, because each is a max, a median,
+    a sum, or a sum of squares -- none of them look at WHICH interval comes
+    next to which. Two segments with the same interval rates in a different
+    order are therefore invisible to all seven, even when the order is the
+    entire story: a clustered burn pattern (several fast intervals in a row,
+    then several slow ones) points at a specific contiguous window of heavy
+    use, while the same rates strictly alternating fast/slow spread that
+    same total usage evenly across the whole segment. This field is the one
+    exception -- it is a property of the SEQUENCE, not just the multiset, of
+    rates. HIGH means the segment had a sustained run of above-average
+    intervals in a row (a burst with duration, not just magnitude); LOW
+    (0 or 1) means no two above-average intervals were ever adjacent, no
+    matter how many there were in total. It is always a non-negative
+    integer, 0 when no interval exceeds the overall rate (impossible in
+    practice once ``max_raw_rate_ratio`` > 1.0, since that means at least
+    one interval exceeds it) up to ``intervals_used``-many raw intervals
+    when every single one does.
+
+    These eight fields, and the module as a whole, report summary
+    statistics computed from a segment's captures -- they do not, and
+    cannot, capture everything about the underlying series. For any finite
+    set of summary numbers there exist two materially different histories
+    that agree on every one of them: adding ``longest_above_overall_rate_run``
+    closed the specific order-blindness gap found in round 9, not every
+    possible gap. A caller that needs to distinguish two series these
+    fields agree on has to read the underlying history itself; no
+    additional summary statistic closes that for every possible pair of
+    series, only for the ones it was specifically built to catch.
     """
 
     source: str
@@ -242,6 +296,7 @@ class BurnRateProjection:
     effective_intervals: Optional[float] = None
     zero_delta_fraction: Optional[float] = None
     max_raw_rate_ratio: Optional[float] = None
+    longest_above_overall_rate_run: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -483,6 +538,15 @@ def _project_group(
         # trivial agreement. See BurnRateProjection's max_relative_deviation
         # docstring for why this is a fact about the data, not a policy call.
         return unavailable(NoProjectionReason.RATE_UNDERFLOWED_TO_ZERO, rate)
+    except _TerminalRemainderUnmergeable:
+        # The segment's final gap left a nonzero usage delta with no
+        # interval to honestly attach it to: too short to stand alone, and
+        # merging it into the preceding interval would smear its rate away
+        # (see _consecutive_intervals's docstring and
+        # _TerminalRemainderUnmergeable). This is not usage silently
+        # dropped -- the caller is told via this distinct reason -- and it
+        # is not a fabricated rate either. Declining is the honest outcome.
+        return unavailable(NoProjectionReason.TERMINAL_REMAINDER_UNMERGEABLE, rate)
     if measurements is None:
         # Structurally unreachable in practice (see _interval_measurements),
         # but if it ever is reached, a non-finite diagnostic must not leak
@@ -507,6 +571,7 @@ def _project_group(
         effective_intervals=measurements.effective_intervals,
         zero_delta_fraction=measurements.zero_delta_fraction,
         max_raw_rate_ratio=measurements.max_raw_rate_ratio,
+        longest_above_overall_rate_run=measurements.longest_above_overall_rate_run,
     )
 
 
@@ -534,9 +599,19 @@ class _RateUnderflowedToZero(Exception):
     """
 
 
+class _TerminalRemainderUnmergeable(Exception):
+    """A segment's final gap left a nonzero usage delta with no interval to
+    attach it to.
+
+    Raised by ``_consecutive_intervals`` -- see that function's docstring for
+    why the remainder cannot stand as its own interval, cannot be merged
+    forward (there is no next gap), and must not be merged backward either.
+    """
+
+
 @dataclass(frozen=True)
 class _IntervalMeasurements:
-    """The seven diagnostic numbers (five folded, two raw structural)
+    """The eight diagnostic numbers (five folded, three raw structural)
     reported alongside a successful projection. See BurnRateProjection's
     docstring for what each one means and why both views are reported.
     """
@@ -548,6 +623,7 @@ class _IntervalMeasurements:
     effective_intervals: float
     zero_delta_fraction: float
     max_raw_rate_ratio: float
+    longest_above_overall_rate_run: int
 
 
 def _consecutive_intervals(
@@ -610,19 +686,23 @@ def _consecutive_intervals(
     e.g. records ending [...,(60, 10), (60.0000005, 11)], where the final
     gap's ~5e-7s never clears the threshold and there is no further gap
     left to carry it forward into. Every other carry-forward case in this
-    function has a "next" interval to fold into; this one does not, and an
+    function has a "next" interval to fold into; this one does not. An
     earlier version of this function simply dropped it, which silently
     broke usage conservation (the segment's reported deltas summed to less
-    than its actual total usage change). The fix folds it BACKWARD into the
-    last already-measured interval instead of forward: widening that
-    interval's own delta and elapsed time by the leftover amounts and
-    recomputing its rate. That is the conservation-preserving choice that
-    invents nothing -- it is the same "merge a too-short gap into a real
-    interval" operation used everywhere else in this function, just run in
-    the only direction available at the end of a segment. A trailing
-    accumulator whose leftover delta is exactly zero needs no such fix: it
-    contributes nothing to the usage total either way, so it can still be
-    dropped cleanly the same as before.
+    than its actual total usage change); a later version folded it
+    BACKWARD into the last already-measured interval instead, which fixed
+    conservation but broke something worse: merging a fast terminal
+    remainder into a slow preceding interval smears its rate across a span
+    it never actually ran at, which can hide a genuine burst entirely (see
+    ``_TerminalRemainderUnmergeable``'s docstring for the disproof case).
+    Both the drop and the backward merge invent an answer the data does not
+    support -- dropping invents "this usage never happened" and merging
+    invents "this usage happened at the previous interval's pace." Neither
+    is true, so ``_TerminalRemainderUnmergeable`` is raised instead: the
+    caller declines the whole projection rather than report a number built
+    on either invention. A trailing accumulator whose leftover delta is
+    exactly zero needs no such handling: it contributes nothing to the
+    usage total either way, so it is still dropped cleanly, same as before.
     """
 
     rates: List[float] = []
@@ -654,39 +734,32 @@ def _consecutive_intervals(
 
     if accumulated_delta != 0.0:
         # See the docstring above: this is the terminal remainder, real
-        # usage with no following gap to carry it into. Fold it backward
-        # into the last measured interval so it is not silently dropped.
-        if rates:
-            deltas[-1] += accumulated_delta
-            elapsed_list[-1] += accumulated_elapsed
-            merged_rate = deltas[-1] / elapsed_list[-1]
-            if merged_rate == 0.0:
-                # deltas[-1] is strictly positive after the merge (it is a
-                # non-negative prior value plus a strictly positive
-                # accumulated_delta, since usage never decreases within a
-                # segment), so a zero merged_rate here is the same
-                # underflow-not-genuine-zero failure the loop above already
-                # guards against, not trivial agreement.
-                raise _RateUnderflowedToZero(
-                    f"terminal delta {accumulated_delta!r} merged into the "
-                    "previous interval underflowed its rate to zero"
-                )
-            rates[-1] = merged_rate
-        else:
-            # No previous interval exists to merge into. Structurally
-            # unreachable through project_exhaustion: _project_group only
-            # reaches this function after MIN_SPAN_SECONDS (>=60s of total
-            # span) and FLAT_USAGE (a nonzero total delta) have both been
-            # established, which together guarantee at least one interval
-            # flushes in the loop above before any trailing sub-threshold
-            # remainder could appear. Declined rather than assumed away, in
-            # case a future direct caller reaches this function with
-            # unsegmented or single-gap input.
-            raise _RateUnderflowedToZero(
-                f"terminal delta {accumulated_delta!r} over "
-                f"{accumulated_elapsed!r}s has no prior interval to merge "
-                "into"
-            )
+        # usage with no following gap to carry it into. A round-7 fix folded
+        # it BACKWARD into the last measured interval on the theory that
+        # merging is the same "carry a too-short gap into a real interval"
+        # operation used everywhere else in this function. Round 9 disproved
+        # that: merging backward doesn't just relocate the remainder, it
+        # SMEARS its rate across the preceding interval's whole span,
+        # erasing the evidence that a fast (possibly catastrophic) jump
+        # happened at all. [(0,0),(60,1),(60.0000005,99)] backward-merges a
+        # ~196,000,000 %/s terminal jump into the preceding minute and
+        # reports a perfectly steady interval -- the tool lying about what
+        # the data showed, which is worse than declining. The remainder's
+        # usage is real and its elapsed time is real, but there is no
+        # interval-sized bucket the two can honestly share: not the
+        # too-short remainder itself (dividing by ~microseconds is float
+        # noise, not evidence), and not the previous interval (its own rate
+        # was measured over its own span, not this one). So this declines
+        # instead of inventing a number either way -- distinct from
+        # dropping the remainder (which the caller would never learn about)
+        # and distinct from the ordinary _RateUnderflowedToZero case (a
+        # rate that IS representable as a number, just not as a nonzero
+        # one).
+        raise _TerminalRemainderUnmergeable(
+            f"terminal delta {accumulated_delta!r} over "
+            f"{accumulated_elapsed!r}s has no interval to merge into and "
+            "cannot stand as its own interval"
+        )
 
     return rates, deltas, elapsed_list
 
@@ -856,20 +929,94 @@ def _measure_view(
 
 @dataclass(frozen=True)
 class _RawStructuralMeasurements:
-    """The two raw (never zero-delta-folded) structural numbers. See
+    """The three raw (never zero-delta-folded) structural numbers. See
     BurnRateProjection's docstring for what each one means and why the
     folded fields cannot substitute for them.
     """
 
     zero_delta_fraction: float
     max_raw_rate_ratio: float
+    longest_above_overall_rate_run: int
+
+
+def _raw_zero_delta_fraction(records: List[_HistoryRecord]) -> float:
+    """Fraction of raw adjacent-capture gaps whose usage delta is exactly
+    zero, computed directly from consecutive record pairs.
+
+    This is deliberately NOT derived from ``_raw_intervals``'s deltas.
+    ``_consecutive_intervals`` unconditionally carries a gap's elapsed time
+    (and delta) forward whenever the ACCUMULATED elapsed time is still below
+    MIN_INTERVAL_SECONDS -- that carry-forward applies regardless of
+    ``fold_zero_delta`` (see its docstring), so a sub-microsecond gap gets
+    coalesced into its neighbor even in the "raw" view. [(0,96),(60,96),
+    (60.0000005,97),(120,98)] has one zero-delta gap among three raw
+    capture-to-capture gaps (1/3), but the coalesced view merges the
+    sub-microsecond (60,96)->(60.0000005,97) gap into a neighbor and reports
+    0.5. ``zero_delta_fraction`` is documented as a property of the raw
+    captures ("how quantized is this data"), not of the measurement
+    intervals folding or coalescing produces, so it is measured here
+    independently of both.
+    """
+
+    gap_count = len(records) - 1
+    if gap_count <= 0:
+        # A single-record segment has no gap to measure. Unreachable through
+        # project_exhaustion (MIN_SAMPLES requires at least 3 records), but
+        # guarded rather than left to divide by zero for a future direct
+        # caller.
+        return 0.0
+    zero_gaps = sum(
+        1
+        for previous, current in zip(records, records[1:])
+        if current.used_percentage == previous.used_percentage
+    )
+    return zero_gaps / gap_count
+
+
+def _longest_above_overall_rate_run(rates: List[float], overall_rate: float) -> int:
+    """Longest run of consecutive raw intervals whose rate strictly exceeds
+    ``overall_rate``.
+
+    (MEDIUM finding, round 9) Every other measurement in this module is
+    order-blind: a max, a median, a sum, or a sum of squares over the
+    interval rates gives the same answer no matter what order the intervals
+    came in, so two segments with the same rates in a different order are
+    indistinguishable to all of them. Concretely, 60-second deltas
+    [10,10,1,1,10,10,1,1] (two clusters of fast intervals) and
+    [10,1,10,1,10,1,10,1] (the same eight rates, strictly alternating)
+    produce identical values for every one of the seven measurements above,
+    the fitted rate, and the exhaustion time -- yet they describe different
+    burn patterns: one has a sustained burst, the other spreads the same
+    total usage evenly across the whole segment.
+
+    This field is the one exception, by construction: it walks the
+    intervals IN ORDER and counts the longest streak of adjacent intervals
+    each running faster than the segment's overall pace. The clustered
+    series above scores 2 (each pair of adjacent "10"s); the alternating
+    series scores 1 (no "10" is ever next to another "10"). That is the
+    only additional measurement this module adds for order-sensitivity --
+    see BurnRateProjection's docstring for why one field is the deliberate
+    stopping point, not the start of an unbounded search for the next
+    counterexample.
+    """
+
+    longest = 0
+    current = 0
+    for rate in rates:
+        if rate > overall_rate:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
 
 
 def _measure_raw_structure(
     records: List[_HistoryRecord],
 ) -> Optional[_RawStructuralMeasurements]:
     """Reduce the raw (unfolded) view of a segment's intervals to
-    ``zero_delta_fraction`` and ``max_raw_rate_ratio``.
+    ``zero_delta_fraction``, ``max_raw_rate_ratio``, and
+    ``longest_above_overall_rate_run``.
 
     This replaced a five-field raw mirror of the folded summary numbers
     (built by running the raw triples through ``_measure_view``, the same
@@ -877,7 +1024,7 @@ def _measure_raw_structure(
     that mirror did not discriminate a quantized-steady series from a
     genuine burst -- both saturate ``_measure_view``'s median-based
     deviation at 1.0 the moment the raw view contains any zero-delta gap,
-    which real data always does. These two numbers are computed directly
+    which real data always does. These numbers are computed directly
     instead, without ever taking a median of the raw rates.
 
     May raise _RateUnderflowedToZero -- from ``_raw_intervals`` itself (a
@@ -899,7 +1046,7 @@ def _measure_raw_structure(
         # crash from max()/sum() on empty input.
         return None
 
-    zero_delta_fraction = sum(1 for delta in deltas if delta == 0.0) / len(deltas)
+    zero_delta_fraction = _raw_zero_delta_fraction(records)
 
     # The overall rate is the elapsed-time-weighted average of every raw
     # interval's rate: sum(delta)/sum(elapsed) == sum(rate*elapsed)/sum(elapsed).
@@ -926,15 +1073,32 @@ def _measure_raw_structure(
             "underflowed to a zero overall rate"
         )
 
-    max_raw_rate_ratio = max(rates) / overall_rate
+    # This ratio is >= 1.0 mathematically (the overall rate is the
+    # elapsed-time-weighted AVERAGE of the per-interval rates, so no single
+    # rate can be below it without another being above it enough to
+    # compensate, and max() picks the largest). But float division does not
+    # honor that exactly: [(0,0),(227.5307793480892,0.00011422248629255103),
+    # (90941578.55322355,45.65348582499713)] computes 0.9999999999999998,
+    # a hair under 1.0, from ordinary rounding in the two divisions (the
+    # per-interval rate and the overall rate) rather than any real interval
+    # running slower than the segment's average. Clamping to the
+    # mathematical floor here is honest -- it is not manufacturing evidence,
+    # it is refusing to let a rounding artifact contradict a fact the
+    # numbers themselves proved -- unlike, say, clamping a genuinely
+    # ambiguous measurement to a convenient value.
+    max_raw_rate_ratio = max(1.0, max(rates) / overall_rate)
+    longest_above_overall_rate_run = _longest_above_overall_rate_run(rates, overall_rate)
     if not math.isfinite(zero_delta_fraction) or not math.isfinite(max_raw_rate_ratio):
         # Never let a non-finite diagnostic escape, matching every other
-        # finiteness gate in this module.
+        # finiteness gate in this module. longest_above_overall_rate_run is
+        # a plain non-negative integer count, not a division result, so it
+        # has no non-finite case to guard against.
         return None
 
     return _RawStructuralMeasurements(
         zero_delta_fraction=zero_delta_fraction,
         max_raw_rate_ratio=max_raw_rate_ratio,
+        longest_above_overall_rate_run=longest_above_overall_rate_run,
     )
 
 
@@ -942,15 +1106,15 @@ def _interval_measurements(
     records: List[_HistoryRecord],
 ) -> Optional[_IntervalMeasurements]:
     """Measure how consistent the segment's intervals are: five folded
-    summary numbers plus two raw structural numbers.
+    summary numbers plus three raw structural numbers.
 
-    See BurnRateProjection's docstring for what each of the seven numbers
+    See BurnRateProjection's docstring for what each of the eight numbers
     means and why the library reports both views instead of collapsing them
-    into a tier. May raise _RateUnderflowedToZero -- see
-    _consecutive_intervals and _measure_raw_structure -- which the caller
-    (_project_group) turns into a declined projection rather than catching
-    here, so it stays distinct from the ordinary "no measurement" None case
-    below.
+    into a tier. May raise _RateUnderflowedToZero or
+    _TerminalRemainderUnmergeable -- see _consecutive_intervals and
+    _measure_raw_structure -- which the caller (_project_group) turns into
+    a declined projection rather than catching here, so those stay distinct
+    from the ordinary "no measurement" None case below.
     """
 
     folded = _measure_view(*_folded_intervals(records))
@@ -966,4 +1130,5 @@ def _interval_measurements(
         effective_intervals=folded.effective_intervals,
         zero_delta_fraction=raw_structure.zero_delta_fraction,
         max_raw_rate_ratio=raw_structure.max_raw_rate_ratio,
+        longest_above_overall_rate_run=raw_structure.longest_above_overall_rate_run,
     )
