@@ -16,6 +16,7 @@ from .claude import parse_stdin
 from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
+from .install_info import format_modified_time, inspect_install, source_commit
 from .render import render_hook, render_report, render_statusline
 from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .severity import Severity
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s {}".format(_installed_version()),
+        version="%(prog)s {}".format(_display_version()),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in (
@@ -77,8 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
 def _installed_version() -> str:
     try:
         return metadata.version("headroom-cli")
-    except metadata.PackageNotFoundError:
+    except Exception:
         return __version__
+
+
+def _display_version() -> str:
+    version = _installed_version()
+    commit = source_commit()
+    return "{} ({})".format(version, commit) if commit else version
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -238,6 +245,13 @@ def _json_document(state: Dict[str, Any], readings: Sequence[Reading]) -> Dict[s
 
 
 def _doctor() -> int:
+    install = inspect_install(_installed_version())
+    print("Install")
+    print("  Path: {}".format(install.path))
+    print("  Mode: {}".format(install.mode))
+    print("  Version: {}".format(install.version))
+    print("  Modified: {}".format(format_modified_time(install.modified_at)))
+    print()
     directory = resolve_state_dir()
     state_path = directory / "state.json"
     state = read_state()

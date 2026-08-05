@@ -12,7 +12,7 @@ headroom COMMAND [OPTIONS]
 
 `headroom -h` and `headroom --help` print top-level help. Every subcommand also accepts `-h` and `--help`. Help exits with status 0. A missing command, an unknown command, or an unrecognized flag is rejected by `argparse` and exits with status 2.
 
-`headroom --version` prints the installed package version and exits with status 0 without requiring a command. When distribution metadata is unavailable, such as when running directly from a source checkout, it prints the package's source version.
+`headroom --version` prints the package version and exits with status 0 without requiring a command. When running from the package directory in a Git checkout, it appends the checkout's short commit hash. It falls back to the plain version when Git metadata is absent or unreadable, or when running from an installed wheel.
 
 ## Commands
 
@@ -22,7 +22,7 @@ headroom COMMAND [OPTIONS]
 | `headroom status` | None | Refreshes Codex through the app-server with rollout fallback, updates state, and prints Claude and Codex short and weekly readings. Missing readings are `unavailable`. |
 | `headroom json` | None | Performs the same Codex refresh as `status`, then prints one compact JSON document containing persisted state, diagnostics, and four bounded readings. |
 | `headroom hook` | Optional Claude Code hook JSON | Performs the same Codex refresh, then emits guidance for the highest actionable severity. A `UserPromptSubmit` payload selects the documented JSON envelope. With no hook payload, output is human-readable text. It emits nothing when all readings are `ok`. |
-| `headroom doctor` | None | Reads current Codex sources without updating state, then reports paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
+| `headroom doctor` | None | Reads current Codex sources without updating state, then reports install provenance, paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
 | `headroom reset` | None | Removes `state.json` and `history.jsonl`. It reports whether anything was removed and leaves other files in the state directory untouched. |
 | `headroom init` | None | Merges the Claude Code statusline and prompt hook into a settings file. See [Installation](howto-install.md). |
 

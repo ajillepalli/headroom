@@ -26,6 +26,14 @@ From the repository root, install an isolated command with uv:
 uv tool install .
 ```
 
+This copies the package into uv's tool environment. Editing the clone afterward does not update that installed command. During development, reinstall after source changes:
+
+```console
+uv tool install . --force
+```
+
+Use `headroom doctor` to confirm the imported package path, install mode, version, and modification time. When running directly from a Git checkout, `headroom --version` also includes the checkout's short commit hash.
+
 For an editable installation, use pip:
 
 ```console

@@ -10,6 +10,18 @@ headroom doctor
 
 It checks the configured state and Codex sources without updating stored snapshots.
 
+## A hook silently produces nothing after a source change
+
+Editing a clone does not update a command previously installed with `uv tool install .`. The installed command is a separate copy and can continue to exit successfully while knowing nothing about the new hook behavior. The typical symptom is a hook that silently produces nothing even though the command exists, exits 0, and reports the expected package version.
+
+Reinstall the command from the repository root after changing the source:
+
+```console
+uv tool install . --force
+```
+
+Then compare `headroom doctor` with `headroom --version`. The `Install` section shows the imported package path, whether it is an installed copy or source checkout, the package version, and the most recent modification time among the loaded headroom modules. A source checkout also includes its short commit hash in `--version`; a wheel install does not.
+
 ## A reading shows unavailable
 
 `unavailable` means no valid snapshot exists for that source and window.
@@ -42,6 +54,10 @@ An accepted reset can be at most the reported window duration plus five minutes 
 
 | Line | Interpretation |
 | --- | --- |
+| `Install / Path` | Resolved path of the imported `headroom` package. Use it to distinguish the command's files from the clone you edited. |
+| `Install / Mode` | `installed` for a copied package or `source` when the imported package is the checkout's top-level `headroom` directory. |
+| `Install / Version` | Package version reported by installed distribution metadata, with the source version as fallback. |
+| `Install / Modified` | Latest modification time, in UTC, among headroom module files loaded by `doctor`. |
 | `State directory` | Directory selected by `HEADROOM_STATE_DIR` or the `~/.headroom` default. |
 | `State file` | Whether `state.json` exists. A corrupt or unreadable file still appears as found but is read as empty state. |
 | `Claude readings` | Stored Claude windows, or `missing`. |

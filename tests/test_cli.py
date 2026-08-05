@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 import io
 from pathlib import Path
 import re
+import tempfile
 import unittest
 from unittest import mock
 
@@ -18,8 +19,20 @@ class CliTests(unittest.TestCase):
         output = io.StringIO()
 
         with mock.patch("headroom.cli.metadata.version", return_value="2.3.4"):
-            with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
-                cli.main(["--version"])
+            with mock.patch("headroom.cli.source_commit", return_value="a1b2c3d"):
+                with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                    cli.main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue(), "headroom 2.3.4 (a1b2c3d)\n")
+
+    def test_version_without_git_metadata_is_plain(self) -> None:
+        output = io.StringIO()
+
+        with mock.patch("headroom.cli.metadata.version", return_value="2.3.4"):
+            with mock.patch("headroom.cli.source_commit", return_value=None):
+                with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                    cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
         self.assertEqual(output.getvalue(), "headroom 2.3.4\n")
@@ -31,12 +44,87 @@ class CliTests(unittest.TestCase):
             "headroom.cli.metadata.version",
             side_effect=cli.metadata.PackageNotFoundError,
         ):
-            with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
-                cli.main(["--version"])
+            with mock.patch("headroom.cli.source_commit", return_value=None):
+                with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                    cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
         self.assertRegex(output.getvalue(), r"^headroom \d+\.\d+\.\d+(?:[^\s]*)?\n$")
         self.assertEqual(output.getvalue(), "headroom {}\n".format(headroom.__version__))
+
+    def test_version_does_not_crash_outside_a_git_repository(self) -> None:
+        from headroom.install_info import source_commit
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "headroom"
+            package.mkdir()
+            (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (root / ".git").mkdir()
+            self.assertIsNone(source_commit(package))
+
+        output = io.StringIO()
+        with mock.patch("headroom.cli.source_commit", return_value=None):
+            with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                cli.main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertTrue(output.getvalue().startswith("headroom "))
+
+    def test_source_commit_reads_head_without_running_git(self) -> None:
+        from headroom.install_info import inspect_install
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "headroom"
+            git = root / ".git"
+            package.mkdir()
+            git.mkdir()
+            (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (git / "HEAD").write_text("0123456789abcdef" * 2 + "01234567\n", encoding="utf-8")
+
+            info = inspect_install("1.2.3", package)
+
+        self.assertEqual(info.mode, "source")
+        self.assertEqual(info.commit, "0123456")
+
+    def test_package_copy_nested_in_checkout_is_installed(self) -> None:
+        from headroom.install_info import inspect_install
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / ".venv" / "site-packages" / "headroom"
+            package.mkdir(parents=True)
+            (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (root / ".git").mkdir()
+
+            info = inspect_install("1.2.3", package)
+
+        self.assertEqual(info.mode, "installed")
+        self.assertIsNone(info.commit)
+
+    def test_doctor_reports_install_path_mode_and_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "HEADROOM_STATE_DIR": directory,
+                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
+                "HEADROOM_CODEX_RPC": "0",
+            }
+            output = io.StringIO()
+            with mock.patch.dict("os.environ", environment, clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["doctor"])
+
+        rendered = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("Install\n", rendered)
+        self.assertIn(
+            "  Path: {}".format(Path(headroom.__file__).resolve().parent),
+            rendered,
+        )
+        self.assertRegex(rendered, r"(?m)^  Mode: (?:installed|source)$")
+        self.assertIn("  Version: {}".format(cli._installed_version()), rendered)
+        self.assertRegex(rendered, r"(?m)^  Modified: .+$")
 
     def test_package_and_project_versions_match(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
