@@ -190,13 +190,26 @@ def _records_since_latest_reset(
 ) -> List[_HistoryRecord]:
     """Return only the records that belong to the current (most recent) window.
 
-    Usage is monotonic non-decreasing within a window, so a decrease in
-    used_percentage IS a reset by definition, whether or not resets_at
-    changed. Many providers never send resets_at at all, so relying solely
-    on resets_at changing misses these unmarked resets and lets a stale,
-    already-reset window donate a huge fake span to the current one. A
-    change in resets_at (with no decrease) still marks a boundary too, since
-    that also signals the provider considers this a different window.
+    True within-window usage is monotone, but reported usage may contain
+    noise. Real readings from this machine oscillate by about a point
+    (57 -> 56 -> 57) at an unchanged resets_at, so a decrease is ambiguous:
+    it may be a reset or a bad measurement. Nothing available distinguishes
+    them. An unchanged resets_at is evidence against a reset, not proof,
+    because it can be stale or captured non-atomically across a boundary,
+    and resets.py only checks that it is numerically plausible. A tolerance
+    band would be worse than useless: observing one-point errors shows such
+    errors occur, not that they are bounded by one point, and any threshold
+    would hide a genuine reset of the same size.
+
+    So every decrease starts a new segment. Keeping pre-decrease records
+    could mix two windows and fabricate evidence, whereas a false boundary
+    costs only availability. A change in resets_at marks a boundary too,
+    since the provider is calling it a different window.
+
+    This knowingly declines to project more often, including on short
+    windows where the jitter above is common. That is the honest outcome:
+    this source does not carry enough information to tell noise from a
+    reset, and inventing the difference is what soundness forbids.
     """
 
     if not records:
