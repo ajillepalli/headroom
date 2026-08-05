@@ -34,6 +34,12 @@ MIN_INTERVAL_SECONDS = 1e-6
 # cap keeps the most RECENT readings in the segment rather than the oldest.
 MAX_FIT_SAMPLES = 500
 
+# Two matching intervals is one coincidence, not a pattern: it is
+# indistinguishable from two readings that happen to agree by chance. HIGH
+# confidence claims the rate is dependably steady, so it needs a third
+# independent interval before that claim is defensible.
+MIN_INTERVALS_FOR_HIGH_CONFIDENCE = 3
+
 
 class ProjectionConfidence(str, Enum):
     """How consistently the history supports the fitted direction."""
@@ -79,6 +85,13 @@ class BurnRateProjection:
       projection could be defended at all. ``projected_exhaustion_at`` is
       None in this case too, so the two None cases are distinguished by
       checking ``reason``, not by re-inspecting ``exhaustion_precedes_reset``.
+
+    ``span_seconds`` is ``Optional`` because the subtraction that produces it
+    (latest capture minus earliest capture) can itself overflow to infinity
+    for pathological epoch timestamps near the float range limit. Rather than
+    let a non-finite span escape to a caller, it is None whenever the true
+    span cannot be represented as a finite float; ``reason`` is then
+    ``NON_FINITE_RESULT``. A non-None ``span_seconds`` is always finite.
     """
 
     source: str
@@ -87,7 +100,7 @@ class BurnRateProjection:
     projected_exhaustion_at: Optional[float]
     exhaustion_precedes_reset: Optional[bool]
     samples_used: int
-    span_seconds: float
+    span_seconds: Optional[float]
     confidence: ProjectionConfidence
     reason: Optional[NoProjectionReason] = None
 
@@ -238,11 +251,21 @@ def _project_group(
 ) -> BurnRateProjection:
     source, window = key
     samples_used = len(records)
-    span_seconds = (
+    raw_span = (
         records[-1].captured_at - records[0].captured_at
         if samples_used > 1
         else 0.0
     )
+    # Validate the span the instant it is produced, not after several early
+    # returns have already had a chance to hand out the raw (possibly
+    # infinite) value. Both endpoints pass _finite_float individually, but
+    # their difference can still overflow: captures near the float range
+    # limit (e.g. -1e308 and 1e308) subtract to inf even though each is
+    # finite on its own. records is sorted by captured_at, so if this total
+    # span is finite, every interior pairwise difference used later is
+    # bounded by it and therefore finite too -- validating once here is
+    # sufficient, not just the first of many checks.
+    span_seconds: Optional[float] = raw_span if math.isfinite(raw_span) else None
 
     def unavailable(
         reason: NoProjectionReason,
@@ -260,6 +283,9 @@ def _project_group(
             confidence=confidence,
             reason=reason,
         )
+
+    if span_seconds is None:
+        return unavailable(NoProjectionReason.NON_FINITE_RESULT)
 
     # A window whose reset time has already passed is over; whatever usage
     # it last reported says nothing about the window in effect now. This is
@@ -356,13 +382,28 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
     near-flat usage previously scored HIGH confidence). Instead this looks at
     consecutive, non-overlapping intervals (independent evidence, unlike the
     combinatorial pairwise slopes used for the rate itself) and measures how
-    much they disagree: the weighted mean absolute deviation from the median
-    interval rate, normalized by that median. Deviations are weighted by
-    recency (oldest interval weight 1, newest weight N) because a burst in
-    the most recent interval is exactly what would corrupt a near-term
-    projection, and an unweighted median-based spread can hide a single
-    outlier sitting at either end of an odd-length list (median absolute
-    deviation collapses to 0 when the outlier is not itself the median).
+    much they disagree: the mean absolute deviation from the median interval
+    rate, normalized by that median, computed two ways and combined.
+
+    Recency weighting (oldest interval weight 1, newest weight N) matters
+    because a burst in the most recent interval is exactly what would
+    corrupt a near-term projection. But recency weighting alone can also
+    dilute a single wildly deviant interval into irrelevance purely because
+    of where it sits in the sequence: 500 one-second readings where the
+    FIRST interval carries half the entire quota still scored a
+    recency-weighted dispersion of ~0.004 (HIGH) because that interval's
+    weight of 1 was swamped by 499 agreeing neighbors weighted up to 499.
+    An unweighted (equal-weight) mean absolute deviation acts as a veto
+    against exactly that: it cannot be diluted by position, so a single
+    interval that disagrees sharply with the rest keeps its full statistical
+    weight regardless of whether it is oldest or newest. Taking the WORSE
+    (larger) of the weighted and unweighted ratios means either kind of
+    inconsistency -- a recent burst or a single buried outlier -- can veto
+    HIGH confidence.
+
+    HIGH additionally requires at least MIN_INTERVALS_FOR_HIGH_CONFIDENCE
+    independent intervals: two intervals agreeing is one coincidence, not a
+    demonstrated pattern, and is indistinguishable from chance agreement.
     """
 
     intervals = []
@@ -387,12 +428,20 @@ def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfiden
 
     weighted_deviation = 0.0
     weight_total = 0.0
+    unweighted_deviation = 0.0
     for rank, rate in enumerate(intervals, start=1):
-        weighted_deviation += rank * abs(rate - center)
+        deviation = abs(rate - center)
+        weighted_deviation += rank * deviation
         weight_total += rank
-    dispersion_ratio = (weighted_deviation / weight_total) / abs(center)
+        unweighted_deviation += deviation
+    weighted_ratio = (weighted_deviation / weight_total) / abs(center)
+    unweighted_ratio = (unweighted_deviation / len(intervals)) / abs(center)
+    dispersion_ratio = max(weighted_ratio, unweighted_ratio)
 
-    if dispersion_ratio <= 0.25:
+    if (
+        len(intervals) >= MIN_INTERVALS_FOR_HIGH_CONFIDENCE
+        and dispersion_ratio <= 0.25
+    ):
         return ProjectionConfidence.HIGH
     if dispersion_ratio <= 0.75:
         return ProjectionConfidence.MEDIUM
