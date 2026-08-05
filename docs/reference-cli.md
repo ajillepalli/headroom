@@ -21,12 +21,24 @@ headroom COMMAND [OPTIONS]
 | `headroom statusline` | One Claude Code JSON document on standard input | Parses Claude readings, stores snapshots and diagnostics, and prints one compact line. It never starts the Codex app-server. Malformed input still produces a fallback line and exits 0. |
 | `headroom status` | None | Refreshes Codex through the app-server with rollout fallback, updates state, and prints Claude and Codex short and weekly readings. Missing readings are `unavailable`. |
 | `headroom json` | None | Performs the same Codex refresh as `status`, then prints one compact JSON document containing persisted state, diagnostics, and four bounded readings. |
-| `headroom hook` | None | Performs the same Codex refresh, then prints guidance for the highest actionable severity. It prints nothing when all readings are `ok`. |
+| `headroom hook` | Optional Claude Code hook JSON | Performs the same Codex refresh, then emits guidance for the highest actionable severity. A `UserPromptSubmit` payload selects the documented JSON envelope. With no hook payload, output is human-readable text. It emits nothing when all readings are `ok`. |
 | `headroom doctor` | None | Reads current Codex sources without updating state, then reports paths, stored Claude windows, the winning Codex source, rollout discovery, parsed Codex windows, and diagnostic notes. |
 | `headroom reset` | None | Removes `state.json` and `history.jsonl`. It reports whether anything was removed and leaves other files in the state directory untouched. |
 | `headroom init` | None | Merges the Claude Code statusline and prompt hook into a settings file. See [Installation](howto-install.md). |
 
-`statusline`, `status`, `json`, `hook`, `doctor`, and `reset` have no command-specific flags other than help.
+`statusline`, `status`, `json`, `doctor`, and `reset` have no command-specific flags other than help.
+
+## Hook output
+
+When standard input is a JSON object whose `hook_event_name` is `UserPromptSubmit`, `headroom hook` writes one compact JSON document:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"<human-readable guidance>"}}
+```
+
+This is the documented Claude Code path for adding hook text to the model context. When standard input is empty, malformed, or not a `UserPromptSubmit` payload, the command falls back to human-readable text. Malformed input never crashes the hook. In every output mode, the command writes nothing at all when every reading is `ok`.
+
+`headroom hook --plain` always selects human-readable text, even when standard input contains a hook payload. This is useful for manual inspection and does not change `headroom status`.
 
 ## Init flags
 
@@ -50,6 +62,7 @@ When both `--print` and `--dry-run` are present, `--print` takes effect first an
 | `HEADROOM_CODEX_RPC_CMD` | `codex app-server` | App-server command. It may be a JSON array of nonempty strings or a shell-style command string. An empty or unparseable value skips the command and records a note. |
 | `HEADROOM_FRESH_CLAUDE_SECONDS` | `300` | Seconds for which a Claude snapshot is exact. The value must be finite and non-negative. |
 | `HEADROOM_FRESH_CODEX_SECONDS` | `1800` | Seconds for which a Codex snapshot is exact. The value must be finite and non-negative. |
+| `HEADROOM_FORCE_SEVERITY` | Unset | Hook diagnostic accepting `notice`, `warn`, or `critical`. It forces hook output at that severity and marks the text as a forced test. Any other value is ignored. Unset it after verifying context injection. |
 
 An invalid freshness value causes `status`, `json`, or `hook` to exit 1. `statusline` keeps its terminal contract, prints `headroom: usage unavailable`, and exits 0.
 

@@ -1,6 +1,6 @@
 """Pure text rendering for status, reports, and model context."""
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from .bounds import Confidence, Reading
 from .severity import Severity, reading_severity
@@ -34,30 +34,58 @@ def render_report(readings: Sequence[Reading], now: float) -> str:
     return "\n".join(lines)
 
 
-def render_hook(readings: Sequence[Reading], now: float) -> str:
+def render_hook(
+    readings: Sequence[Reading],
+    now: float,
+    forced_severity: Optional[Severity] = None,
+) -> str:
     """Render brief model guidance, or an empty string when no action is needed."""
 
     actionable = [reading for reading in readings if reading_severity(reading) is not Severity.OK]
-    if not actionable:
+    if not actionable and forced_severity is None:
         return ""
-    actionable.sort(key=lambda item: int(reading_severity(item)), reverse=True)
-    reading = actionable[0]
-    reset = _reset_plain(reading, now)
-    first = "Usage headroom: {} {} {} (reading {} old), {}.".format(
-        _source_name(reading.source),
-        reading.window,
-        _usage(reading),
-        _duration(reading.age_seconds),
-        reset,
+    candidates = actionable or [
+        reading
+        for reading in readings
+        if reading.lower_bound_percent is not None
+    ]
+    candidates.sort(
+        key=lambda item: (
+            int(reading_severity(item)),
+            item.lower_bound_percent or 0.0,
+        ),
+        reverse=True,
     )
-    severity = reading_severity(reading)
+    reading = candidates[0] if candidates else None
+    lines: List[str] = []
+    if forced_severity is not None:
+        lines.append(
+            "FORCED TEST ({}): diagnostic output, not a real usage warning.".format(
+                forced_severity
+            )
+        )
+    if reading is None:
+        lines.append("Usage headroom: no reading is available.")
+    else:
+        reset = _reset_plain(reading, now)
+        lines.append(
+            "Usage headroom: {} {} {} (reading {} old), {}.".format(
+                _source_name(reading.source),
+                reading.window,
+                _usage(reading),
+                _duration(reading.age_seconds),
+                reset,
+            )
+        )
+    severity = forced_severity or reading_severity(reading)
     if severity is Severity.CRITICAL:
         action = "Stop parallel subagent fan-out, use cheaper models, and checkpoint work now."
     elif severity is Severity.WARN:
         action = "Prefer cheaper models, avoid parallel subagent fan-out, and checkpoint soon."
     else:
         action = "Conserve usage and avoid unnecessary parallel work."
-    return first + "\n" + action
+    lines.append(action)
+    return "\n".join(lines)
 
 
 def _usage(reading: Reading) -> str:

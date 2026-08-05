@@ -13,9 +13,8 @@ def main() -> int:
     try:
         project_root = Path(__file__).resolve().parent.parent
         result = subprocess.run(
-            [sys.executable, "-m", "headroom.cli", "hook"],
+            [sys.executable, "-m", "headroom.cli", "hook"] + sys.argv[1:],
             cwd=str(project_root),
-            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,

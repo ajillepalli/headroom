@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from importlib import metadata
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -17,6 +18,7 @@ from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .render import render_hook, render_report, render_statusline
 from .resets import reset_time_is_plausible, window_minutes_from_raw
+from .severity import Severity
 from .settings import run_init
 from .state import (
     clear_state,
@@ -49,11 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
         "statusline",
         "status",
         "json",
-        "hook",
         "doctor",
         "reset",
     ):
         subparsers.add_parser(command)
+    hook_parser = subparsers.add_parser("hook")
+    hook_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="print human-readable text even when hook JSON is received",
+    )
     init_parser = subparsers.add_parser("init", help="configure Claude Code")
     init_parser.add_argument(
         "--settings",
@@ -110,13 +117,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif arguments.command == "json":
             print(json.dumps(_json_document(state, readings), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         elif arguments.command == "hook":
-            text = render_hook(readings, now)
+            text = render_hook(readings, now, forced_severity=_forced_hook_severity())
             if text:
-                print(text)
+                if arguments.plain or not _user_prompt_submit_input():
+                    print(text)
+                else:
+                    print(
+                        json.dumps(
+                            {
+                                "hookSpecificOutput": {
+                                    "hookEventName": "UserPromptSubmit",
+                                    "additionalContext": text,
+                                }
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
         return 0
     except (OSError, ValueError, TypeError) as error:
         print("headroom: {}".format(error), file=sys.stderr)
         return 1
+
+
+def _user_prompt_submit_input() -> bool:
+    """Return whether stdin contains a Claude UserPromptSubmit payload."""
+
+    if sys.stdin.isatty():
+        return False
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("hook_event_name") == "UserPromptSubmit"
+    )
+
+
+def _forced_hook_severity() -> Optional[Severity]:
+    """Read the opt-in diagnostic severity, ignoring unsupported values."""
+
+    value = os.environ.get("HEADROOM_FORCE_SEVERITY", "").strip().lower()
+    return {
+        "notice": Severity.NOTICE,
+        "warn": Severity.WARN,
+        "critical": Severity.CRITICAL,
+    }.get(value)
 
 
 def _statusline() -> int:

@@ -68,6 +68,45 @@ HEADROOM_CODEX_RPC=0 headroom status
 
 This is useful when the app-server command cannot start or when testing rollout capture. Freshness then depends on the newest usable rollout below the configured Codex home.
 
+## Verify model context injection
+
+Use `HEADROOM_FORCE_SEVERITY` to test the complete hook path without waiting for real usage to approach a limit. This is a temporary diagnostic, not a usage-control feature.
+
+First, exit Claude Code. Set a forced severity in the shell that will launch it:
+
+```console
+$env:HEADROOM_FORCE_SEVERITY = "critical"
+claude
+```
+
+On a POSIX shell:
+
+```console
+HEADROOM_FORCE_SEVERITY=critical claude
+```
+
+Submit a prompt asking what forced headroom test context accompanied the prompt. The model should report context beginning with `FORCED TEST (critical)` and state that it is not a real usage warning. This confirms that Claude Code received the hook's `additionalContext`, not just that the hook ran.
+
+You can inspect the documented JSON envelope separately in PowerShell:
+
+```console
+'{"hook_event_name":"UserPromptSubmit"}' | headroom hook
+```
+
+For human-readable output instead, run `headroom hook --plain`. Then unset the diagnostic and restart Claude Code so the child process no longer inherits it:
+
+```console
+$env:HEADROOM_FORCE_SEVERITY = $null
+```
+
+On a POSIX shell:
+
+```console
+unset HEADROOM_FORCE_SEVERITY
+```
+
+Accepted diagnostic values are `notice`, `warn`, and `critical`. Any other value is ignored. `headroom status` is unaffected.
+
 ## Clear stored state
 
 To remove captured snapshots, diagnostics, and history, run:
