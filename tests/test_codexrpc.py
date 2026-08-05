@@ -161,6 +161,37 @@ class CodexRpcTests(unittest.TestCase):
         self.assertEqual(notes, [])
         self.assertNotEqual(7.0, codexrpc.DEFAULT_TIMEOUT_SECONDS)
 
+    def test_read_rate_limits_wires_the_override_into_the_deadline(self) -> None:
+        # Parsing the override correctly (the test above) and actually using
+        # it to compute rpc_deadline are two different things: a regression
+        # that dropped the parsed value on the floor and fell back to
+        # DEFAULT_TIMEOUT_SECONDS would pass both the integration test
+        # (whose stub outlasts either value) and the isolated parser test
+        # above. Spy on _wait_for_response to see the exact deadline
+        # read_rate_limits computed and hands it, with a fixed clock so the
+        # expected value is exact rather than a real-time approximation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
+                "HEADROOM_CODEX_RPC_TIMEOUT": "7",
+                "HEADROOM_TEST_RPC_MODE": "timeout",
+                "HEADROOM_TEST_RPC_HEARTBEAT": str(root / "heartbeat"),
+            }
+            captured_deadlines: list = []
+
+            def spy(messages, request_id, deadline, notes):
+                captured_deadlines.append(deadline)
+                raise codexrpc._RpcTimeout()
+
+            with mock.patch("headroom.codexrpc.time.monotonic", return_value=1_000.0):
+                with mock.patch(
+                    "headroom.codexrpc._wait_for_response", side_effect=spy
+                ):
+                    codexrpc.read_rate_limits(environ=environment)
+
+            self.assertEqual(captured_deadlines, [1_000.0 + 7.0])
+
     def test_garbage_output_falls_back_to_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
