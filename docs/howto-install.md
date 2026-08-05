@@ -165,7 +165,7 @@ headroom doctor
 
 `status` shows all four source-window combinations. `doctor` reports the selected Codex hooks file, whether the headroom hook is registered, the state location, and the winning Codex capture source. See [Troubleshooting](howto-troubleshoot.md) for each line.
 
-The only documented Claude capture path this configuration uses is the terminal statusline. The Desktop app, the IDE extensions, and Claude Code on the web have no documented mechanism for supplying the numbers, though hooks still fire there, and web sessions load hooks from project or organization settings rather than the user file this writes. Codex stays client-independent while the app-server RPC answers; its rollout fallback reads local session records instead. See [which surfaces are covered](explanation-capture.md#which-surfaces-are-covered) before assuming a setup reads everything.
+The only documented Claude capture path this configuration uses is the terminal statusline. The Desktop app and the IDE extensions have no documented mechanism for supplying the numbers, though hooks still fire there, so they receive warnings built from whatever the terminal last captured. Claude Code on the web is out of reach entirely, because a cloud session runs on Anthropic-managed infrastructure that has neither the `headroom` command nor the local state file. Codex stays client-independent while the app-server RPC answers; its rollout fallback reads local session records instead. See [which surfaces are covered](explanation-capture.md#which-surfaces-are-covered) before assuming a setup reads everything.
 
 Run the standard-library test suite from the repository root with:
 
