@@ -23,6 +23,12 @@ UPDATE_CHECK_ENV = "HEADROOM_UPDATE_CHECK"
 PYPI_URL = "https://pypi.org/pypi/headroom-cli/json"
 CACHE_FILENAME = "update-check.json"
 CACHE_SECONDS = 24 * 60 * 60
+# Operational tolerance for ordinary clock behaviour (NTP step corrections,
+# VM/container pause-resume, laptop sleep), not a soundness guarantee. A cache
+# timestamped a few seconds ahead of "now" is still a cache we just wrote; a
+# cache dated years ahead is the actual bug this guards against (it would
+# otherwise suppress every future check), and stays rejected past this window.
+CLOCK_SKEW_ALLOWANCE_SECONDS = 5 * 60
 DEADLINE_SECONDS = 2.0
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_CACHE_BYTES = 16 * 1024
@@ -160,7 +166,7 @@ def check_for_update(
     cached = read_cached_result(state_dir, installed_version)
     if cached is not None:
         age = checked_at - cached.checked_at
-        if 0 <= age < CACHE_SECONDS:
+        if -CLOCK_SKEW_ALLOWANCE_SECONDS <= age < CACHE_SECONDS:
             return _with_cached(cached)
 
     installed = parse_version(installed_version)

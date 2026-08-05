@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from email.message import Message
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -34,9 +36,10 @@ class _Response:
 
 
 class _RedirectTransport(request.HTTPSHandler):
-    def __init__(self, location: str) -> None:
+    def __init__(self, location: str, status_code: int = 302) -> None:
         super().__init__()
         self.location = location
+        self.status_code = status_code
         self.contacted_urls = []
         self.body = io.BytesIO(b"redirect")
 
@@ -48,9 +51,9 @@ class _RedirectTransport(request.HTTPSHandler):
             self.body,
             headers,
             request_value.full_url,
-            302,
+            self.status_code,
         )
-        result.msg = "Found"
+        result.msg = "Redirect"
         return result
 
 
@@ -232,6 +235,33 @@ class CheckTests(unittest.TestCase):
                     self.assertEqual(result.outcome, "current")
                     self.assertFalse(result.cached)
 
+    def test_small_clock_skew_does_not_invalidate_a_good_cache(self) -> None:
+        # Ordinary NTP correction can leave a cache timestamped a few seconds
+        # ahead of "now". That is not the future-dated-cache bug (a cache
+        # dated years ahead suppressing every future check); it is normal
+        # clock behaviour, and should not throw away a valid cache or cost a
+        # network round trip.
+        cached_result = update_check.UpdateResult(
+            "current",
+            105.0,
+            "1.0",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            update_check._write_cache(cached_result, state_dir)
+            with mock.patch(
+                "headroom.update_check._open_pypi"
+            ) as opened:
+                result = update_check.check_for_update(
+                    "1.0",
+                    state_dir,
+                    now=100.0,
+                )
+
+            opened.assert_not_called()
+            self.assertEqual(result.outcome, "current")
+            self.assertTrue(result.cached)
+
     def test_empty_catalogue_is_cached_as_failure_not_current(self) -> None:
         body = json.dumps({"releases": {}}).encode("utf-8")
         with tempfile.TemporaryDirectory() as directory:
@@ -273,31 +303,56 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(cached.reason, result.reason)
 
     def test_cross_origin_redirect_is_not_contacted(self) -> None:
+        # Covers every redirect status the fix claims to block. 301/302/303/307
+        # are handled by our overridden HTTPRedirectHandler.redirect_request,
+        # which returns None to refuse the redirect. 308 has no http_error_308
+        # method on Python 3.9's HTTPRedirectHandler at all, so it falls
+        # through to HTTPDefaultErrorHandler instead -- a genuinely different
+        # code path that deserves its own assertion, not just an assumption
+        # that "redirects are blocked" covers it too.
         redirect_target = "http://attacker.invalid/collect"
-        transport = _RedirectTransport(redirect_target)
-        opener = request.build_opener(
-            update_check._NoRedirectHandler(),
-            transport,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(
-                "headroom.update_check.request.build_opener",
-                return_value=opener,
-            ):
-                result = update_check.check_for_update(
-                    "1.0",
-                    Path(directory),
-                    now=100.0,
+        for status_code in (301, 302, 303, 307, 308):
+            with self.subTest(status_code=status_code):
+                transport = _RedirectTransport(redirect_target, status_code)
+                opener = request.build_opener(
+                    update_check._NoRedirectHandler(),
+                    transport,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch(
+                        "headroom.update_check.request.build_opener",
+                        return_value=opener,
+                    ):
+                        result = update_check.check_for_update(
+                            "1.0",
+                            Path(directory),
+                            now=100.0,
+                        )
+
+                self.assertEqual(transport.contacted_urls, [update_check.PYPI_URL])
+                self.assertNotIn(redirect_target, transport.contacted_urls)
+                self.assertTrue(transport.body.closed)
+                self.assertEqual(result.outcome, "failure")
+                self.assertEqual(
+                    result.reason,
+                    "PyPI returned HTTP status {}".format(status_code),
                 )
 
-        self.assertEqual(transport.contacted_urls, [update_check.PYPI_URL])
-        self.assertNotIn(redirect_target, transport.contacted_urls)
-        self.assertTrue(transport.body.closed)
-        self.assertEqual(result.outcome, "failure")
-        self.assertEqual(result.reason, "PyPI returned HTTP status 302")
-
     def test_deadline_is_rechecked_after_each_response_read(self) -> None:
-        response_value = _Response(b'{"releases":{"1.0":[]}}')
+        # The whole body fits in the first response.read() call, so a second
+        # read() is needed only to observe end-of-stream (an empty chunk).
+        # That second read is the one that matters here: if it were the read
+        # that blocked past the deadline (e.g. a slow/hanging server taking
+        # its time to send EOF), a version of this loop that only checks the
+        # deadline *before* each read would sail straight through
+        # `if not chunk: break` and successfully parse the (valid) body,
+        # silently ignoring that DEADLINE_SECONDS had already elapsed. Only a
+        # recheck immediately *after* that read catches it. Five monotonic()
+        # values are consumed in order: started, pre-read #1, post-read #1
+        # (not yet expired), pre-read #2 (not yet expired), post-read #2
+        # (expired).
+        body = json.dumps({"releases": {"1.0": [_file()]}}).encode("utf-8")
+        response_value = _Response(body)
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch(
                 "headroom.update_check._open_pypi",
@@ -305,7 +360,7 @@ class CheckTests(unittest.TestCase):
             ):
                 with mock.patch(
                     "headroom.update_check.time.monotonic",
-                    side_effect=(10.0, 10.5, 12.0),
+                    side_effect=(0.0, 0.1, 0.2, 0.3, 2.5),
                 ):
                     result = update_check.check_for_update(
                         "1.0",
@@ -338,15 +393,50 @@ class CacheTests(unittest.TestCase):
                     self.assertIsNone(update_check.read_cached_result(Path(directory)))
 
     def test_cache_read_is_bounded_and_rejects_non_regular_files(self) -> None:
+        # A payload of pure whitespace (the original oversized case) is
+        # invalid JSON on its own, so json.loads() rejects it regardless of
+        # whether the MAX_CACHE_BYTES read-size bound exists. That made the
+        # first assertion below pass vacuously. To actually exercise the
+        # bound, pad a fully VALID cache document with leading whitespace
+        # (json.loads tolerates leading/trailing whitespace) until the file
+        # is exactly one byte over the limit. With the bound in place, the
+        # bounded read sees more bytes than MAX_CACHE_BYTES and bails before
+        # ever parsing. Without it, the bounded read still happens to capture
+        # the whole (valid) file, and it would decode successfully.
+        valid_document = json.dumps(
+            {
+                "version": 1,
+                "checked_at": 100.0,
+                "installed_version": "1.0",
+                "outcome": "current",
+                "latest_version": None,
+                "reason": None,
+            }
+        ).encode("utf-8")
+
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             cache = state_dir / update_check.CACHE_FILENAME
-            cache.write_bytes(b" " * (update_check.MAX_CACHE_BYTES + 1))
+            padding = b" " * (update_check.MAX_CACHE_BYTES + 1 - len(valid_document))
+            cache.write_bytes(padding + valid_document)
             self.assertIsNone(update_check.read_cached_result(state_dir))
 
-            cache.unlink()
-            cache.mkdir()
-            self.assertIsNone(update_check.read_cached_result(state_dir))
+        # A directory placed at the cache path already raises PermissionError
+        # (Windows) or IsADirectoryError (POSIX) at path.open("rb") time, so
+        # it never reaches the stat.S_ISREG check at all: any OSError is
+        # already caught by the generic handler below, making the original
+        # directory-based case pass regardless of that check's presence.
+        # Exercise the S_ISREG gate directly instead, by making fstat() report
+        # a non-regular mode for an otherwise perfectly valid, in-bounds file.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            cache = state_dir / update_check.CACHE_FILENAME
+            cache.write_bytes(valid_document)
+            fake_stat = os.stat_result((stat.S_IFDIR | 0o755,) + (0,) * 9)
+            with mock.patch(
+                "headroom.update_check.os.fstat", return_value=fake_stat
+            ):
+                self.assertIsNone(update_check.read_cached_result(state_dir))
 
     def test_cache_validation_uses_the_open_file_without_a_pre_open_stat(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
