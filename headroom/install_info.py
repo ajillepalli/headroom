@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 import re
 import sys
@@ -23,6 +24,7 @@ class InstallInfo:
     version: str
     modified_at: Optional[float]
     commit: Optional[str]
+    update_mode: str = "unknown"
 
 
 def inspect_install(version: str, package_path: Optional[Path] = None) -> InstallInfo:
@@ -39,6 +41,7 @@ def inspect_install(version: str, package_path: Optional[Path] = None) -> Instal
         version=version,
         modified_at=_loaded_module_mtime(path),
         commit=_short_commit(checkout) if checkout is not None else None,
+        update_mode="source" if checkout is not None else _installed_update_mode(path, package_path is None),
     )
 
 
@@ -181,3 +184,23 @@ def _packed_reference(path: Path, reference: str) -> Optional[str]:
 
 def _unique_paths(paths: Tuple[Path, Path]) -> Tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
+
+
+def _installed_update_mode(package_path: Path, inspect_metadata: bool) -> str:
+    """Identify only installation modes with reliable on-disk evidence."""
+
+    try:
+        for parent in (package_path,) + tuple(package_path.parents):
+            if (parent / "uv-receipt.toml").is_file():
+                return "uv-tool"
+            if (parent / "pipx_metadata.json").is_file():
+                return "unknown"
+    except OSError:
+        pass
+    if not inspect_metadata:
+        return "unknown"
+    try:
+        installer = metadata.distribution("headroom-cli").read_text("INSTALLER")
+    except Exception:
+        return "unknown"
+    return "pip" if installer is not None and installer.strip().lower() == "pip" else "unknown"
