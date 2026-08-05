@@ -70,6 +70,7 @@ In that fallback mode, the generated settings use the current Python executable,
 | `json` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints one compact JSON document with persisted state, diagnostics, and four bounded readings. |
 | `hook` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints guidance for the highest actionable severity. It prints nothing when every reading is `ok`. |
 | `doctor` | Performs the same on-demand Codex read without updating state. It prints which source won, the state paths, parsed windows, rollout details when fallback was needed, and diagnostic notes. |
+| `reset` | Clears persisted snapshots, diagnostics, and history so the next capture starts from empty state. |
 | `init` | Merges the Claude Code statusline and prompt hook into its settings, with backup, dry-run, and print-only modes. |
 
 Run a subcommand with this form:
@@ -120,6 +121,8 @@ The useful result is not a guess at current usage. It is a sound bound derived f
 Usage is monotonic inside one limit window. It can rise, but it cannot fall until the reset. A stale reading therefore gives a lower bound on current usage. If the last reading was 65%, headroom reports `>=65% used`. It never presents that stale value as exact, and it never overestimates usage.
 
 The reset time is absolute. Once `now` passes `resets_at`, the old window is over. headroom treats that snapshot as `post_reset`, sets its lower bound to 0%, and marks it certain and `ok`. It does not carry uncertainty from the previous window into the new one.
+
+Reset times are accepted only when they are plausible for the reported window, with a five-minute grace period on either side. When a payload has no window duration, the reset may be at most 14 days ahead. An implausible reset is recorded as a diagnostic, but its usage percentage is kept and shown with `reset time unknown`. Numeric timestamps at or above `100000000000` are interpreted as epoch milliseconds because contemporary epoch seconds are about `10^9`, epoch milliseconds are about `10^12`, and epoch seconds will remain below that threshold until the year 5138.
 
 This makes staleness mostly harmless. Before the reset, the last value remains a valid lower bound and severity leans toward caution. After the reset, the old reading becomes known-good instead of uncertain. Only a stale reading that has not reached its reset needs a hedge.
 

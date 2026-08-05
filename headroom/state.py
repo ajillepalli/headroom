@@ -100,6 +100,21 @@ def append_history(snapshots: Iterable[Snapshot], state_dir: Optional[Path] = No
         os.fsync(handle.fileno())
 
 
+def clear_state(state_dir: Optional[Path] = None) -> bool:
+    """Remove persisted snapshots, diagnostics, and history."""
+
+    directory = resolve_state_dir(state_dir)
+    removed = False
+    for name in ("state.json", "history.jsonl"):
+        path = directory / name
+        try:
+            path.unlink()
+            removed = True
+        except FileNotFoundError:
+            pass
+    return removed
+
+
 def snapshots_from_state(state: Dict[str, Any]) -> Dict[str, Snapshot]:
     """Decode valid persisted snapshots keyed by source and window."""
 

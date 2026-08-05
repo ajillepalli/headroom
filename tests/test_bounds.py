@@ -8,11 +8,37 @@ from unittest.mock import patch
 
 from headroom.bounds import Confidence, Snapshot, bound_snapshot
 from headroom.freshness import freshness_seconds
-from headroom.render import render_hook, render_statusline
+from headroom.render import render_hook, render_report, render_statusline
 from headroom.severity import Severity, reading_severity
 
 
 class BoundsTests(unittest.TestCase):
+    def test_legacy_implausible_reset_is_not_used(self) -> None:
+        captured = 1_800_000_000.0
+        snapshot = Snapshot(
+            used_percentage=12.0,
+            captured_at=captured,
+            resets_at=9_999_999_999.0,
+            window="short",
+            source="codex",
+            raw={"window_minutes": 300},
+        )
+
+        reading = bound_snapshot(
+            snapshot,
+            now=captured + 301,
+            source="codex",
+            window="short",
+            fresh_for_seconds=300.0,
+        )
+        report = render_report([reading], now=captured + 301)
+
+        self.assertEqual(reading.lower_bound_percent, 12.0)
+        self.assertIsNone(reading.resets_at)
+        self.assertNotEqual(reading.confidence, Confidence.POST_RESET)
+        self.assertIn("reset time unknown", report)
+        self.assertNotIn("resets in", report)
+
     def test_stale_usage_is_rendered_only_as_a_lower_bound(self) -> None:
         snapshot = Snapshot(
             used_percentage=65.0,

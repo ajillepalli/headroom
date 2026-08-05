@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .bounds import Snapshot, valid_percent
 from .claude import classify_window, parse_reset_time
+from .resets import parse_plausible_reset_time
 from .config import resolve_codex_sessions_dir
 
 
@@ -32,7 +33,11 @@ def default_sessions_dir() -> Path:
     return resolve_codex_sessions_dir()
 
 
-def parse_rate_limits(payload: Any, captured_at: Optional[float] = None) -> Tuple[Snapshot, ...]:
+def parse_rate_limits(
+    payload: Any,
+    captured_at: Optional[float] = None,
+    notes: Optional[List[str]] = None,
+) -> Tuple[Snapshot, ...]:
     """Extract Codex window buckets from an object containing rate_limits."""
 
     captured = time.time() if captured_at is None else float(captured_at)
@@ -59,10 +64,13 @@ def parse_rate_limits(payload: Any, captured_at: Optional[float] = None) -> Tupl
                 continue
             reset_key = _first_key(bucket, _RESET_KEYS)
             reset_value = bucket.get(reset_key) if reset_key is not None else None
+            resets_at, reset_note = parse_plausible_reset_time(reset_value, captured, duration)
+            if reset_note is not None and notes is not None:
+                notes.append("{} for {} window".format(reset_note, window))
             found[window] = Snapshot(
                 used_percentage=used,
                 captured_at=captured,
-                resets_at=parse_reset_time(reset_value),
+                resets_at=resets_at,
                 window=window,
                 source="codex",
                 limit_reached=_limit_reached(limits, bucket, used),
@@ -107,7 +115,7 @@ def _last_snapshot_in_file(path: Path, notes: List[str]) -> Tuple[Snapshot, ...]
                 except ValueError:
                     continue
                 captured = _payload_timestamp(payload, captured_fallback)
-                candidate = parse_rate_limits(payload, captured)
+                candidate = parse_rate_limits(payload, captured, notes)
                 if candidate:
                     latest = candidate
     except OSError as error:

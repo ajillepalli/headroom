@@ -10,9 +10,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+from headroom.bounds import Confidence, Snapshot, bound_snapshot
 from headroom.claude import parse_payload, parse_reset_time
 from headroom.cli import main
 from headroom.codexsrc import parse_rate_limits
+from headroom.render import render_report
+from headroom.state import save_snapshots
 
 
 class ParserTests(unittest.TestCase):
@@ -50,7 +53,7 @@ class ParserTests(unittest.TestCase):
             }
         }
 
-        result = parse_payload(payload, captured_at=100.0)
+        result = parse_payload(payload, captured_at=1_786_400_000.0)
         snapshots = {snapshot.window: snapshot for snapshot in result.snapshots}
 
         self.assertEqual(set(snapshots), {"short", "weekly"})
@@ -69,7 +72,7 @@ class ParserTests(unittest.TestCase):
             }
         }
 
-        snapshots = parse_rate_limits(payload, captured_at=100.0)
+        snapshots = parse_rate_limits(payload, captured_at=1_786_490_000.0)
 
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0].window, "short")
@@ -102,6 +105,111 @@ class ParserTests(unittest.TestCase):
         for value, expected in cases:
             with self.subTest(value=value):
                 self.assertEqual(parse_reset_time(value), expected)
+
+    def test_implausible_future_reset_keeps_usage_and_records_note(self) -> None:
+        captured = 1_800_000_000.0
+        notes: list[str] = []
+        payload = {
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 12,
+                    "window_minutes": 300,
+                    "resets_at": 9_999_999_999,
+                }
+            }
+        }
+
+        snapshots = parse_rate_limits(payload, captured_at=captured, notes=notes)
+        reading = bound_snapshot(
+            snapshots[0], captured + 301, "codex", "short", fresh_for_seconds=300
+        )
+        report = render_report([reading], captured + 301)
+
+        self.assertEqual(snapshots[0].used_percentage, 12.0)
+        self.assertIsNone(snapshots[0].resets_at)
+        self.assertEqual(reading.lower_bound_percent, 12.0)
+        self.assertNotEqual(reading.confidence, Confidence.POST_RESET)
+        self.assertIn("reset time unknown", report)
+        self.assertNotIn("resets in", report)
+        self.assertTrue(any("9999999999" in note for note in notes))
+
+    def test_implausible_past_reset_is_not_treated_as_completed(self) -> None:
+        captured = 1_800_000_000.0
+        notes: list[str] = []
+        payload = {
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 88,
+                    "window_minutes": 300,
+                    "resets_at": captured - 3_600,
+                }
+            }
+        }
+
+        snapshot = parse_rate_limits(payload, captured_at=captured, notes=notes)[0]
+        reading = bound_snapshot(
+            snapshot, captured + 301, "codex", "short", fresh_for_seconds=300
+        )
+
+        self.assertIsNone(snapshot.resets_at)
+        self.assertEqual(reading.lower_bound_percent, 88.0)
+        self.assertEqual(reading.confidence, Confidence.STALE_BOUNDED)
+        self.assertTrue(any(str(int(captured - 3_600)) in note for note in notes))
+
+    def test_normal_short_and_weekly_resets_remain_plausible(self) -> None:
+        captured = 1_800_000_000.0
+        payload = {
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 8,
+                    "window_minutes": 300,
+                    "resets_at": captured + 300 * 60,
+                },
+                "secondary": {
+                    "used_percent": 18,
+                    "window_minutes": 10_080,
+                    "resets_at": captured + 10_080 * 60,
+                },
+            }
+        }
+
+        snapshots = {
+            snapshot.window: snapshot
+            for snapshot in parse_rate_limits(payload, captured)
+        }
+
+        self.assertEqual(snapshots["short"].resets_at, captured + 300 * 60)
+        self.assertEqual(snapshots["weekly"].resets_at, captured + 10_080 * 60)
+
+    def test_doctor_surfaces_stored_rejected_reset_note(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            save_snapshots(
+                (
+                    Snapshot(
+                        used_percentage=12.0,
+                        captured_at=1_800_000_000.0,
+                        resets_at=9_999_999_999.0,
+                        window="short",
+                        source="claude",
+                        raw={"window_minutes": 300},
+                    ),
+                ),
+                state_dir,
+            )
+            environment = {
+                "HEADROOM_STATE_DIR": directory,
+                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
+                "HEADROOM_CODEX_RPC": "0",
+            }
+            with mock.patch.dict(os.environ, environment, clear=True):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main(["doctor"]), 0)
+
+        self.assertIn(
+            "rejected implausible resets_at 9999999999.0", output.getvalue()
+        )
 
     def test_malformed_or_empty_stdin_still_prints_and_exits_zero(self) -> None:
         for payload in ("", "{"):

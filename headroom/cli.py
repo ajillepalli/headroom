@@ -14,8 +14,15 @@ from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .render import render_hook, render_report, render_statusline
+from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .settings import run_init
-from .state import read_state, resolve_state_dir, save_snapshots, snapshots_from_state
+from .state import (
+    clear_state,
+    read_state,
+    resolve_state_dir,
+    save_snapshots,
+    snapshots_from_state,
+)
 
 
 @dataclass(frozen=True)
@@ -31,7 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(prog="headroom")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("statusline", "status", "json", "hook", "doctor"):
+    for command in (
+        "statusline",
+        "status",
+        "json",
+        "hook",
+        "doctor",
+        "reset",
+    ):
         subparsers.add_parser(command)
     init_parser = subparsers.add_parser("init", help="configure Claude Code")
     init_parser.add_argument(
@@ -58,6 +72,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
     if arguments.command == "statusline":
         return _statusline()
+    if arguments.command == "reset":
+        try:
+            removed = clear_state()
+            print(
+                "Cleared stored state."
+                if removed
+                else "Stored state is already clear."
+            )
+            return 0
+        except OSError as error:
+            print("headroom reset: {}".format(error), file=sys.stderr)
+            return 1
     try:
         if arguments.command == "doctor":
             return _doctor()
@@ -175,15 +201,77 @@ def _doctor() -> int:
         )
     )
     print("Codex readings: {}".format(", ".join(snapshot.window for snapshot in codex.snapshots) or "missing"))
-    notes = codex.rpc.notes + (rollout.notes if rollout is not None else ())
+    notes = tuple(_stored_diagnostic_notes(state))
+    notes += tuple(_stored_snapshot_reset_notes(existing))
+    notes += codex.rpc.notes + (rollout.notes if rollout is not None else ())
     if notes:
-        print("Notes: {}".format("; ".join(notes)))
+        print("Notes: {}".format("; ".join(dict.fromkeys(notes))))
     return 0
 
 
 def _found_windows(snapshots: Dict[str, Any], source: str) -> str:
     windows = [window for window in ("short", "weekly") if "{}:{}".format(source, window) in snapshots]
     return ", ".join(windows) if windows else "missing"
+
+
+def _stored_diagnostic_notes(state: Dict[str, Any]) -> List[str]:
+    result: List[str] = []
+    diagnostics = state.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return result
+    for source, details in diagnostics.items():
+        if not isinstance(details, dict):
+            continue
+        notes = details.get("notes")
+        if isinstance(notes, list):
+            result.extend(
+                "stored {}: {}".format(source, note)
+                for note in notes
+                if isinstance(note, str)
+            )
+        unparsed = details.get("unparsed")
+        if not isinstance(unparsed, list):
+            continue
+        for note in unparsed:
+            if not isinstance(note, dict):
+                continue
+            reason = note.get("reason")
+            if not isinstance(reason, str):
+                continue
+            path = note.get("path")
+            location = (
+                "/".join(str(part) for part in path)
+                if isinstance(path, list)
+                else ""
+            )
+            result.append(
+                "stored {}{}: {}".format(
+                    source,
+                    " at {}".format(location) if location else "",
+                    reason,
+                )
+            )
+    return result
+
+
+def _stored_snapshot_reset_notes(snapshots: Dict[str, Snapshot]) -> List[str]:
+    result: List[str] = []
+    for snapshot in snapshots.values():
+        resets_at = snapshot.resets_at
+        if resets_at is None or reset_time_is_plausible(
+            resets_at,
+            snapshot.captured_at,
+            window_minutes_from_raw(snapshot.raw),
+        ):
+            continue
+        result.append(
+            "stored {} {}: rejected implausible resets_at {!r}".format(
+                snapshot.source,
+                snapshot.window,
+                resets_at,
+            )
+        )
+    return result
 
 
 def init_main() -> int:

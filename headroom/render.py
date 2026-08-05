@@ -85,7 +85,7 @@ def _window(window: str) -> str:
 
 def _reset_phrase(reading: Reading, now: float) -> str:
     if reading.resets_at is None:
-        return ""
+        return ", reset time unknown"
     if reading.confidence is Confidence.POST_RESET:
         return ", previous window reset"
     return ", resets in {}".format(_duration(max(0.0, reading.resets_at - now)))

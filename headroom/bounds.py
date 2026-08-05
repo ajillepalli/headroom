@@ -6,6 +6,7 @@ import math
 from typing import Any, Dict, Optional
 
 from .freshness import freshness_seconds
+from .resets import reset_time_is_plausible, window_minutes_from_raw
 
 
 class Confidence(str, Enum):
@@ -108,11 +109,18 @@ def bound_snapshot(
         )
 
     age = max(0.0, float(now) - snapshot.captured_at)
-    if snapshot.resets_at is not None and now > snapshot.resets_at:
+    resets_at = snapshot.resets_at
+    if resets_at is not None and not reset_time_is_plausible(
+        resets_at,
+        snapshot.captured_at,
+        window_minutes_from_raw(snapshot.raw),
+    ):
+        resets_at = None
+    if resets_at is not None and now > resets_at:
         return Reading(
             certain=True,
             lower_bound_percent=0.0,
-            resets_at=snapshot.resets_at,
+            resets_at=resets_at,
             age_seconds=age,
             window=snapshot.window,
             source=snapshot.source,
@@ -132,7 +140,7 @@ def bound_snapshot(
     return Reading(
         certain=confidence is Confidence.FRESH,
         lower_bound_percent=snapshot.used_percentage,
-        resets_at=snapshot.resets_at,
+        resets_at=resets_at,
         age_seconds=age,
         window=snapshot.window,
         source=snapshot.source,

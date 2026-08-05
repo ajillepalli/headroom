@@ -118,7 +118,7 @@ def read_rate_limits(
         if selected is None:
             notes.append("app-server RPC returned no Codex rate-limit bucket")
         else:
-            snapshots = parse_rate_limits(selected, captured_at=time.time())
+            snapshots = parse_rate_limits(selected, captured_at=time.time(), notes=notes)
             if not snapshots:
                 notes.append("app-server RPC returned no usable rate limits")
     except _RpcTimeout:

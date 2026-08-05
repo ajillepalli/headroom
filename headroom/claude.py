@@ -1,12 +1,12 @@
 """Defensive parsing of Claude Code statusline payloads."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .bounds import Snapshot, valid_percent
+from .resets import parse_plausible_reset_time, parse_reset_time
 
 
 _USED_KEYS = ("used_percentage", "usedPercentage", "used_percent", "usedPercent")
@@ -20,35 +20,6 @@ class ParseResult:
 
     snapshots: Tuple[Snapshot, ...]
     unparsed: Tuple[Dict[str, Any], ...]
-
-
-def parse_reset_time(value: Any) -> Optional[float]:
-    """Parse epoch seconds, epoch milliseconds, or an ISO-8601 timestamp."""
-
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        if number > 100_000_000_000.0:
-            number /= 1000.0
-        return number if number >= 0.0 else None
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            number = float(stripped)
-        except ValueError:
-            iso_value = stripped[:-1] + "+00:00" if stripped.endswith("Z") else stripped
-            try:
-                parsed = datetime.fromisoformat(iso_value)
-            except ValueError:
-                return None
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        return parse_reset_time(number)
-    return None
 
 
 def classify_window(window_minutes: Any, path: Sequence[str]) -> Optional[str]:
@@ -90,9 +61,9 @@ def parse_payload(payload: Any, captured_at: Optional[float] = None) -> ParseRes
             continue
         reset_key = _first_key(value, _RESET_KEYS)
         reset_value = value.get(reset_key) if reset_key is not None else None
-        resets_at = parse_reset_time(reset_value)
-        if reset_key is not None and resets_at is None:
-            notes.append({"path": list(path), "reason": "invalid reset time", "value": reset_value})
+        resets_at, reset_note = parse_plausible_reset_time(reset_value, captured, duration)
+        if reset_note is not None:
+            notes.append({"path": list(path), "reason": reset_note, "value": reset_value})
         snapshot = Snapshot(
             used_percentage=used,
             captured_at=captured,
