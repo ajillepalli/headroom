@@ -37,15 +37,29 @@ Snapshots go to `state.json` under the state directory. Writes replace that file
 
 ## Install
 
-Use Python 3.9 or newer. From the repository root, run:
+Use Python 3.9 or newer. From the repository root, install the command with `uv` and configure Claude Code:
+
+```console
+uv tool install .
+headroom init
+```
+
+Or use an editable `pip` install:
+
+```console
+pip install -e .
+headroom init
+```
+
+`headroom init` merges the statusline and prompt hook into `~/.claude/settings.json`. It preserves unrelated settings and hook events, appends to an existing `UserPromptSubmit` array, and creates a timestamped backup before changing an existing file. Use `--settings PATH` to target another settings file, `--dry-run` to inspect the diff without writing, or `--print` to emit the JSON fragment only.
+
+When `headroom` is on `PATH`, the generated commands are exactly `headroom statusline` and `headroom hook`. For a plain clone that has not been installed, the compatibility shim still works:
 
 ```console
 python install.py
 ```
 
-The script prints a `settings.json` fragment for the Claude Code statusline and `UserPromptSubmit` hook. Paste that fragment into your Claude Code settings. `install.py` does not find, merge, or edit `settings.json`.
-
-The generated hook command uses the current Python executable and an absolute path to `hooks/headroom-hook.py`. The generated statusline command uses the same Python executable, sets `PYTHONPATH` to this checkout, and runs `python -m headroom.cli statusline`. It therefore works regardless of the directory Claude Code invokes it from. Paths are quoted for the current platform.
+In that fallback mode, the generated settings use the current Python executable, an absolute checkout path in `PYTHONPATH`, and `python -m headroom.cli` internally so Claude Code can invoke headroom from any directory.
 
 ## Commands
 
@@ -56,11 +70,12 @@ The generated hook command uses the current Python executable and an absolute pa
 | `json` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints one compact JSON document with persisted state, diagnostics, and four bounded readings. |
 | `hook` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints guidance for the highest actionable severity. It prints nothing when every reading is `ok`. |
 | `doctor` | Performs the same on-demand Codex read without updating state. It prints which source won, the state paths, parsed windows, rollout details when fallback was needed, and diagnostic notes. |
+| `init` | Merges the Claude Code statusline and prompt hook into its settings, with backup, dry-run, and print-only modes. |
 
 Run a subcommand with this form:
 
 ```console
-python -m headroom.cli status
+headroom status
 ```
 
 ### Observed output
@@ -68,7 +83,7 @@ python -m headroom.cli status
 On August 4, 2026, the requested commands used a writable isolated state directory and the real local Codex sessions. They returned the following point-in-time output.
 
 ```console
-python -m headroom.cli status
+headroom status
 ```
 
 Output:
@@ -83,7 +98,7 @@ Codex
 ```
 
 ```console
-python -m headroom.cli doctor
+headroom doctor
 ```
 
 Output:

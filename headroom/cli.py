@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,6 +14,7 @@ from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .render import render_hook, render_report, render_statusline
+from .settings import run_init
 from .state import read_state, resolve_state_dir, save_snapshots, snapshots_from_state
 
 
@@ -28,7 +30,19 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the command parser."""
 
     parser = argparse.ArgumentParser(prog="headroom")
-    parser.add_argument("command", choices=("statusline", "status", "json", "hook", "doctor"))
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("statusline", "status", "json", "hook", "doctor"):
+        subparsers.add_parser(command)
+    init_parser = subparsers.add_parser("init", help="configure Claude Code")
+    init_parser.add_argument(
+        "--settings",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="settings file to update (default: ~/.claude/settings.json)",
+    )
+    init_parser.add_argument("--dry-run", action="store_true", help="print the diff without writing files")
+    init_parser.add_argument("--print", dest="print_only", action="store_true", help="print the settings snippet only")
     return parser
 
 
@@ -36,6 +50,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run a headroom command and return its process status."""
 
     arguments = build_parser().parse_args(argv)
+    if arguments.command == "init":
+        try:
+            return run_init(arguments.settings, dry_run=arguments.dry_run, print_only=arguments.print_only)
+        except OSError as error:
+            print("headroom init: {}".format(error), file=sys.stderr)
+            return 1
     if arguments.command == "statusline":
         return _statusline()
     try:
@@ -164,6 +184,11 @@ def _doctor() -> int:
 def _found_windows(snapshots: Dict[str, Any], source: str) -> str:
     windows = [window for window in ("short", "weekly") if "{}:{}".format(source, window) in snapshots]
     return ", ".join(windows) if windows else "missing"
+
+
+def init_main() -> int:
+    """Run init with arguments supplied to the legacy installer shim."""
+    return main(["init"] + sys.argv[1:])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "headroom-cli"
+version = "0.1.0"
+description = "Shared usage headroom tracking for Claude Code and Codex"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE.txt" }
+authors = [
+  { name = "Ananth Jillepalli" },
+]
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/ajillepalli/headroom"
+Repository = "https://github.com/ajillepalli/headroom"
+Issues = "https://github.com/ajillepalli/headroom/issues"
+
+[project.scripts]
+headroom = "headroom.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["headroom"]
