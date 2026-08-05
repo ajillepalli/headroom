@@ -12,12 +12,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .bounds import Reading, Snapshot, bound_snapshot
+from .burn_rate import BurnRateProjection, project_exhaustion
 from .claude import parse_stdin
 from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .install_info import format_modified_time, inspect_install, source_commit
-from .render import render_hook, render_report, render_statusline
+from .render import (
+    render_burn_rate_doctor_lines,
+    render_burn_rate_status_lines,
+    render_hook,
+    render_report,
+    render_statusline,
+)
 from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .severity import Severity
 from .settings import (
@@ -44,6 +51,22 @@ class _CodexRefreshResult:
 
 HOOK_DEADLINE_SECONDS = 7.0
 HOOK_MAX_ROLLOUT_FILES = 32
+# history.jsonl is append-only and, absent a marked reset, grows for the
+# life of an install (see burn_rate.py's own MAX_FIT_SAMPLES comment) --
+# project_exhaustion reads, JSON-parses, and groups the WHOLE file before
+# its 500-sample fit cap ever applies, so its cost grows with lifetime
+# capture count, not with anything hook's own HOOK_DEADLINE_SECONDS budget
+# accounts for (Codex review, round 2, P2). A long-running install could
+# see this work grow large enough to threaten the hook's external timeout
+# (the generated Codex hook config carries its own 30s timeoutSec). This is
+# a size-based heuristic, not a measured bound: real captures here run
+# roughly 150-250 bytes/line, so 20 MB is on the order of 100,000 lines,
+# comfortably parseable in a second or two on modest hardware while still
+# covering months of ordinary use. Skipping burn-rate projections outright
+# past this size (rather than reading a prefix or a tail) keeps the
+# behavior simple and honest: a caller sees no projections, not a
+# projection quietly built from a truncated slice of history.
+HOOK_MAX_HISTORY_BYTES = 20_000_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,7 +176,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if arguments.command == "doctor":
             return _doctor()
-        now = time.time()
         if arguments.command != "hook" or not arguments.stored_only:
             deadline = (
                 time.monotonic() + HOOK_DEADLINE_SECONDS
@@ -161,15 +183,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else None
             )
             _refresh_codex(deadline=deadline)
+        # Captured AFTER the refresh above (not before): a successful
+        # app-server refresh timestamps its snapshot with its own
+        # time.time() call inside codexrpc.py, which can land after an
+        # earlier `now` here. project_exhaustion discards any history record
+        # whose captured_at exceeds the `now` it is given, so a stale `now`
+        # would silently exclude the snapshot just appended by the refresh
+        # above from every projection this call computes (Codex review,
+        # round 1, P1).
+        now = time.time()
         state = read_state()
         readings = _readings(state, now)
+        projections = _burn_rate_projections(
+            now,
+            max_history_bytes=HOOK_MAX_HISTORY_BYTES if arguments.command == "hook" else None,
+        )
         if arguments.command == "status":
             print(render_report(readings, now))
+            burn_lines = render_burn_rate_status_lines(projections, now, readings)
+            if burn_lines:
+                print("Burn rate")
+                for line in burn_lines:
+                    print(line)
             _print_status_update()
         elif arguments.command == "json":
-            print(json.dumps(_json_document(state, readings), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            print(
+                json.dumps(
+                    _json_document(state, readings, projections),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         elif arguments.command == "hook":
-            text = render_hook(readings, now, forced_severity=_forced_hook_severity())
+            text = render_hook(readings, now, projections=projections, forced_severity=_forced_hook_severity())
             if text:
                 if arguments.plain or not _user_prompt_submit_input():
                     print(text)
@@ -286,9 +333,46 @@ def _readings(state: Dict[str, Any], now: float) -> List[Reading]:
     ]
 
 
-def _json_document(state: Dict[str, Any], readings: Sequence[Reading]) -> Dict[str, Any]:
+def _burn_rate_projections(
+    now: float, max_history_bytes: Optional[int] = None
+) -> List[BurnRateProjection]:
+    """Project quota exhaustion from the persisted history file.
+
+    Reads directly from history.jsonl rather than the in-memory readings
+    just refreshed above: burn_rate.project_exhaustion needs the whole
+    recent history to fit a rate, not just the latest snapshot per window.
+    An unreadable or missing history file yields an empty list (see
+    project_exhaustion's own OSError handling), which every caller here
+    already treats the same as "nothing to report."
+
+    ``max_history_bytes``, when given, skips the (unbounded-cost) read
+    entirely once the file exceeds that size, returning an empty list the
+    same way an unreadable file does -- see HOOK_MAX_HISTORY_BYTES for why
+    the hook path passes this and status/json/doctor do not. The size check
+    itself is a cheap stat(), so this adds negligible cost on every call.
+    """
+
+    history_path = resolve_state_dir() / "history.jsonl"
+    if max_history_bytes is not None:
+        try:
+            if history_path.stat().st_size > max_history_bytes:
+                return []
+        except OSError:
+            # Missing, unreadable, or otherwise unstat-able: let
+            # project_exhaustion's own OSError handling decide, same as the
+            # unbounded path below.
+            pass
+    return project_exhaustion(history_path, now=now)
+
+
+def _json_document(
+    state: Dict[str, Any],
+    readings: Sequence[Reading],
+    projections: Sequence[BurnRateProjection],
+) -> Dict[str, Any]:
     result = dict(state)
     result["readings"] = [reading.to_dict() for reading in readings]
+    result["burn_rate_projections"] = [projection.to_dict() for projection in projections]
     return result
 
 
@@ -334,6 +418,15 @@ def _doctor() -> int:
     notes += codex.rpc.notes + (rollout.notes if rollout is not None else ())
     if notes:
         print("Notes: {}".format("; ".join(dict.fromkeys(notes))))
+    print()
+    print("Burn rate")
+    doctor_now = time.time()
+    burn_lines = render_burn_rate_doctor_lines(_burn_rate_projections(doctor_now), doctor_now)
+    if burn_lines:
+        for line in burn_lines:
+            print(line)
+    else:
+        print("  no usage history recorded")
     _print_update_doctor()
     return 0
 

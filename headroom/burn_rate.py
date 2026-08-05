@@ -312,6 +312,37 @@ class BurnRateProjection:
     fields agree on has to read the underlying history itself; no
     additional summary statistic closes that for every possible pair of
     series, only for the ones it was specifically built to catch.
+
+    ``latest_change_at`` is a ninth, differently-shaped fact: the
+    ``captured_at`` of the most recent record in the segment whose
+    ``used_percentage`` differs from the record immediately before it --
+    when usage last demonstrably MOVED, as opposed to when the most recent
+    capture merely HAPPENED. A capture repeating the prior capture's
+    percentage confirms nothing changed; it is not evidence a trend
+    continues, only evidence a capture occurred. Every measurement above is
+    computed from the segment as a whole and is blind to where in the
+    segment its evidence sits -- in particular, a trailing run of
+    zero-delta captures (usage climbs, then genuinely stalls, and captures
+    keep arriving reporting the same stalled value) is invisible to every
+    folded field: folding exists to merge a zero-delta gap FORWARD into the
+    next interval that changed, and a trailing run has no next interval to
+    merge into, so its elapsed time is dropped from the folded view
+    entirely rather than reported as "recent, but flat." A caller checking
+    only "is there a recent capture" (my Confidence.FRESH state, kept
+    elsewhere) cannot tell a genuinely continuing trend from a stalled one
+    that merely keeps being re-captured -- ``latest_change_at`` is what
+    that caller compares "now" against instead: if the gap between them
+    exceeds what a normal capture cadence would explain, the segment has
+    stalled since the last real change, no matter how fresh the most
+    recent capture is or how clean the segment's own fitted rate looks.
+    Like the eight fields above, this is a raw fact with no threshold
+    attached -- how large a gap is too large is a policy question for a
+    caller, not this module, to answer. It is None exactly when no
+    projection was made (``reason`` is set), same as every field above;
+    when a projection exists, it is always set, because
+    ``exhaustion_precedes_reset``'s sibling check (``latest_usage !=
+    first_usage``, see ``_project_group``) guarantees at least one
+    adjacent pair in the segment differs.
     """
 
     source: str
@@ -330,6 +361,36 @@ class BurnRateProjection:
     zero_delta_fraction: Optional[float] = None
     max_raw_rate_ratio: Optional[float] = None
     longest_above_overall_rate_run: Optional[int] = None
+    latest_change_at: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-compatible representation with every field present.
+
+        ``reason`` is serialized as its string value (not the enum member)
+        so a caller debugging "why is there no projection" over JSON gets a
+        stable, documented string rather than a Python repr. This mirrors
+        Snapshot.to_dict and Reading.to_dict in bounds.py.
+        """
+
+        return {
+            "source": self.source,
+            "window": self.window,
+            "rate_percent_per_second": self.rate_percent_per_second,
+            "projected_exhaustion_at": self.projected_exhaustion_at,
+            "exhaustion_precedes_reset": self.exhaustion_precedes_reset,
+            "samples_used": self.samples_used,
+            "span_seconds": self.span_seconds,
+            "reason": self.reason.value if self.reason is not None else None,
+            "max_relative_deviation": self.max_relative_deviation,
+            "max_usage_share": self.max_usage_share,
+            "intervals_used": self.intervals_used,
+            "rate_drift": self.rate_drift,
+            "effective_intervals": self.effective_intervals,
+            "zero_delta_fraction": self.zero_delta_fraction,
+            "max_raw_rate_ratio": self.max_raw_rate_ratio,
+            "longest_above_overall_rate_run": self.longest_above_overall_rate_run,
+            "latest_change_at": self.latest_change_at,
+        }
 
 
 @dataclass(frozen=True)
@@ -605,7 +666,32 @@ def _project_group(
         zero_delta_fraction=measurements.zero_delta_fraction,
         max_raw_rate_ratio=measurements.max_raw_rate_ratio,
         longest_above_overall_rate_run=measurements.longest_above_overall_rate_run,
+        latest_change_at=_latest_change_at(records),
     )
+
+
+def _latest_change_at(records: List[_HistoryRecord]) -> float:
+    """The ``captured_at`` of the most recent record whose ``used_percentage``
+    differs from the record immediately before it.
+
+    Callable only once ``latest_usage != first_usage`` is already
+    established (see ``_project_group``, right before ``BurnRateProjection``
+    is built on the success path): that guarantees at least one adjacent
+    pair in the segment differs, because if every adjacent pair were equal
+    the first and last values would be transitively equal too. So this
+    always finds a match before its loop reaches index 0; the function has
+    no "nothing ever changed" branch to fall back to because that case is
+    unreachable under its precondition.
+    """
+
+    for index in range(len(records) - 1, 0, -1):
+        if records[index].used_percentage != records[index - 1].used_percentage:
+            return records[index].captured_at
+    # Unreachable given this function's precondition (see docstring); kept
+    # as a defensive, honestly-labeled fallback rather than an assertion, so
+    # a future caller that violates the precondition gets the segment's
+    # earliest timestamp instead of an IndexError.
+    return records[0].captured_at
 
 
 def _pairwise_slopes(records: List[_HistoryRecord]) -> List[float]:

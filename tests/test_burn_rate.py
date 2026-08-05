@@ -100,6 +100,7 @@ class BurnRateTests(unittest.TestCase):
         self.assertIsNone(projection.zero_delta_fraction)
         self.assertIsNone(projection.max_raw_rate_ratio)
         self.assertIsNone(projection.longest_above_overall_rate_run)
+        self.assertIsNone(projection.latest_change_at)
 
     def test_flat_usage_yields_no_projection_and_reason(self) -> None:
         projection = self._project(
@@ -218,6 +219,47 @@ class BurnRateTests(unittest.TestCase):
         self._assertClose(projection.max_usage_share, 0.48936170212765956)
         self._assertClose(projection.rate_drift, 0.13636363636363624)
         self._assertClose(projection.effective_intervals, 2.3575240128068304)
+
+    def test_latest_change_at_is_the_final_captures_timestamp_when_every_gap_moves(
+        self,
+    ) -> None:
+        # Every adjacent pair differs, so the most recent record IS the most
+        # recent change.
+        projection = self._project(
+            [
+                self._record(0.0, 10.0, resets_at=20_000.0),
+                self._record(600.0, 20.0, resets_at=20_000.0),
+                self._record(1_200.0, 30.0, resets_at=20_000.0),
+            ]
+        )[0]
+
+        self.assertIsNone(projection.reason)
+        self.assertEqual(projection.latest_change_at, 1_200.0)
+
+    def test_latest_change_at_is_before_a_trailing_flat_run(self) -> None:
+        # (Codex review, round 2, P1) A climb followed by several captures
+        # that repeat the same percentage: usage genuinely stalled after
+        # t=3_000, but captures kept arriving. latest_change_at must point
+        # at the last capture that actually differed from its predecessor
+        # (3_000.0), not the segment's final capture (4_500.0) -- the whole
+        # point of this field is to let a caller distinguish "recently
+        # captured" from "recently changed", and a trailing flat run is
+        # exactly the case those two diverge.
+        projection = self._project(
+            [
+                self._record(0.0, 10.0, resets_at=20_000.0),
+                self._record(600.0, 20.0, resets_at=20_000.0),
+                self._record(1_200.0, 30.0, resets_at=20_000.0),
+                self._record(1_800.0, 40.0, resets_at=20_000.0),
+                self._record(2_400.0, 50.0, resets_at=20_000.0),
+                self._record(3_000.0, 60.0, resets_at=20_000.0),
+                self._record(3_750.0, 60.0, resets_at=20_000.0),
+                self._record(4_500.0, 60.0, resets_at=20_000.0),
+            ]
+        )[0]
+
+        self.assertIsNone(projection.reason)
+        self.assertEqual(projection.latest_change_at, 3_000.0)
 
     # -- Regression tests for the second-round Codex P2 confidence review --
     # (kept as the historical record of what this metric must expose, now
