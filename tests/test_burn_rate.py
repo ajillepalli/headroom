@@ -21,9 +21,12 @@ from headroom.burn_rate import (
     BurnRateProjection,
     NoProjectionReason,
     _HistoryRecord,
+    _RateUnderflowedToZero,
+    _folded_intervals,
     _interval_measurements,
     _pairwise_slopes,
     _project_group,
+    _raw_intervals,
     _relative_difference,
     project_exhaustion,
 )
@@ -92,6 +95,11 @@ class BurnRateTests(unittest.TestCase):
         self.assertIsNone(projection.intervals_used)
         self.assertIsNone(projection.rate_drift)
         self.assertIsNone(projection.effective_intervals)
+        self.assertIsNone(projection.max_relative_deviation_raw)
+        self.assertIsNone(projection.max_usage_share_raw)
+        self.assertIsNone(projection.intervals_used_raw)
+        self.assertIsNone(projection.rate_drift_raw)
+        self.assertIsNone(projection.effective_intervals_raw)
 
     def test_flat_usage_yields_no_projection_and_reason(self) -> None:
         projection = self._project(
@@ -569,19 +577,62 @@ class BurnRateTests(unittest.TestCase):
         self._assertClose(projection.effective_intervals, 3.0)
         self._assertClose(projection.rate_drift, 0.5)
 
+        # (HIGH finding, round 6) The raw (unfolded) counterparts must be
+        # visible alongside the folded ones. Here they show exactly the
+        # saturation the P1 finding above describes: 4 of the 7 raw gaps
+        # are zero-delta, so the raw median is 0 and every nonzero raw
+        # interval scores the saturated zero-baseline deviation of 1.0 --
+        # in contrast with the folded value's actionable 1/3. This is the
+        # "quantized data" half of the raw/folded divergence: folded looks
+        # better than raw because folding is doing real, wanted work here.
+        self.assertEqual(projection.intervals_used_raw, 7)
+        self._assertClose(projection.max_relative_deviation_raw, 1.0)
+        self._assertClose(projection.max_usage_share_raw, 1.0 / 3.0)
+        self._assertClose(projection.effective_intervals_raw, 3.0)
+        self._assertClose(projection.rate_drift_raw, 0.5)
+
     def test_unfolded_zero_delta_intervals_would_saturate_the_deviation(
         self,
     ) -> None:
         # Direct unit-level companion to the test above: proves the folding
         # in _folded_intervals is what keeps max_relative_deviation
-        # actionable, by checking the un-folded raw shape would have been
-        # degenerate. Without folding, the 7 raw intervals are
-        # [0,0,1/60,0,1/60,0,1/60] %/s; their median is 0 (4 of 7 are
-        # zero), so every nonzero raw interval scores the saturated 1.0
-        # deviation defined for a zero baseline -- the exact "every real
-        # reading looks maximally unstable" failure the round-5 review
-        # found across this project's own production history.
-        raw_rates = [0.0, 0.0, 1.0 / 60.0, 0.0, 1.0 / 60.0, 0.0, 1.0 / 60.0]
+        # actionable. This asserts _folded_intervals' OWN output on the
+        # same 8-point fixture, not a hand-written literal list -- a prior
+        # version of this test built its "would-be-raw" rates by hand,
+        # which stayed green even if _folded_intervals stopped folding
+        # entirely (deleting the fold_zero_delta branch is not caught by
+        # checking a literal that was never produced by the function). This
+        # version fails immediately if folding is deleted, because deleting
+        # it changes _folded_intervals' actual return value.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 90.0),
+            _HistoryRecord(60.0, None, "claude", "short", 90.0),
+            _HistoryRecord(120.0, None, "claude", "short", 90.0),
+            _HistoryRecord(180.0, None, "claude", "short", 91.0),
+            _HistoryRecord(240.0, None, "claude", "short", 91.0),
+            _HistoryRecord(300.0, None, "claude", "short", 92.0),
+            _HistoryRecord(360.0, None, "claude", "short", 92.0),
+            _HistoryRecord(420.0, None, "claude", "short", 93.0),
+        ]
+
+        rates, deltas, elapsed_list = _folded_intervals(records)
+
+        # 7 raw gaps fold down to 3: the two leading zero-delta gaps merge
+        # forward into the first real jump, and each later zero-delta gap
+        # merges into the jump right after it.
+        self.assertEqual(len(rates), 3)
+        self._assertClose(rates[0], 1.0 / 180.0)
+        self._assertClose(rates[1], 1.0 / 120.0)
+        self._assertClose(rates[2], 1.0 / 120.0)
+        self.assertEqual(deltas, [1.0, 1.0, 1.0])
+        self.assertEqual(elapsed_list, [180.0, 120.0, 120.0])
+
+        # And, as before: the RAW (unfolded) view of the same fixture is
+        # what saturates -- this is the direct proof that folding is not
+        # merely cosmetic but is what keeps max_relative_deviation
+        # actionable on quantized data.
+        raw_rates, _, _ = _raw_intervals(records)
+        self.assertEqual(len(raw_rates), 7)
         center = statistics.median(raw_rates)
         self.assertEqual(center, 0.0)
         self._assertClose(_relative_difference(1.0 / 60.0, center), 1.0)
@@ -626,6 +677,281 @@ class BurnRateTests(unittest.TestCase):
         self._assertClose(measurements.rate_drift, 0.6448474590894441)
         self._assertClose(measurements.effective_intervals, 2.0915100185911997)
         self.assertLess(measurements.effective_intervals, 3.0)
+
+    # -- Round 6: raw/folded divergence, usage conservation, underflow ------
+
+    def test_folding_smooths_a_genuine_burst_but_raw_reveals_it(self) -> None:
+        # (HIGH finding, round 6) The complementary case to the quantized
+        # fixture above: ten repetitions of "hold flat for 600s, then burst
+        # 6.01 points in the next single second." Folding merges each flat
+        # run forward into the burst that follows it, so every FOLDED
+        # interval is (delta=6.01, elapsed=601s) -- a uniform ~0.01 %/s rate
+        # that looks perfectly steady, even though the data is a real
+        # 6.01-point-per-SECOND burst, not a steady trickle. This is the
+        # other side of the same coin as the quantized-data case: folding
+        # merging elapsed time across zero-delta gaps is what makes
+        # quantized data readable, and it is the exact same operation that
+        # smooths a burst into a flat rate. Both are true; a caller cannot
+        # tell them apart from the folded fields alone.
+        records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        elapsed = 0.0
+        usage = 0.0
+        for _ in range(10):
+            elapsed += 600.0
+            records.append(_HistoryRecord(elapsed, None, "claude", "short", usage))
+            elapsed += 1.0
+            usage += 6.01
+            records.append(_HistoryRecord(elapsed, None, "claude", "short", usage))
+
+        measurements = _interval_measurements(records)
+
+        assert measurements is not None
+        # Folded: ten equal (delta, elapsed) intervals -- looks flawless.
+        self.assertEqual(measurements.intervals_used, 10)
+        self._assertClose(measurements.max_relative_deviation, 0.0, rel_tol=1e-9)
+        self._assertClose(measurements.max_usage_share, 0.1)
+        self._assertClose(measurements.rate_drift, 0.0, rel_tol=1e-9)
+        self._assertClose(measurements.effective_intervals, 10.0)
+
+        # Raw: twenty intervals, half of them the genuine 1-second bursts at
+        # a rate roughly 601x their flat neighbors. The raw median sits
+        # exactly between the two populations (0.0 and 6.01), so every
+        # interval -- flat or burst -- measures the maximal 1.0 relative
+        # deviation from it. That saturation, next to the folded value's
+        # ~0.0, is the tell: a large raw/folded GAP is itself the signal
+        # that folding smoothed over something, here a real burst rather
+        # than mere quantization.
+        self.assertEqual(measurements.intervals_used_raw, 20)
+        self._assertClose(measurements.max_relative_deviation_raw, 1.0)
+        self._assertClose(measurements.max_usage_share_raw, 0.1)
+
+    def test_usage_is_conserved_across_folded_and_raw_intervals(self) -> None:
+        # (HIGH finding, round 6, method requirement) Whatever folding or
+        # skipping happens internally, the sum of every measured interval's
+        # usage delta must equal the segment's overall usage delta (latest
+        # minus first) exactly -- for BOTH the folded and the raw view.
+        # This is checked across several different fixture shapes: a clean
+        # steady series, the quantized-real-data shape, a sub-microsecond
+        # skipped interval, and a long run of zero-delta folding.
+        fixtures = []
+
+        clean = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        for index in range(1, 5):
+            clean.append(
+                _HistoryRecord(float(index) * 60.0, None, "claude", "short", float(index) * 10.0)
+            )
+        fixtures.append(clean)
+
+        quantized = [
+            _HistoryRecord(0.0, None, "claude", "short", 90.0),
+            _HistoryRecord(60.0, None, "claude", "short", 90.0),
+            _HistoryRecord(120.0, None, "claude", "short", 90.0),
+            _HistoryRecord(180.0, None, "claude", "short", 91.0),
+            _HistoryRecord(240.0, None, "claude", "short", 91.0),
+            _HistoryRecord(300.0, None, "claude", "short", 92.0),
+            _HistoryRecord(360.0, None, "claude", "short", 92.0),
+            _HistoryRecord(420.0, None, "claude", "short", 93.0),
+        ]
+        fixtures.append(quantized)
+
+        sub_microsecond = [
+            _HistoryRecord(0.0, None, "claude", "short", 90.0),
+            _HistoryRecord(60.0, None, "claude", "short", 91.0),
+            _HistoryRecord(60.0000005, None, "claude", "short", 98.9),
+            _HistoryRecord(120.0, None, "claude", "short", 99.9),
+        ]
+        fixtures.append(sub_microsecond)
+
+        long_zero_run = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        long_zero_run.append(_HistoryRecord(60.0, None, "claude", "short", 1.0))
+        elapsed = 60.0
+        for _ in range(99):
+            elapsed += 60.0
+            long_zero_run.append(_HistoryRecord(elapsed, None, "claude", "short", 1.0))
+        elapsed += 60.0
+        long_zero_run.append(_HistoryRecord(elapsed, None, "claude", "short", 100.0))
+        fixtures.append(long_zero_run)
+
+        for records in fixtures:
+            expected_total = records[-1].used_percentage - records[0].used_percentage
+            _, folded_deltas, _ = _folded_intervals(records)
+            _, raw_deltas, _ = _raw_intervals(records)
+            self.assertAlmostEqual(
+                sum(folded_deltas),
+                expected_total,
+                msg=f"folded deltas do not conserve usage for {records!r}",
+            )
+            self.assertAlmostEqual(
+                sum(raw_deltas),
+                expected_total,
+                msg=f"raw deltas do not conserve usage for {records!r}",
+            )
+
+    def test_sub_microsecond_interval_carries_its_usage_delta_forward(
+        self,
+    ) -> None:
+        # (HIGH finding, round 6) A sub-microsecond gap sits between two
+        # ordinary readings: (60, 91) -> (60.0000005, 98.9) is a 7.9-point
+        # jump over ~5e-7s, well below MIN_INTERVAL_SECONDS. That gap cannot
+        # stand as its own interval (dividing by ~5e-7s is not evidence),
+        # but its 7.9-point usage delta is real and must survive by being
+        # carried forward into the next measurable interval -- the same
+        # carry-forward folding already does for zero-delta gaps. The old
+        # code discarded it outright: the elapsed AND delta of a
+        # below-threshold gap were dropped before ever reaching the
+        # accumulator, so the reported deltas were the degenerate [1.0, 1.0]
+        # instead of the true [1.0, 8.9].
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 90.0),
+            _HistoryRecord(60.0, None, "claude", "short", 91.0),
+            _HistoryRecord(60.0000005, None, "claude", "short", 98.9),
+            _HistoryRecord(120.0, None, "claude", "short", 99.9),
+        ]
+
+        rates, deltas, elapsed_list = _folded_intervals(records)
+
+        self.assertEqual(len(deltas), 2)
+        self._assertClose(deltas[0], 1.0)
+        # The 7.9-point jump is preserved inside the second interval's
+        # delta (1.0 carried over from the 99.9-98.9 gap, plus the 7.9 from
+        # the sub-microsecond gap) rather than vanishing.
+        self._assertClose(deltas[1], 8.900000000000006)
+        self.assertAlmostEqual(sum(deltas), 99.9 - 90.0)
+
+        measurements = _interval_measurements(records)
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 2)
+        self._assertClose(measurements.max_relative_deviation, 0.7979797979797981)
+        self._assertClose(measurements.max_usage_share, 0.898989898989899)
+
+    def test_positive_delta_underflowing_to_zero_rate_is_declined(self) -> None:
+        # (MEDIUM finding, round 6) Disproves the old docstring claim that a
+        # zero median is structurally unreachable because every folded
+        # interval's delta is strictly positive. It is: 5e-324 and 1e-323
+        # are the two smallest representable positive doubles, and dividing
+        # either by an ordinary 60s elapsed time underflows to an exact
+        # 0.0 -- a positive delta with no representable rate. Folding that
+        # interval in as "rate 0.0" would silently misrepresent a
+        # measurement failure as trivial zero-usage agreement, and corrupt
+        # the median every other interval is compared against. Instead,
+        # _RateUnderflowedToZero is raised so the caller can decline the
+        # whole projection instead of reporting numbers built on it.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 0.0),
+            _HistoryRecord(60.0, None, "claude", "short", 5e-324),
+            _HistoryRecord(120.0, None, "claude", "short", 1e-323),
+            _HistoryRecord(121.0, None, "claude", "short", 99.0),
+        ]
+
+        with self.assertRaises(_RateUnderflowedToZero):
+            _interval_measurements(records)
+
+    def test_underflowed_rate_declines_the_whole_projection(self) -> None:
+        # End-to-end companion to the direct test above: project_exhaustion
+        # must turn the raised _RateUnderflowedToZero into a declined
+        # projection with a distinct reason, not let the exception escape
+        # or silently fall back to NON_FINITE_RESULT (0.0 is finite; this
+        # is a different failure mode and callers should be able to tell
+        # them apart).
+        projection = self._project(
+            [
+                self._record(0.0, 0.0, resets_at=None),
+                self._record(60.0, 5e-324, resets_at=None),
+                self._record(120.0, 1e-323, resets_at=None),
+                self._record(121.0, 99.0, resets_at=None),
+            ],
+            now=121.5,
+        )[0]
+
+        self.assertEqual(
+            projection.reason, NoProjectionReason.RATE_UNDERFLOWED_TO_ZERO
+        )
+        self.assertIsNone(projection.projected_exhaustion_at)
+        self._assertNoMeasurements(projection)
+        # The Theil-Sen rate itself is fitted independently of the interval
+        # diagnostics and does not underflow the same way, so it is still
+        # reported even though the diagnostics declined.
+        self.assertIsNotNone(projection.rate_percent_per_second)
+
+    def test_exact_zero_delta_folding_is_not_a_tolerance(self) -> None:
+        # (MEDIUM test finding, round 6) A mutation that replaces the exact
+        # `accumulated_delta == 0.0` fold check with a near-zero tolerance
+        # (e.g. `< 1e-9`) previously survived the whole suite. This fixture
+        # is built to fail under such a mutant: the first gap's delta is
+        # 1e-12 -- nonzero, but small enough that a 1e-9 tolerance would
+        # treat it as "close enough to zero" and fold it forward anyway.
+        # Under the correct exact check it must survive as its own
+        # (tiny-rate) interval, giving THREE folded intervals with an
+        # enormous rate_drift; the tolerant mutant folds it away, giving
+        # only TWO intervals with zero drift.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 98.0),
+            _HistoryRecord(60.0, None, "claude", "short", 98.000000000001),
+            _HistoryRecord(120.0, None, "claude", "short", 99.0),
+            _HistoryRecord(180.0, None, "claude", "short", 99.5),
+        ]
+
+        rates, deltas, elapsed_list = _folded_intervals(records)
+        self.assertEqual(len(rates), 3)
+
+        measurements = _interval_measurements(records)
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 3)
+        self._assertClose(measurements.rate_drift, 753950830473.4714, rel_tol=1e-6)
+
+    def test_single_surviving_folded_interval(self) -> None:
+        # (MEDIUM test finding, round 6) No existing test covered the case
+        # where folding collapses a segment down to exactly ONE surviving
+        # interval: (0,10) and (60,10) fold together (zero delta), then
+        # merge into the (120,20) jump, leaving one interval covering the
+        # whole 120s span. All five folded measurements are asserted so a
+        # mutation to any one of them (including the single-interval
+        # rate_drift=0.0 special case) is caught here.
+        records = [
+            _HistoryRecord(0.0, None, "claude", "short", 10.0),
+            _HistoryRecord(60.0, None, "claude", "short", 10.0),
+            _HistoryRecord(120.0, None, "claude", "short", 20.0),
+        ]
+
+        measurements = _interval_measurements(records)
+
+        assert measurements is not None
+        self.assertEqual(measurements.intervals_used, 1)
+        self._assertClose(measurements.max_relative_deviation, 0.0)
+        self._assertClose(measurements.max_usage_share, 1.0)
+        self._assertClose(measurements.rate_drift, 0.0)
+        self._assertClose(measurements.effective_intervals, 1.0)
+
+    def test_long_zero_run_accumulates_full_elapsed_time(self) -> None:
+        # (MEDIUM test finding, round 6) The longest zero-delta run any
+        # prior fixture folded was two consecutive readings. Here, usage
+        # sits flat at 1.0 for 99 consecutive one-minute readings (5,940
+        # seconds of folded-together zero-delta gaps) before the next real
+        # jump to 100.0. A mutant that truncates the accumulated-elapsed
+        # carry after just a couple of zero-delta folds (instead of
+        # continuing to accumulate across the whole run) would report a
+        # short elapsed time for the final interval instead of the true
+        # 6,000 seconds (60s for the initial 0->1 jump's neighbor gap, plus
+        # 5,940s of zero runs, plus the final 60s gap into the 100.0 jump).
+        records = [_HistoryRecord(0.0, None, "claude", "short", 0.0)]
+        records.append(_HistoryRecord(60.0, None, "claude", "short", 1.0))
+        elapsed = 60.0
+        for _ in range(99):
+            elapsed += 60.0
+            records.append(_HistoryRecord(elapsed, None, "claude", "short", 1.0))
+        elapsed += 60.0
+        records.append(_HistoryRecord(elapsed, None, "claude", "short", 100.0))
+        self.assertEqual(len(records), 102)
+        self.assertEqual(elapsed, 6060.0)
+
+        rates, deltas, elapsed_list = _folded_intervals(records)
+
+        self.assertEqual(len(elapsed_list), 2)
+        self._assertClose(elapsed_list[0], 60.0)
+        # The full 6,000-second accumulated elapsed time of the long zero
+        # run plus its bracketing gaps must survive intact.
+        self._assertClose(elapsed_list[1], 6000.0)
+        self._assertClose(deltas[1], 99.0)
 
     def test_single_terminal_burst_after_quiet_history(self) -> None:
         # (Codex P1, round 1) All the acceleration comes from one 1-second
