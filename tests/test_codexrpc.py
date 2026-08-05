@@ -14,7 +14,12 @@ import time
 import unittest
 from unittest import mock
 
+from headroom.bounds import Snapshot
+from headroom.codexrpc import CodexRpcResult
+from headroom.codexsrc import CodexResult
+from headroom import cli
 from headroom.cli import main
+from headroom.state import save_snapshots
 
 
 STUB = Path(__file__).with_name("codex_app_server_stub.py")
@@ -127,6 +132,45 @@ class CodexRpcTests(unittest.TestCase):
             self.assertEqual(diagnostics["source"], "rollout")
             self.assertFalse(diagnostics["rpc_attempted"])
             self.assertFalse((root / "started").exists())
+
+    def test_hook_uses_total_deadline_bounded_scan_and_stored_state_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = time.time()
+            environment = {
+                "CODEX_HOME": str(root / "codex-hooks"),
+                "HEADROOM_CODEX_HOME": str(root / "codex-home"),
+                "HEADROOM_STATE_DIR": str(root / "state"),
+            }
+            stored = Snapshot(
+                used_percentage=94.0,
+                captured_at=now,
+                resets_at=now + 7_200,
+                window="weekly",
+                source="codex",
+            )
+            rpc_result = CodexRpcResult((), True, ("hook deadline reached",))
+            rollout_result = CodexResult((), None, 0, ("rollout scan deadline reached",))
+            output = StringIO()
+            started = time.monotonic()
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                save_snapshots((stored,))
+                with mock.patch("headroom.cli.read_rate_limits", return_value=rpc_result) as rpc:
+                    with mock.patch("headroom.cli.read_latest", return_value=rollout_result) as rollout:
+                        with redirect_stdout(output):
+                            result = main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("94% used", output.getvalue())
+            deadline = rpc.call_args.kwargs["deadline"]
+            self.assertIsNotNone(deadline)
+            self.assertLessEqual(deadline, started + cli.HOOK_DEADLINE_SECONDS + 0.25)
+            self.assertEqual(rollout.call_args.kwargs["deadline"], deadline)
+            self.assertEqual(
+                rollout.call_args.kwargs["max_files"],
+                cli.HOOK_MAX_ROLLOUT_FILES,
+            )
 
     def _environment(self, root: Path, mode: str) -> dict[str, str]:
         return {

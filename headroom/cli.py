@@ -20,7 +20,11 @@ from .install_info import format_modified_time, inspect_install, source_commit
 from .render import render_hook, render_report, render_statusline
 from .resets import reset_time_is_plausible, window_minutes_from_raw
 from .severity import Severity
-from .settings import codex_hook_registration, run_init
+from .settings import (
+    codex_hook_command_availability,
+    codex_hook_registration,
+    run_init,
+)
 from .state import (
     clear_state,
     read_state,
@@ -36,6 +40,10 @@ class _CodexRefreshResult:
     source: str
     rpc: CodexRpcResult
     rollout: Optional[CodexResult]
+
+
+HOOK_DEADLINE_SECONDS = 7.0
+HOOK_MAX_ROLLOUT_FILES = 32
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print human-readable text even when hook JSON is received",
     )
+    hook_parser.add_argument("--stored-only", action="store_true", help=argparse.SUPPRESS)
     init_parser = subparsers.add_parser("init", help="configure Claude Code and Codex hooks")
     init_targets = init_parser.add_mutually_exclusive_group()
     init_targets.add_argument(
@@ -142,7 +151,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if arguments.command == "doctor":
             return _doctor()
         now = time.time()
-        _refresh_codex()
+        if arguments.command != "hook" or not arguments.stored_only:
+            deadline = (
+                time.monotonic() + HOOK_DEADLINE_SECONDS
+                if arguments.command == "hook"
+                else None
+            )
+            _refresh_codex(deadline=deadline)
         state = read_state()
         readings = _readings(state, now)
         if arguments.command == "status":
@@ -220,18 +235,21 @@ def _statusline() -> int:
     return 0
 
 
-def _refresh_codex() -> _CodexRefreshResult:
-    result = _read_codex_on_demand()
+def _refresh_codex(deadline: Optional[float] = None) -> _CodexRefreshResult:
+    result = _read_codex_on_demand(deadline=deadline)
     diagnostics: Dict[str, Any] = {"codex": _codex_diagnostics(result)}
     save_snapshots(result.snapshots, diagnostics=diagnostics)
     return result
 
 
-def _read_codex_on_demand() -> _CodexRefreshResult:
-    rpc = read_rate_limits()
+def _read_codex_on_demand(deadline: Optional[float] = None) -> _CodexRefreshResult:
+    rpc = read_rate_limits(deadline=deadline)
     if rpc.snapshots:
         return _CodexRefreshResult(rpc.snapshots, "app-server", rpc, None)
-    rollout = read_latest()
+    rollout = read_latest(
+        deadline=deadline,
+        max_files=HOOK_MAX_ROLLOUT_FILES if deadline is not None else None,
+    )
     source = "rollout" if rollout.snapshots else "none"
     return _CodexRefreshResult(rollout.snapshots, source, rpc, rollout)
 
@@ -281,6 +299,7 @@ def _doctor() -> int:
     codex_hooks, codex_hook_status = codex_hook_registration()
     print("Codex hooks file: {}".format(codex_hooks))
     print("Codex hook: {}".format(codex_hook_status))
+    print("Codex hook command: {}".format(codex_hook_command_availability()))
     directory = resolve_state_dir()
     state_path = directory / "state.json"
     state = read_state()

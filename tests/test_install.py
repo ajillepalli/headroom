@@ -165,6 +165,14 @@ class InstallTests(unittest.TestCase):
             self.assertIn("-m headroom.cli {}".format(subcommand), command)
             self.assertIn("PYTHONPATH", command)
 
+    def test_codex_command_uses_python_fallback_without_headroom(self) -> None:
+        with mock.patch("headroom.settings.shutil.which", return_value=None):
+            command = codex_hooks_snippet()["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+
+        self.assertIn(str(Path(sys.executable).resolve()), command)
+        self.assertIn("-m headroom.cli hook", command)
+        self.assertIn("PYTHONPATH", command)
+
     def test_codex_init_writes_verified_schema_to_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "codex"
@@ -177,7 +185,8 @@ class InstallTests(unittest.TestCase):
             installed = json.loads(installed_text)
             self.assertEqual(installed, self.CODEX_DOCUMENT)
             self.assertEqual(installed_text, json.dumps(self.CODEX_DOCUMENT, indent=2) + "\n")
-            self.assertEqual(codex_hooks_snippet(), self.CODEX_DOCUMENT)
+            with mock.patch("headroom.settings.shutil.which", return_value=os.devnull):
+                self.assertEqual(codex_hooks_snippet(), self.CODEX_DOCUMENT)
 
     def test_codex_home_override_takes_precedence_for_tests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -239,6 +248,50 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((home / "hooks.json").read_text(encoding="utf-8"), first_content)
             self.assertEqual(len(json.loads(first_content)["hooks"]["UserPromptSubmit"]), 1)
             self.assertEqual(list(home.glob("hooks.json.*.bak")), [])
+
+    def test_customized_headroom_hook_is_preserved_and_not_duplicated_for_both_targets(self) -> None:
+        customized = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "  headroom   hook  ",
+                    "timeoutSec": 30,
+                    "custom": True,
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                json.dumps({"hooks": {"UserPromptSubmit": [customized]}}),
+                encoding="utf-8",
+            )
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            hooks_path = codex_home / "hooks.json"
+            hooks_path.write_text(
+                json.dumps({"hooks": {"UserPromptSubmit": [customized]}}),
+                encoding="utf-8",
+            )
+
+            result, stdout, stderr = self._run_cli(
+                [
+                    "init",
+                    "--all",
+                    "--settings",
+                    str(settings),
+                    "--codex-home",
+                    str(codex_home),
+                ]
+            )
+
+            self.assertEqual(result, 0, stderr)
+            for path in (settings, hooks_path):
+                prompt_hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+                self.assertEqual(prompt_hooks, [customized])
+            self.assertEqual(stdout.count("customized headroom hook"), 2)
 
     def test_codex_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -342,22 +395,83 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(settings.read_text(encoding="utf-8"), '{"theme": "dark"}\n')
             self.assertEqual(hooks.read_text(encoding="utf-8"), "{broken\n")
 
+    def test_init_all_rejects_aliased_targets_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "codex"
+            aliased_settings = codex_home / "child" / ".." / "hooks.json"
+
+            with mock.patch("headroom.settings._prepare_install") as preflight:
+                result, _, stderr = self._run_cli(
+                    [
+                        "init",
+                        "--all",
+                        "--settings",
+                        str(aliased_settings),
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            self.assertNotEqual(result, 0)
+            self.assertIn("same file as both Claude and Codex", stderr)
+            preflight.assert_not_called()
+
+    def test_concurrent_creation_after_preflight_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            concurrent = '{"created": "concurrently"}\n'
+            real_prepare = settings_module._prepare_install
+
+            def prepare_then_create(target):
+                prepared = real_prepare(target)
+                path.write_text(concurrent, encoding="utf-8")
+                return prepared
+
+            with mock.patch("headroom.settings._prepare_install", side_effect=prepare_then_create):
+                result, _, stderr = self._run_init(path)
+
+            self.assertNotEqual(result, 0)
+            self.assertIn("appeared after preflight", stderr)
+            self.assertEqual(path.read_text(encoding="utf-8"), concurrent)
+            self.assertEqual(list(path.parent.glob("settings.json.*.bak")), [])
+
+    def test_concurrent_edit_after_preflight_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text('{"before": true}\n', encoding="utf-8")
+            concurrent = '{"edited": "concurrently"}\n'
+            real_prepare = settings_module._prepare_install
+
+            def prepare_then_edit(target):
+                prepared = real_prepare(target)
+                path.write_text(concurrent, encoding="utf-8")
+                return prepared
+
+            with mock.patch("headroom.settings._prepare_install", side_effect=prepare_then_edit):
+                result, _, stderr = self._run_init(path)
+
+            self.assertNotEqual(result, 0)
+            self.assertIn("changed after preflight", stderr)
+            self.assertEqual(path.read_text(encoding="utf-8"), concurrent)
+            self.assertEqual(list(path.parent.glob("settings.json.*.bak")), [])
+
     def test_init_all_rolls_back_first_target_if_second_write_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "claude" / "settings.json"
             codex_home = root / "codex"
-            real_atomic_write = settings_module._atomic_write
+            real_write_prepared = settings_module._write_prepared
             calls = 0
 
-            def fail_second_write(path: Path, text: str) -> None:
+            def fail_second_write(item) -> None:
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("simulated Codex write failure")
-                real_atomic_write(path, text)
+                real_write_prepared(item)
 
-            with mock.patch("headroom.settings._atomic_write", side_effect=fail_second_write):
+            with mock.patch("headroom.settings._write_prepared", side_effect=fail_second_write):
                 result, _, stderr = self._run_cli(
                     ["init", "--all", "--settings", str(settings), "--codex-home", str(codex_home)]
                 )

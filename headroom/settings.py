@@ -9,6 +9,7 @@ import difflib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -85,7 +86,7 @@ def codex_hooks_snippet() -> Dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "headroom hook",
+                            "command": headroom_command("hook"),
                             "timeoutSec": 10,
                         }
                     ]
@@ -107,7 +108,7 @@ def merge_settings(existing: Dict[str, Any], snippet: Dict[str, Any]) -> Dict[st
         raise ValueError("the existing 'hooks.UserPromptSubmit' setting is not a JSON array")
 
     headroom_hook = snippet["hooks"]["UserPromptSubmit"][0]
-    if headroom_hook not in prompt_hooks:
+    if not _contains_headroom_hook(prompt_hooks):
         prompt_hooks.append(copy.deepcopy(headroom_hook))
     merged["statusLine"] = copy.deepcopy(snippet["statusLine"])
     return merged
@@ -126,7 +127,7 @@ def merge_codex_hooks(existing: Dict[str, Any], snippet: Dict[str, Any]) -> Dict
         raise ValueError("the existing 'hooks.UserPromptSubmit' setting is not a JSON array")
 
     headroom_hook = snippet["hooks"]["UserPromptSubmit"][0]
-    if headroom_hook not in prompt_hooks:
+    if not _contains_headroom_hook(prompt_hooks):
         prompt_hooks.append(copy.deepcopy(headroom_hook))
     return merged
 
@@ -142,9 +143,11 @@ class _InstallTarget:
 class _PreparedInstall:
     target: _InstallTarget
     existed: bool
+    original_bytes: bytes
     original_text: str
     rendered: str
     changed: bool
+    customized_hook: bool
 
 
 def run_init(
@@ -174,6 +177,15 @@ def run_init(
                 merge_codex_hooks,
             )
         )
+
+    if len(targets) > 1 and _same_file(targets[0].path, targets[1].path):
+        print(
+            "headroom init: refusing to configure the same file as both Claude and Codex: {}".format(
+                targets[0].path
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     if print_only:
         document = (
@@ -209,24 +221,21 @@ def run_init(
     changed = [item for item in prepared if item.changed]
     if not changed:
         for item in prepared:
-            print("headroom init: {} is already configured".format(item.target.path))
+            if item.customized_hook:
+                print(
+                    "headroom init: {} already has a customized headroom hook; leaving it unchanged".format(
+                        item.target.path
+                    )
+                )
+            else:
+                print("headroom init: {} is already configured".format(item.target.path))
         return 0
-
-    try:
-        for item in changed:
-            item.target.path.parent.mkdir(parents=True, exist_ok=True)
-            if item.existed:
-                backup = _backup_path(item.target.path)
-                shutil.copyfile(str(item.target.path), str(backup))
-                print("Backup: {}".format(backup))
-    except OSError as error:
-        print("headroom init: could not create backups: {}".format(error), file=sys.stderr)
-        return 1
 
     applied: List[_PreparedInstall] = []
     try:
         for item in changed:
-            _atomic_write(item.target.path, item.rendered)
+            item.target.path.parent.mkdir(parents=True, exist_ok=True)
+            _write_prepared(item)
             applied.append(item)
     except OSError as error:
         rollback_errors = _rollback_installs(applied)
@@ -250,7 +259,13 @@ def run_init(
     for item in changed:
         print("Updated: {}".format(item.target.path))
     for item in prepared:
-        if not item.changed:
+        if item.customized_hook:
+            print(
+                "headroom init: {} already has a customized headroom hook; leaving it unchanged".format(
+                    item.target.path
+                )
+            )
+        elif not item.changed:
             print("headroom init: {} is already configured".format(item.target.path))
     return 0
 
@@ -258,11 +273,13 @@ def run_init(
 def _prepare_install(target: _InstallTarget) -> _PreparedInstall:
     path = target.path
     existed = path.exists()
+    original_bytes = b""
     original_text = ""
     existing: Dict[str, Any] = {}
     if existed:
         try:
-            original_text = path.read_text(encoding="utf-8")
+            original_bytes = path.read_bytes()
+            original_text = original_bytes.decode("utf-8")
             parsed = json.loads(original_text)
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid JSON ({})".format(error))
@@ -273,7 +290,48 @@ def _prepare_install(target: _InstallTarget) -> _PreparedInstall:
     merged = target.merger(existing, target.snippet)
     rendered = json.dumps(merged, indent=2) + "\n"
     changed = merged != existing
-    return _PreparedInstall(target, existed, original_text, rendered, changed)
+    prompt_hooks = _prompt_hooks(existing)
+    expected = target.snippet["hooks"]["UserPromptSubmit"][0]
+    customized_hook = _contains_headroom_hook(prompt_hooks) and expected not in prompt_hooks
+    return _PreparedInstall(
+        target,
+        existed,
+        original_bytes,
+        original_text,
+        rendered,
+        changed,
+        customized_hook,
+    )
+
+
+def _write_prepared(item: _PreparedInstall) -> None:
+    """Commit a preflighted update only if its target is still unchanged."""
+
+    path = item.target.path
+    if not item.existed:
+        try:
+            _exclusive_write(path, item.rendered)
+        except FileExistsError as error:
+            raise OSError(
+                "{} appeared after preflight; refusing to overwrite it".format(path)
+            ) from error
+        return
+
+    _assert_preflight_content(path, item.original_bytes)
+    backup = _backup_path(path)
+    _exclusive_write(backup, item.original_text)
+    print("Backup: {}".format(backup))
+    _assert_preflight_content(path, item.original_bytes)
+    _atomic_write(path, item.rendered)
+
+
+def _assert_preflight_content(path: Path, expected: bytes) -> None:
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError as error:
+        raise OSError("{} changed after preflight (file was removed)".format(path)) from error
+    if current != expected:
+        raise OSError("{} changed after preflight; refusing to overwrite it".format(path))
 
 
 def _rollback_installs(applied: Sequence[_PreparedInstall]) -> List[str]:
@@ -304,17 +362,132 @@ def codex_hook_registration(codex_home: Optional[Path] = None) -> Tuple[Path, st
         return path, "not registered (invalid top level)"
     hooks = parsed.get("hooks")
     prompt_hooks = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
-    expected = codex_hooks_snippet()["hooks"]["UserPromptSubmit"][0]
     return (
         (path, "registered")
-        if isinstance(prompt_hooks, list) and expected in prompt_hooks
+        if isinstance(prompt_hooks, list) and _contains_headroom_hook(prompt_hooks)
         else (path, "not registered")
     )
+
+
+def codex_hook_command_availability(codex_home: Optional[Path] = None) -> str:
+    """Return whether the registered Codex hook command can be launched."""
+
+    path = codex_hooks_path(codex_home)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "not checked (hook not registered)"
+    prompt_hooks = _prompt_hooks(parsed if isinstance(parsed, dict) else {})
+    commands = list(_headroom_hook_commands(prompt_hooks))
+    if not commands:
+        return "not checked (hook not registered)"
+    return "available" if any(_command_is_available(command) for command in commands) else "unavailable"
 
 
 def _backup_path(path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S.%f")
     return path.with_name("{}.{}.bak".format(path.name, timestamp))
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    """Compare paths after resolving aliases, including existing same-file links."""
+
+    first_resolved = first.expanduser().resolve(strict=False)
+    second_resolved = second.expanduser().resolve(strict=False)
+    if os.path.normcase(str(first_resolved)) == os.path.normcase(str(second_resolved)):
+        return True
+    try:
+        return os.path.samefile(str(first), str(second))
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _prompt_hooks(document: Dict[str, Any]) -> List[Any]:
+    hooks = document.get("hooks")
+    prompt_hooks = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    return prompt_hooks if isinstance(prompt_hooks, list) else []
+
+
+def _contains_headroom_hook(prompt_hooks: Sequence[Any]) -> bool:
+    return any(_headroom_hook_commands(prompt_hooks))
+
+
+def _headroom_hook_commands(prompt_hooks: Sequence[Any]):
+    for wrapper in prompt_hooks:
+        if not isinstance(wrapper, dict):
+            continue
+        registrations = wrapper.get("hooks")
+        if not isinstance(registrations, list):
+            registrations = [wrapper]
+        for registration in registrations:
+            if not isinstance(registration, dict) or registration.get("type") != "command":
+                continue
+            command = registration.get("command")
+            if isinstance(command, str) and _is_headroom_hook_command(command):
+                yield command
+
+
+def _command_segments(command: str) -> List[List[str]]:
+    segments: List[List[str]] = []
+    for raw_segment in re.split(r"\s*(?:&&|\|\||;)\s*", command.strip()):
+        if not raw_segment:
+            continue
+        try:
+            tokens = shlex.split(raw_segment, posix=os.name != "nt")
+        except ValueError:
+            tokens = raw_segment.split()
+        cleaned = [token.strip("\"'") for token in tokens]
+        while cleaned and "=" in cleaned[0] and not cleaned[0].startswith(("-", "/")):
+            cleaned.pop(0)
+        if cleaned and cleaned[0].casefold() == "env":
+            cleaned.pop(0)
+            while cleaned and "=" in cleaned[0]:
+                cleaned.pop(0)
+        if cleaned:
+            segments.append(cleaned)
+    return segments
+
+
+def _is_headroom_hook_command(command: str) -> bool:
+    for tokens in _command_segments(command):
+        executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if executable in ("headroom", "headroom.exe") and len(tokens) > 1:
+            if tokens[1].casefold() == "hook":
+                return True
+        lowered = [token.casefold() for token in tokens]
+        for index in range(len(lowered) - 2):
+            if lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]:
+                return True
+    return False
+
+
+def _command_is_available(command: str) -> bool:
+    for tokens in _command_segments(command):
+        lowered = [token.casefold() for token in tokens]
+        is_hook = False
+        if len(tokens) > 1:
+            name = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+            is_hook = name in ("headroom", "headroom.exe") and lowered[1] == "hook"
+        is_hook = is_hook or any(
+            lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]
+            for index in range(len(lowered) - 2)
+        )
+        if not is_hook:
+            continue
+        executable = tokens[0]
+        if Path(executable).is_absolute():
+            return Path(executable).is_file()
+        return shutil.which(executable) is not None
+    return False
+
+
+def _exclusive_write(path: Path, text: str) -> None:
+    """Create a complete new file without replacing one that already exists."""
+
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _atomic_write(path: Path, text: str) -> None:

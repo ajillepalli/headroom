@@ -155,6 +155,45 @@ class CliTests(unittest.TestCase):
             self.assertIn("Codex hooks file: {}".format(hooks_path), output.getvalue())
             self.assertIn("Codex hook: registered", output.getvalue())
 
+    def test_doctor_reports_registration_separately_from_command_availability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            hooks_path = codex_home / "hooks.json"
+            document = {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "headroom hook",
+                                    "timeoutSec": 30,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            hooks_path.write_text(json.dumps(document), encoding="utf-8")
+            environment = {
+                "CODEX_HOME": str(codex_home),
+                "HEADROOM_STATE_DIR": str(root / "state"),
+                "HEADROOM_CODEX_HOME": str(root / "capture"),
+                "HEADROOM_CODEX_RPC": "0",
+            }
+            output = io.StringIO()
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("headroom.settings.shutil.which", return_value=None):
+                    with redirect_stdout(output):
+                        result = cli.main(["doctor"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Codex hook: registered", output.getvalue())
+            self.assertIn("Codex hook command: unavailable", output.getvalue())
+
     def test_package_and_project_versions_match(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         project_section = pyproject.read_text(encoding="utf-8").split("[project]", 1)[1]

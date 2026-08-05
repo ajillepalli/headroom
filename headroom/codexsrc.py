@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -79,37 +80,108 @@ def parse_rate_limits(
     return tuple(found[key] for key in ("short", "weekly") if key in found)
 
 
-def read_latest(sessions_dir: Optional[Path] = None) -> CodexResult:
+def read_latest(
+    sessions_dir: Optional[Path] = None,
+    *,
+    deadline: Optional[float] = None,
+    max_files: Optional[int] = None,
+) -> CodexResult:
     """Scan newest rollout files until one yields a usable last snapshot."""
 
     root = default_sessions_dir() if sessions_dir is None else Path(sessions_dir)
     if not root.is_dir():
         return CodexResult((), None, 0, ("sessions directory not found",))
     try:
-        files = sorted(
-            root.glob("*/*/*/rollout-*.jsonl"),
-            key=lambda path: (path.stat().st_mtime, str(path)),
-            reverse=True,
-        )
+        files, discovery_note = _rollout_files(root, deadline, max_files)
     except OSError as error:
         return CodexResult((), None, 0, (str(error),))
 
     checked = 0
-    notes: List[str] = []
+    notes: List[str] = [discovery_note] if discovery_note is not None else []
     for path in files:
+        if deadline is not None and time.monotonic() >= deadline:
+            notes.append("rollout scan deadline reached")
+            break
         checked += 1
-        snapshots = _last_snapshot_in_file(path, notes)
+        snapshots = _last_snapshot_in_file(path, notes, deadline)
         if snapshots:
             return CodexResult(snapshots, str(path), checked, tuple(notes))
     return CodexResult((), None, checked, tuple(notes or ["no usable rate limits found"]))
 
 
-def _last_snapshot_in_file(path: Path, notes: List[str]) -> Tuple[Snapshot, ...]:
+def _rollout_files(
+    root: Path,
+    deadline: Optional[float],
+    max_files: Optional[int],
+) -> Tuple[List[Path], Optional[str]]:
+    if max_files is None:
+        files = list(root.glob("*/*/*/rollout-*.jsonl"))
+        return sorted(files, key=_file_sort_key, reverse=True), None
+
+    limit = max(0, max_files)
+    if limit == 0:
+        return [], "rollout scan limited to 0 files"
+    entry_budget = max(16, limit * 8)
+    candidates: List[Path] = []
+    exhausted = False
+
+    def children(path: Path, directories: bool) -> List[Path]:
+        nonlocal entry_budget, exhausted
+        found: List[Path] = []
+        with os.scandir(str(path)) as entries:
+            for entry in entries:
+                if deadline is not None and time.monotonic() >= deadline:
+                    exhausted = True
+                    break
+                if entry_budget <= 0:
+                    exhausted = True
+                    break
+                entry_budget -= 1
+                try:
+                    matches = entry.is_dir() if directories else entry.is_file()
+                except OSError:
+                    continue
+                if matches:
+                    found.append(Path(entry.path))
+        return sorted(found, key=lambda child: child.name, reverse=True)
+
+    for year in children(root, True):
+        for month in children(year, True):
+            for day in children(month, True):
+                for path in children(day, False):
+                    if path.name.startswith("rollout-") and path.name.endswith(".jsonl"):
+                        candidates.append(path)
+                        if len(candidates) >= limit:
+                            exhausted = True
+                            break
+                if exhausted:
+                    break
+            if exhausted:
+                break
+        if exhausted:
+            break
+
+    note = "rollout scan bounded at {} files".format(limit) if exhausted else None
+    return sorted(candidates, key=_file_sort_key, reverse=True), note
+
+
+def _file_sort_key(path: Path) -> Tuple[float, str]:
+    return path.stat().st_mtime, str(path)
+
+
+def _last_snapshot_in_file(
+    path: Path,
+    notes: List[str],
+    deadline: Optional[float] = None,
+) -> Tuple[Snapshot, ...]:
     latest: Tuple[Snapshot, ...] = ()
     try:
         captured_fallback = path.stat().st_mtime
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line_number, line in enumerate(handle, 1):
+                if deadline is not None and time.monotonic() >= deadline:
+                    notes.append("rollout scan deadline reached while reading {}".format(path))
+                    break
                 try:
                     payload = json.loads(line)
                 except ValueError:
