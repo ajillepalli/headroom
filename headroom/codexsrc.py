@@ -12,7 +12,7 @@ from .config import resolve_codex_sessions_dir
 
 
 _USED_KEYS = ("used_percent", "used_percentage", "usedPercent", "usedPercentage")
-_WINDOW_KEYS = ("window_minutes", "windowMinutes")
+_WINDOW_KEYS = ("window_minutes", "windowMinutes", "windowDurationMins")
 _RESET_KEYS = ("resets_at", "resetsAt")
 
 
@@ -161,5 +161,6 @@ def _limit_reached(limits: Dict[str, Any], bucket: Dict[str, Any], used: float) 
         limits.get("rate_limit_reached_type"),
         limits.get("rateLimitReachedType"),
         limits.get("spend_control_reached"),
+        limits.get("spendControlReached"),
     )
     return used >= 100.0 or any(bool(value) for value in values)

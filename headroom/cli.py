@@ -1,17 +1,27 @@
 """Command-line entry point for headroom."""
 
 import argparse
+from dataclasses import dataclass
 import json
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .bounds import Reading, bound_snapshot
+from .bounds import Reading, Snapshot, bound_snapshot
 from .claude import parse_stdin
+from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
 from .freshness import freshness_seconds
 from .render import render_hook, render_report, render_statusline
 from .state import read_state, resolve_state_dir, save_snapshots, snapshots_from_state
+
+
+@dataclass(frozen=True)
+class _CodexRefreshResult:
+    snapshots: Tuple[Snapshot, ...]
+    source: str
+    rpc: CodexRpcResult
+    rollout: Optional[CodexResult]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,17 +79,33 @@ def _statusline() -> int:
     return 0
 
 
-def _refresh_codex() -> CodexResult:
-    result = read_latest()
-    diagnostics: Dict[str, Any] = {
-        "codex": {
-            "file": result.file,
-            "files_checked": result.files_checked,
-            "notes": list(result.notes),
-        }
-    }
+def _refresh_codex() -> _CodexRefreshResult:
+    result = _read_codex_on_demand()
+    diagnostics: Dict[str, Any] = {"codex": _codex_diagnostics(result)}
     save_snapshots(result.snapshots, diagnostics=diagnostics)
     return result
+
+
+def _read_codex_on_demand() -> _CodexRefreshResult:
+    rpc = read_rate_limits()
+    if rpc.snapshots:
+        return _CodexRefreshResult(rpc.snapshots, "app-server", rpc, None)
+    rollout = read_latest()
+    source = "rollout" if rollout.snapshots else "none"
+    return _CodexRefreshResult(rollout.snapshots, source, rpc, rollout)
+
+
+def _codex_diagnostics(result: _CodexRefreshResult) -> Dict[str, Any]:
+    rollout = result.rollout
+    rollout_notes = rollout.notes if rollout is not None else ()
+    return {
+        "source": result.source,
+        "rpc_attempted": result.rpc.attempted,
+        "rpc_notes": list(result.rpc.notes),
+        "file": rollout.file if rollout is not None else None,
+        "files_checked": rollout.files_checked if rollout is not None else 0,
+        "notes": list(result.rpc.notes + rollout_notes),
+    }
 
 
 def _readings(state: Dict[str, Any], now: float) -> List[Reading]:
@@ -108,15 +134,30 @@ def _doctor() -> int:
     state_path = directory / "state.json"
     state = read_state()
     existing = snapshots_from_state(state)
-    codex = read_latest()
+    codex = _read_codex_on_demand()
+    rollout = codex.rollout
     print("State directory: {}".format(directory))
     print("State file: {}".format("found" if state_path.is_file() else "missing"))
     print("Claude readings: {}".format(_found_windows(existing, "claude")))
-    print("Codex sessions: {}".format("found" if codex.files_checked else "missing"))
-    print("Codex rollout: {}".format(codex.file or "no usable snapshot"))
+    print("Codex source: {}".format(codex.source))
+    print(
+        "Codex sessions: {}".format(
+            "not checked"
+            if rollout is None
+            else "found" if rollout.files_checked else "missing"
+        )
+    )
+    print(
+        "Codex rollout: {}".format(
+            "not checked"
+            if rollout is None
+            else rollout.file or "no usable snapshot"
+        )
+    )
     print("Codex readings: {}".format(", ".join(snapshot.window for snapshot in codex.snapshots) or "missing"))
-    if codex.notes:
-        print("Notes: {}".format("; ".join(codex.notes)))
+    notes = codex.rpc.notes + (rollout.notes if rollout is not None else ())
+    if notes:
+        print("Notes: {}".format("; ".join(notes)))
     return 0
 
 

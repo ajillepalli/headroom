@@ -1,0 +1,171 @@
+"""Tests for on-demand Codex app-server rate-limit refresh."""
+
+from __future__ import annotations
+
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+from headroom.cli import main
+
+
+STUB = Path(__file__).with_name("codex_app_server_stub.py")
+
+
+class CodexRpcTests(unittest.TestCase):
+    def test_statusline_never_starts_app_server(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root, "success")
+            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
+            output = StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", StringIO("{}")):
+                    with redirect_stdout(output):
+                        result = main(["statusline"])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output.getvalue().strip())
+            self.assertFalse((root / "started").exists())
+
+    def test_success_uses_codex_bucket_and_window_duration_mins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root, "success")
+            environment["HEADROOM_TEST_RPC_LOG"] = str(root / "requests.jsonl")
+
+            document = self._run_json(environment)
+
+            snapshot = document["sources"]["codex"]["weekly"]
+            self.assertEqual(snapshot["used_percentage"], 4.0)
+            self.assertEqual(snapshot["raw"]["windowDurationMins"], 10_080)
+            self.assertEqual(document["diagnostics"]["codex"]["source"], "app-server")
+            requests = [
+                json.loads(line)
+                for line in (root / "requests.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(len(requests), 3)
+            self.assertEqual(requests[0]["params"]["clientInfo"]["name"], "headroom")
+            self.assertEqual(requests[1]["method"], "initialized")
+            self.assertIsNone(requests[2]["params"])
+
+    def test_doctor_surfaces_app_server_as_winning_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = self._environment(Path(directory), "success")
+            output = StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with redirect_stdout(output):
+                    result = main(["doctor"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Codex source: app-server", output.getvalue())
+            self.assertIn("Codex sessions: not checked", output.getvalue())
+
+    def test_timeout_falls_back_and_kills_the_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_rollout(root, used_percent=41)
+            environment = self._environment(root, "timeout")
+            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "1"
+            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
+            environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
+
+            document = self._run_json(environment)
+
+            self.assertEqual(
+                document["sources"]["codex"]["weekly"]["used_percentage"],
+                41.0,
+            )
+            diagnostics = document["diagnostics"]["codex"]
+            self.assertEqual(diagnostics["source"], "rollout")
+            self.assertTrue(any("timed out" in note for note in diagnostics["notes"]))
+            self.assertTrue((root / "started").is_file())
+            time.sleep(0.8)
+            self.assertFalse((root / "survived").exists())
+
+    def test_garbage_output_falls_back_to_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_rollout(root, used_percent=42)
+            document = self._run_json(self._environment(root, "garbage"))
+
+            self.assertEqual(
+                document["sources"]["codex"]["weekly"]["used_percentage"],
+                42.0,
+            )
+            diagnostics = document["diagnostics"]["codex"]
+            self.assertEqual(diagnostics["source"], "rollout")
+            self.assertTrue(
+                any("non-JSON" in note for note in diagnostics["rpc_notes"])
+            )
+
+    def test_rpc_zero_skips_process_and_uses_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_rollout(root, used_percent=43)
+            environment = self._environment(root, "success")
+            environment["HEADROOM_CODEX_RPC"] = "0"
+            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
+
+            document = self._run_json(environment)
+
+            self.assertEqual(
+                document["sources"]["codex"]["weekly"]["used_percentage"],
+                43.0,
+            )
+            diagnostics = document["diagnostics"]["codex"]
+            self.assertEqual(diagnostics["source"], "rollout")
+            self.assertFalse(diagnostics["rpc_attempted"])
+            self.assertFalse((root / "started").exists())
+
+    def _environment(self, root: Path, mode: str) -> dict[str, str]:
+        return {
+            "HEADROOM_CODEX_HOME": str(root / "codex-home"),
+            "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
+            "HEADROOM_STATE_DIR": str(root / "state"),
+            "HEADROOM_TEST_RPC_MODE": mode,
+        }
+
+    def _run_json(self, environment: dict[str, str]) -> dict:
+        output = StringIO()
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with redirect_stdout(output):
+                result = main(["json"])
+        self.assertEqual(result, 0)
+        return json.loads(output.getvalue())
+
+    def _write_rollout(self, root: Path, used_percent: int) -> None:
+        rollout_dir = root / "codex-home" / "sessions" / "2026" / "08" / "04"
+        rollout_dir.mkdir(parents=True)
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = {
+            "timestamp": timestamp,
+            "payload": {
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 10_080,
+                        "resets_at": time.time() + 86_400,
+                    },
+                    "secondary": None,
+                }
+            },
+        }
+        (rollout_dir / "rollout-test.jsonl").write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

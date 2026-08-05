@@ -98,6 +98,7 @@ class HookEndToEndTests(unittest.TestCase):
 
                 environment = os.environ.copy()
                 environment["HEADROOM_CODEX_HOME"] = codex_home
+                environment["HEADROOM_CODEX_RPC"] = "0"
                 environment["HEADROOM_STATE_DIR"] = state_dir
                 environment["HEADROOM_FRESH_CODEX_SECONDS"] = "1800"
                 return subprocess.run(

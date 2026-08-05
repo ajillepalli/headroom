@@ -76,6 +76,23 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(snapshots[0].used_percentage, 8.0)
         self.assertEqual(snapshots[0].resets_at, 1_786_494_688.0)
 
+    def test_app_server_window_duration_mins_parses(self) -> None:
+        payload = {
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": 4,
+                "windowDurationMins": 10_080,
+                "resetsAt": 1_786_494_688,
+            },
+            "secondary": None,
+        }
+
+        snapshots = parse_rate_limits(payload, captured_at=100.0)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].window, "weekly")
+        self.assertEqual(snapshots[0].used_percentage, 4.0)
+
     def test_reset_time_accepts_epoch_seconds_milliseconds_and_iso(self) -> None:
         cases = (
             (1_786_494_688, 1_786_494_688.0),

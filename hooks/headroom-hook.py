@@ -19,7 +19,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=5,
+            timeout=10,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

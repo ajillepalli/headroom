@@ -20,16 +20,18 @@ Claude Code and Codex each enforce rolling usage limits. Each tool shows its num
 
 headroom closes that gap. It captures both tools' local rate-limit readings, stores them together, and gives the model a short warning when usage calls for a change in behavior. The prompt hook stays silent when usage is fine.
 
-headroom uses only the Python standard library. It makes no network calls.
+headroom uses only the Python standard library. It makes no direct network calls.
 
 ## How it works
 
 | Source | Capture path |
 | --- | --- |
 | Claude Code | A configured statusline command receives JSON on standard input. Claude Code 2.1.80 and newer include a `rate_limits` value in that input. headroom searches the payload recursively because the nesting is not fixed. |
-| Codex | headroom reads rollout files below `~/.codex/sessions/YYYY/MM/DD/`. It orders files newest first, stops at the first file with a usable snapshot, and takes the last usable `rate_limits` value in that file. |
+| Codex | On demand, headroom starts `codex app-server` and reads current rate limits over its local stdio RPC. If the RPC is disabled or yields no usable snapshot, headroom reads rollout files below `~/.codex/sessions/YYYY/MM/DD/`. |
 
-Claude capture runs when Claude Code renders its statusline. Codex capture runs when `status`, `json`, or `hook` refreshes state from the newest local session rollout. Both sources accept the field variants present in current payloads, including snake case and camel case names.
+Claude capture runs when Claude Code renders its statusline. Codex RPC capture runs when `status`, `json`, `hook`, or `doctor` is requested. The RPC call costs no Codex quota and creates no session rollout files. `statusline` never starts the app-server. It stays fast by rendering stored Codex state only.
+
+The rollout fallback orders files newest first, stops at the first file with a usable snapshot, and takes the last usable `rate_limits` value in that file. Both capture sources accept the field variants present in current payloads, including snake case and camel case names.
 
 Snapshots go to `state.json` under the state directory. Writes replace that file atomically. Each captured snapshot is also appended to `history.jsonl`.
 
@@ -50,10 +52,10 @@ The generated hook command uses the current Python executable and an absolute pa
 | Subcommand | What it prints |
 | --- | --- |
 | `statusline` | Reads a Claude statusline JSON document from standard input, stores any snapshots it can parse, and prints one compact line. It prints a fallback line and exits successfully even for malformed input. |
-| `status` | Refreshes Codex state, then prints a multi-line report for Claude and Codex across the short and weekly windows. Missing readings appear as `unavailable`. |
-| `json` | Refreshes Codex state, then prints one compact JSON document with persisted state, diagnostics, and four bounded readings. |
-| `hook` | Refreshes Codex state, then prints guidance for the highest actionable severity. It prints nothing when every reading is `ok`. |
-| `doctor` | Prints the state directory, state-file presence, stored Claude windows, Codex session discovery, the selected rollout, parsed Codex windows, and any scanner notes. It scans Codex without updating state. |
+| `status` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints a multi-line report for Claude and Codex across the short and weekly windows. Missing readings appear as `unavailable`. |
+| `json` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints one compact JSON document with persisted state, diagnostics, and four bounded readings. |
+| `hook` | Refreshes Codex state through the app-server RPC with rollout fallback, then prints guidance for the highest actionable severity. It prints nothing when every reading is `ok`. |
+| `doctor` | Performs the same on-demand Codex read without updating state. It prints which source won, the state paths, parsed windows, rollout details when fallback was needed, and diagnostic notes. |
 
 Run a subcommand with this form:
 
@@ -77,7 +79,7 @@ Claude
   7d: unavailable
 Codex
   5h: unavailable
-  7d: 3% used [ok], resets in 6d 19h
+  7d: 4% used [ok], resets in 6d 19h
 ```
 
 ```console
@@ -90,8 +92,9 @@ Output:
 State directory: C:\Users\ANANTH~1.JIL\AppData\Local\Temp\headroom-readme-state
 State file: found
 Claude readings: missing
-Codex sessions: found
-Codex rollout: C:\Users\ananth.jillepalli\.codex\sessions\2026\08\04\rollout-2026-08-04T22-27-53-019fd064-7871-7d72-a8ae-b157428f0475.jsonl
+Codex source: app-server
+Codex sessions: not checked
+Codex rollout: not checked
 Codex readings: weekly
 ```
 
@@ -133,16 +136,19 @@ For a `stale_bounded` reading with less than 50% headroom, headroom raises the b
 | --- | --- | --- |
 | `HEADROOM_STATE_DIR` | `~/.headroom` | Directory for `state.json` and `history.jsonl`. |
 | `HEADROOM_CODEX_HOME` | `~/.codex` | Codex home directory. Sessions are read from its `sessions` child directory. |
+| `HEADROOM_CODEX_RPC` | enabled | Set to `0` to skip the app-server RPC and use rollout files. |
+| `HEADROOM_CODEX_RPC_TIMEOUT` | `6` | Hard timeout in seconds for app-server startup, initialization, and the rate-limit read. |
+| `HEADROOM_CODEX_RPC_CMD` | `codex app-server` | Command used to start the RPC server. This is primarily useful for testing or nonstandard Codex installations. |
 | `HEADROOM_FRESH_CLAUDE_SECONDS` | `300` | Number of seconds a Claude snapshot remains fresh. |
 | `HEADROOM_FRESH_CODEX_SECONDS` | `1800` | Number of seconds a Codex snapshot remains fresh. |
 
-Freshness values must be finite, non-negative numbers.
+Freshness values must be finite, non-negative numbers. The RPC timeout must be a finite number greater than zero.
 
 ## Limits
 
 - Neither vendor publishes a token allowance through these sources. headroom reports percent used and reset time. It never reports tokens remaining.
 - Claude readings are only as fresh as the last statusline render.
-- Codex readings update only when a Codex session runs and writes a usable rollout.
+- On-demand Codex refresh needs a working `codex app-server` command. Without it, freshness depends on the newest usable rollout file.
 - The Codex short window is often `null`, so it may remain unavailable while the weekly window is present.
 
 ## Tests
