@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 from .bounds import Snapshot
 from .config import resolve_state_dir
+from .freshness import freshness_seconds
 
 
 def read_state(state_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -57,8 +58,18 @@ def save_snapshots(
     snapshots: Sequence[Snapshot],
     state_dir: Optional[Path] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
+    context_capture: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Merge snapshots into state and append each captured reading to history."""
+    """Merge snapshots into state and append each captured reading to history.
+
+    ``context_capture``, when given, is folded into the SAME read-modify-
+    write transaction as the rate-limit snapshots above rather than given
+    its own ``state.py`` entry point: two separate read-modify-write round
+    trips inside one statusline invocation would not be atomic with each
+    other, and the concurrent-session case (two terminal tabs writing at
+    close to the same moment) is exactly the failure this whole feature
+    exists to avoid.
+    """
 
     state = read_state(state_dir)
     sources = state.setdefault("sources", {})
@@ -81,6 +92,8 @@ def save_snapshots(
                 continue
         source[snapshot.window] = snapshot.to_dict()
         accepted.append(snapshot)
+    if context_capture is not None:
+        _merge_context_capture(sources, context_capture)
     state["version"] = 1
     if diagnostics is not None:
         stored = state.setdefault("diagnostics", {})
@@ -91,6 +104,62 @@ def save_snapshots(
     write_state(state, state_dir)
     append_history(accepted, state_dir)
     return state
+
+
+def _merge_context_capture(sources: Dict[str, Any], capture: Dict[str, Any]) -> None:
+    """Store one session's context capture and prune entries gone stale.
+
+    Context is per-session (context_window.py), so this is keyed by
+    session_id under ``sources["claude"]["context"]`` rather than the flat
+    ``(source, window)`` slot rate-limit snapshots use above -- a flat slot
+    would let one terminal tab's context answer for a different session's
+    prompt (the exact bug the ENG review phase caught).
+
+    Pruning runs on every call that supplies a capture, using the new
+    capture's own ``captured_at`` as "now" rather than calling
+    ``time.time()`` here: ``state.py`` otherwise never reads the real clock,
+    every timestamp it handles is passed in, and this keeps that property so
+    callers stay deterministic in tests. A session that stops writing (a
+    closed terminal tab) lingers until the NEXT successful capture from any
+    session sweeps it -- acceptable, since a lingering entry is inert until
+    then (fresh-or-nothing already refuses to read anything stale) and
+    "prune on write" does not require every write to also be the sweep.
+    """
+
+    claude_source = sources.setdefault("claude", {})
+    if not isinstance(claude_source, dict):
+        claude_source = {}
+        sources["claude"] = claude_source
+    contexts = claude_source.setdefault("context", {})
+    if not isinstance(contexts, dict):
+        contexts = {}
+        claude_source["context"] = contexts
+
+    session_id = capture.get("session_id")
+    captured_at = capture.get("captured_at")
+    if isinstance(session_id, str) and session_id:
+        contexts[session_id] = capture
+
+    if not isinstance(captured_at, (int, float)) or isinstance(captured_at, bool):
+        return
+    fresh_for = freshness_seconds("context")
+    stale_keys = [
+        key
+        for key, value in contexts.items()
+        if not _context_entry_is_fresh(value, float(captured_at), fresh_for)
+    ]
+    for key in stale_keys:
+        del contexts[key]
+
+
+def _context_entry_is_fresh(value: Any, now: float, fresh_for_seconds: float) -> bool:
+    if not isinstance(value, dict):
+        return False
+    try:
+        captured_at = float(value["captured_at"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return (now - captured_at) <= max(0.0, fresh_for_seconds)
 
 
 def append_history(snapshots: Iterable[Snapshot], state_dir: Optional[Path] = None) -> None:
@@ -146,6 +215,34 @@ def snapshots_from_state(state: Dict[str, Any]) -> Dict[str, Snapshot]:
                 continue
             result["{}:{}".format(source_name, window_name)] = snapshot
     return result
+
+
+def context_captures_from_state(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Return raw persisted context captures keyed by session_id.
+
+    This intentionally returns raw dicts, not decoded ``ContextReading``
+    objects: decoding needs ``now`` and the context freshness window, which
+    only a caller with a specific point in time to bind against has (see
+    ``context_window.ContextReading.from_dict``). Every value here is at
+    least a dict; further validation happens at decode time, wrapped in the
+    same ``(KeyError, TypeError, ValueError, OverflowError)`` catch
+    ``snapshots_from_state`` uses for rate-limit snapshots above.
+    """
+
+    sources = state.get("sources")
+    if not isinstance(sources, dict):
+        return {}
+    claude_source = sources.get("claude")
+    if not isinstance(claude_source, dict):
+        return {}
+    contexts = claude_source.get("context")
+    if not isinstance(contexts, dict):
+        return {}
+    return {
+        session_id: value
+        for session_id, value in contexts.items()
+        if isinstance(session_id, str) and isinstance(value, dict)
+    }
 
 
 def _empty_state() -> Dict[str, Any]:

@@ -6,6 +6,7 @@ from typing import Optional
 
 from .bounds import Confidence, Reading
 from .burn_rate import BurnRateProjection
+from .context_window import ContextReading
 
 
 ESCALATE_BELOW_HEADROOM = 50.0
@@ -25,6 +26,28 @@ class Severity(IntEnum):
         return self.name.lower()
 
 
+def severity_for_headroom(headroom: float) -> Severity:
+    """The pure severity cascade shared by every headroom-shaped signal.
+
+    Extracted so both the rate-limit ladder (``reading_severity`` below,
+    which layers reset/limit/escalation handling on top) and the context
+    ladder (``context_reading_severity`` below, which has none of those
+    rate-limit-specific concepts) apply the SAME four thresholds instead of
+    a second, independently maintained copy -- a differentiated context
+    ladder was proposed and then dropped (CEO review) once it turned out to
+    match this one at two of three points and be five points LOWER, not
+    higher, at the third, contradicting its own stated rationale.
+    """
+
+    if headroom > 40.0:
+        return Severity.OK
+    if headroom >= 20.0:
+        return Severity.NOTICE
+    if headroom >= 10.0:
+        return Severity.WARN
+    return Severity.CRITICAL
+
+
 def reading_severity(reading: Reading) -> Severity:
     """Map a bounded reading to its display severity."""
 
@@ -37,14 +60,7 @@ def reading_severity(reading: Reading) -> Severity:
         return Severity.OK
 
     headroom = 100.0 - used
-    if headroom > 40.0:
-        severity = Severity.OK
-    elif headroom >= 20.0:
-        severity = Severity.NOTICE
-    elif headroom >= 10.0:
-        severity = Severity.WARN
-    else:
-        severity = Severity.CRITICAL
+    severity = severity_for_headroom(headroom)
 
     # Escalation exists because the true value can only be worse than the
     # bound, but with most of the quota untouched no plausible burn rate
@@ -55,6 +71,23 @@ def reading_severity(reading: Reading) -> Severity:
     ):
         severity = Severity(min(int(severity) + 1, int(Severity.CRITICAL)))
     return severity
+
+
+def context_reading_severity(reading: Optional[ContextReading]) -> Severity:
+    """Map a context reading to display severity, OK when absent or stale.
+
+    Fresh-or-nothing (context_window.py): a missing or non-fresh context
+    reading contributes nothing to arbitration between rate and context
+    severity, exactly like having no signal at all. There is no escalation
+    step here -- escalation exists on the rate-limit path because a stale
+    snapshot is still a valid lower bound that can only be worse than
+    reported; a stale context reading is not a bound at all, so there is
+    nothing to escalate from.
+    """
+
+    if reading is None or not reading.fresh:
+        return Severity.OK
+    return severity_for_headroom(100.0 - reading.used_percent)
 
 
 # --- Burn-rate projection speaking policy ---

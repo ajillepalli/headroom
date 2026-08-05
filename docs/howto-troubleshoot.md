@@ -56,6 +56,16 @@ The percentage parsed, but `resets_at` was absent, invalid, or implausible for i
 
 An accepted reset can be at most the reported window duration plus five minutes after capture, with five minutes of grace before capture. Without a valid duration, it can be at most 14 days ahead.
 
+## Context guidance never appears
+
+Check `headroom doctor`'s dedicated `Claude context` line first; it names the cause directly. In likelihood order:
+
+1. **Stale by cadence.** `Claude context: stale (last capture Xm Ys ago, exceeds 300s freshness)`. Claude's own statusline hasn't rendered recently enough -- the terminal may be idle, or minimized. Context is fresh-or-nothing (see [Why context is fresh-or-nothing](explanation-context.md)): unlike a rate-limit reading, a stale context reading is never shown as a bound, only as nothing. Interact with Claude Code again; the very next statusline render or `UserPromptSubmit` refreshes it.
+2. **No `session_id` in the last statusline payload.** `Claude context: not available (no session_id in last statusline payload)`. Update Claude Code -- `session_id` alongside `context_window` requires a version that supplies both. `headroom doctor`'s generic `Notes` line will not show this cause on its own, because an absence is not a parse rejection; the dedicated context line exists specifically to surface it.
+3. **Different session than the one asking.** The hook only ever reports the session named in its own `UserPromptSubmit` payload. If another terminal tab or a much older conversation has a fresh context reading, this session still reports nothing until its own statusline has rendered at least once. This is deliberate: a shared, non-session-keyed reading would let one conversation's context percentage answer for a different one's prompt.
+4. **Genuinely `ok`.** `Claude context: ok (N% used, below notice threshold)`. Below 60% used, `hook` and `statusline` stay quiet by design; run `headroom status` or `headroom json` to see the number anyway.
+5. **Claude Code version too old.** `context_window` and `session_id` are both recent additions to the statusline payload; an old client sends neither, so nothing is ever captured for context specifically, even though rate-limit readings work normally.
+
 ## Read doctor output
 
 | Line | Interpretation |
@@ -67,6 +77,7 @@ An accepted reset can be at most the reported window duration plus five minutes 
 | `State directory` | Directory selected by `HEADROOM_STATE_DIR` or the `~/.headroom` default. |
 | `State file` | Whether `state.json` exists. A corrupt or unreadable file still appears as found but is read as empty state. |
 | `Claude readings` | Stored Claude windows, or `missing`. |
+| `Claude context` | `not available`, `stale`, or the most recent session's usage and severity. See [Context guidance never appears](#context-guidance-never-appears). |
 | `Codex source` | `app-server`, `rollout`, or `none` for this check. |
 | `Codex sessions` | `not checked` when RPC won, otherwise whether any rollout files were checked. |
 | `Codex rollout` | `not checked`, the selected rollout path, or `no usable snapshot`. |

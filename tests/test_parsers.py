@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from io import StringIO
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 from unittest import mock
 
 from headroom.bounds import Confidence, Snapshot, bound_snapshot
-from headroom.claude import classify_window, parse_payload, parse_reset_time
+from headroom.claude import classify_window, parse_payload, parse_reset_time, parse_stdin
 from headroom.cli import main
 from headroom.codexsrc import parse_rate_limits
 from headroom.render import render_report
@@ -19,6 +20,7 @@ from headroom.state import save_snapshots
 
 
 CLAUDE_STATUSLINE_PAYLOAD = {
+    "session_id": "9da33c25-68e3-4cd9-9e3e-eab1d894f71d",
     "rate_limits": {
         "five_hour": {"resets_at": 1785929400, "used_percentage": 20},
         "seven_day": {"resets_at": 1786266000, "used_percentage": 4},
@@ -52,20 +54,144 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(
             any("context_window" in note.get("path", ()) for note in result.unparsed)
         )
+        # The #9 exclusion guard and the new context extraction are
+        # independent: the same payload yields a context capture AND still
+        # produces no extra rate window from that subtree.
+        self.assertIsNotNone(result.context)
+        self.assertEqual(result.context["used_percentage"], 81.0)
+        self.assertEqual(result.context["size"], 1_000_000)
+        self.assertEqual(result.context["session_id"], "9da33c25-68e3-4cd9-9e3e-eab1d894f71d")
 
     def test_context_window_is_excluded_even_if_it_has_a_duration(self) -> None:
         payload = {
+            "session_id": "s-1",
             "context_window": {
                 "used_percentage": 81,
                 "remaining_percentage": 19,
                 "window_minutes": 300,
-            }
+            },
         }
 
         result = parse_payload(payload, captured_at=1_785_920_000.0)
 
         self.assertEqual(result.snapshots, ())
         self.assertNotIn("context_window", repr(result.unparsed))
+        self.assertEqual(result.context["used_percentage"], 81.0)
+
+    def test_context_missing_session_id_yields_no_capture(self) -> None:
+        payload = {"context_window": {"used_percentage": 42}}
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertIsNone(result.context)
+        self.assertTrue(
+            any(note.get("reason") == "missing session_id" for note in result.context_unparsed)
+        )
+
+    def test_context_second_match_is_ignored_but_noted(self) -> None:
+        payload = {
+            "session_id": "s-1",
+            "outer": {"context_window": {"used_percentage": 10}},
+            "nested": {"deeper": {"context_window": {"used_percentage": 99}}},
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        # Document order: "outer" is encountered before "nested" in a
+        # top-down walk of this dict, so the first match wins.
+        self.assertEqual(result.context["used_percentage"], 10.0)
+        self.assertTrue(
+            any(
+                note.get("reason") == "duplicate context_window subtree ignored"
+                for note in result.context_unparsed
+            )
+        )
+
+    def test_context_remaining_only_derives_used(self) -> None:
+        payload = {"session_id": "s-1", "context_window": {"remaining_percentage": 30}}
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.context["used_percentage"], 70.0)
+
+    def test_context_out_of_range_remaining_is_rejected(self) -> None:
+        payload = {"session_id": "s-1", "context_window": {"remaining_percentage": 140}}
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertIsNone(result.context)
+        self.assertTrue(
+            any(note.get("reason") == "invalid context percentage" for note in result.context_unparsed)
+        )
+
+    def test_context_used_over_100_is_rejected_never_rendered(self) -> None:
+        payload = {"session_id": "s-1", "context_window": {"used_percentage": 150}}
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertIsNone(result.context)
+        self.assertTrue(
+            any(note.get("reason") == "invalid context percentage" for note in result.context_unparsed)
+        )
+
+    def test_context_used_wins_and_notes_mismatch_with_remaining(self) -> None:
+        payload = {
+            "session_id": "s-1",
+            "context_window": {"used_percentage": 81, "remaining_percentage": 5},
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.context["used_percentage"], 81.0)
+        self.assertTrue(
+            any(
+                note.get("reason") == "used and remaining do not sum to 100"
+                for note in result.context_unparsed
+            )
+        )
+
+    def test_context_malformed_size_drops_size_keeps_percent(self) -> None:
+        payload = {
+            "session_id": "s-1",
+            "context_window": {"used_percentage": 50, "context_window_size": "not-a-number"},
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.context["used_percentage"], 50.0)
+        self.assertIsNone(result.context["size"])
+        self.assertTrue(
+            any(note.get("reason") == "invalid context_window_size" for note in result.context_unparsed)
+        )
+
+    def test_context_camel_case_fields_parse(self) -> None:
+        payload = {
+            "session_id": "s-1",
+            "contextWindow": {
+                "usedPercentage": 33,
+                "contextWindowSize": 200_000,
+            },
+        }
+
+        result = parse_payload(payload, captured_at=1_785_920_000.0)
+
+        self.assertEqual(result.context["used_percentage"], 33.0)
+        self.assertEqual(result.context["size"], 200_000)
+
+    def test_context_bool_and_null_percentages_are_rejected(self) -> None:
+        for value in (True, None, "nope"):
+            with self.subTest(value=value):
+                payload = {"session_id": "s-1", "context_window": {"used_percentage": value}}
+                result = parse_payload(payload, captured_at=1_785_920_000.0)
+                self.assertIsNone(result.context)
+
+    def test_malformed_context_window_does_not_break_parse_stdin(self) -> None:
+        text = json.dumps({"session_id": "s-1", "context_window": {"used_percentage": "nope"}})
+
+        result = parse_stdin(text, captured_at=1_785_920_000.0)
+
+        self.assertIsNone(result.context)
+        self.assertEqual(result.snapshots, ())
 
     def test_existing_name_variants_still_classify(self) -> None:
         cases = (
