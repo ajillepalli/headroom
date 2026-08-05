@@ -18,6 +18,22 @@ MIN_SPAN_SECONDS = 60.0
 # to 10 times the observed span while still allowing useful short-term warnings.
 MIN_SPAN_TO_HORIZON_RATIO = 0.1
 
+# An interval this close to zero is not a second independent observation, it is
+# float noise. Denormal or near-duplicate timestamps (e.g. two captures a few
+# nanoseconds apart from clock jitter) divide a normal-sized usage delta by an
+# almost-zero elapsed time and can overflow to inf even though "elapsed > 0.0"
+# is technically true. Anything below a microsecond carries no rate evidence.
+MIN_INTERVAL_SECONDS = 1e-6
+
+# Theil-Sen's pairwise-slope step is O(n^2) in both time and memory: a segment
+# with N readings builds N*(N-1)/2 float pairs. history.jsonl is append-only
+# and, absent a marked reset, a segment can grow without bound, so N must be
+# capped rather than trusted to stay small. 500 readings caps the pair count
+# at 124,750 (well under a second, a few MB) while still covering a long
+# capture history. Recency is what matters for a burn rate, not depth, so the
+# cap keeps the most RECENT readings in the segment rather than the oldest.
+MAX_FIT_SAMPLES = 500
+
 
 class ProjectionConfidence(str, Enum):
     """How consistently the history supports the fitted direction."""
@@ -39,11 +55,31 @@ class NoProjectionReason(str, Enum):
     USAGE_WENT_BACKWARDS = "usage_went_backwards"
     NON_POSITIVE_RATE = "non_positive_rate"
     LOW_CONFIDENCE = "low_confidence"
+    WINDOW_ALREADY_RESET = "window_already_reset"
+    NON_FINITE_RESULT = "non_finite_result"
+    PROJECTED_EXHAUSTION_IN_PAST = "projected_exhaustion_in_past"
 
 
 @dataclass(frozen=True)
 class BurnRateProjection:
-    """The fitted burn rate and exhaustion decision for one usage window."""
+    """The fitted burn rate and exhaustion decision for one usage window.
+
+    ``exhaustion_precedes_reset`` is a tri-state field and callers MUST branch
+    on it with ``is True`` / ``is False`` / ``is None`` rather than truthiness
+    (``if not projection.exhaustion_precedes_reset`` conflates all three):
+
+    * ``True`` / ``False`` -- a projection exists (``projected_exhaustion_at``
+      is set, ``reason`` is None) and it is known whether exhaustion falls
+      before or after the window's reset.
+    * ``None`` with ``reason`` set to None -- a projection exists, but the
+      window's reset time is unknown (``resets_at`` was absent), so no
+      before/after comparison can be made. ``projected_exhaustion_at`` is
+      still set in this case.
+    * ``None`` with ``reason`` set to a ``NoProjectionReason`` -- no
+      projection could be defended at all. ``projected_exhaustion_at`` is
+      None in this case too, so the two None cases are distinguished by
+      checking ``reason``, not by re-inspecting ``exhaustion_precedes_reset``.
+    """
 
     source: str
     window: str
@@ -85,14 +121,22 @@ def project_exhaustion(
                 if record is None or record.captured_at > current_time:
                     continue
                 groups.setdefault((record.source, record.window), []).append(record)
-    except (FileNotFoundError, IsADirectoryError):
+    except OSError:
+        # Matches state.read_state: an unreadable file (missing, a directory,
+        # permission denied, or any other OS-level failure) means "no data",
+        # not a crash. The caller already treats an empty list as "nothing to
+        # report".
         return []
 
     projections = []
     for key in sorted(groups):
         records = sorted(groups[key], key=lambda item: item.captured_at)
         latest_segment = _records_since_latest_reset(records)
-        projections.append(_project_group(key, latest_segment))
+        # Cap AFTER segmentation: segmentation must see the full history to
+        # find the true reset boundary, but only the most recent samples are
+        # needed (and safe, see MAX_FIT_SAMPLES) to fit the current window.
+        fit_segment = latest_segment[-MAX_FIT_SAMPLES:]
+        projections.append(_project_group(key, fit_segment, current_time))
     return projections
 
 
@@ -144,15 +188,28 @@ def _finite_float(value: Any) -> Optional[float]:
 def _records_since_latest_reset(
     records: List[_HistoryRecord],
 ) -> List[_HistoryRecord]:
+    """Return only the records that belong to the current (most recent) window.
+
+    Usage is monotonic non-decreasing within a window, so a decrease in
+    used_percentage IS a reset by definition, whether or not resets_at
+    changed. Many providers never send resets_at at all, so relying solely
+    on resets_at changing misses these unmarked resets and lets a stale,
+    already-reset window donate a huge fake span to the current one. A
+    change in resets_at (with no decrease) still marks a boundary too, since
+    that also signals the provider considers this a different window.
+    """
+
     if not records:
         return []
 
-    latest_resets_at = records[-1].resets_at
     segment_start = len(records) - 1
-    while (
-        segment_start > 0
-        and records[segment_start - 1].resets_at == latest_resets_at
-    ):
+    while segment_start > 0:
+        previous = records[segment_start - 1]
+        current = records[segment_start]
+        if previous.resets_at != current.resets_at:
+            break
+        if current.used_percentage < previous.used_percentage:
+            break
         segment_start -= 1
 
     # Repeated captures can share a timestamp. Keeping only the last one avoids
@@ -164,7 +221,7 @@ def _records_since_latest_reset(
 
 
 def _project_group(
-    key: Tuple[str, str], records: List[_HistoryRecord]
+    key: Tuple[str, str], records: List[_HistoryRecord], now: float
 ) -> BurnRateProjection:
     source, window = key
     samples_used = len(records)
@@ -191,6 +248,14 @@ def _project_group(
             reason=reason,
         )
 
+    # A window whose reset time has already passed is over; whatever usage
+    # it last reported says nothing about the window in effect now. This is
+    # the burn-rate analogue of bounds.bound_snapshot's POST_RESET handling:
+    # stay consistent with it rather than projecting through a dead window.
+    latest_resets_at = records[-1].resets_at if records else None
+    if latest_resets_at is not None and latest_resets_at <= now:
+        return unavailable(NoProjectionReason.WINDOW_ALREADY_RESET)
+
     if samples_used < MIN_SAMPLES:
         return unavailable(NoProjectionReason.TOO_FEW_SAMPLES)
     if span_seconds < MIN_SPAN_SECONDS:
@@ -205,6 +270,11 @@ def _project_group(
     if latest_usage == first_usage:
         return unavailable(NoProjectionReason.FLAT_USAGE, rate)
     if latest_usage < first_usage:
+        # Defense in depth: _records_since_latest_reset already guarantees a
+        # non-decreasing segment (a decrease is itself a reset boundary), so
+        # this should be unreachable through project_exhaustion. It stays as
+        # a hard invariant check because a wrong confident projection is far
+        # worse than a defensive branch that never fires.
         return unavailable(NoProjectionReason.USAGE_WENT_BACKWARDS, rate)
     if rate is None or rate <= 0.0:
         return unavailable(NoProjectionReason.NON_POSITIVE_RATE, rate)
@@ -212,7 +282,13 @@ def _project_group(
     latest = records[-1]
     projected_at = latest.captured_at + (100.0 - latest_usage) / rate
     horizon_seconds = projected_at - latest.captured_at
-    confidence = _confidence_for_slopes(slopes)
+    if not all(
+        math.isfinite(value)
+        for value in (rate, projected_at, horizon_seconds, span_seconds)
+    ):
+        return unavailable(NoProjectionReason.NON_FINITE_RESULT, None)
+
+    confidence = _confidence_for_records(records)
     if span_seconds < horizon_seconds * MIN_SPAN_TO_HORIZON_RATIO:
         return unavailable(
             NoProjectionReason.INSUFFICIENT_SPAN_FOR_HORIZON,
@@ -221,6 +297,13 @@ def _project_group(
         )
     if confidence is ProjectionConfidence.LOW:
         return unavailable(NoProjectionReason.LOW_CONFIDENCE, rate, confidence)
+    if projected_at < now:
+        # The rate is stale enough that, projected forward, we'd already be
+        # past exhaustion by "now" without a fresher reading confirming it.
+        # Stating a past timestamp as a live projection is not defensible.
+        return unavailable(
+            NoProjectionReason.PROJECTED_EXHAUSTION_IN_PAST, rate, confidence
+        )
 
     resets_at = latest.resets_at
     precedes_reset = None if resets_at is None else projected_at < resets_at
@@ -243,19 +326,61 @@ def _pairwise_slopes(records: List[_HistoryRecord]) -> List[float]:
     for left_index, left in enumerate(records[:-1]):
         for right in records[left_index + 1 :]:
             elapsed = right.captured_at - left.captured_at
-            if elapsed > 0.0:
-                slopes.append(
-                    (right.used_percentage - left.used_percentage) / elapsed
-                )
+            if elapsed < MIN_INTERVAL_SECONDS:
+                continue
+            slope = (right.used_percentage - left.used_percentage) / elapsed
+            if math.isfinite(slope):
+                slopes.append(slope)
     return slopes
 
 
-def _confidence_for_slopes(slopes: List[float]) -> ProjectionConfidence:
-    positive_fraction = sum(slope > 0.0 for slope in slopes) / len(slopes)
-    # This marker describes directional agreement, not a probability. That
-    # keeps it tied to evidence in the samples rather than inventing precision.
-    if positive_fraction >= 0.9:
+def _confidence_for_records(records: List[_HistoryRecord]) -> ProjectionConfidence:
+    """Rate confidence by how CONSISTENT the burn rate is, not by its sign.
+
+    Usage is monotonic within a segment, so nearly every pairwise slope is
+    positive; a sign-based check is close to tautological and was the root
+    cause of a real bug (a single 1-second terminal burst after hours of
+    near-flat usage previously scored HIGH confidence). Instead this looks at
+    consecutive, non-overlapping intervals (independent evidence, unlike the
+    combinatorial pairwise slopes used for the rate itself) and measures how
+    much they disagree: the weighted mean absolute deviation from the median
+    interval rate, normalized by that median. Deviations are weighted by
+    recency (oldest interval weight 1, newest weight N) because a burst in
+    the most recent interval is exactly what would corrupt a near-term
+    projection, and an unweighted median-based spread can hide a single
+    outlier sitting at either end of an odd-length list (median absolute
+    deviation collapses to 0 when the outlier is not itself the median).
+    """
+
+    intervals = []
+    for index in range(1, len(records)):
+        previous = records[index - 1]
+        current = records[index]
+        elapsed = current.captured_at - previous.captured_at
+        if elapsed < MIN_INTERVAL_SECONDS:
+            continue
+        rate = (current.used_percentage - previous.used_percentage) / elapsed
+        if math.isfinite(rate):
+            intervals.append(rate)
+
+    if len(intervals) < 2:
+        # Only one independent interval means there is no second, separate
+        # observation to check it against: nothing here supports HIGH.
+        return ProjectionConfidence.LOW
+
+    center = median(intervals)
+    if center == 0.0:
+        return ProjectionConfidence.LOW
+
+    weighted_deviation = 0.0
+    weight_total = 0.0
+    for rank, rate in enumerate(intervals, start=1):
+        weighted_deviation += rank * abs(rate - center)
+        weight_total += rank
+    dispersion_ratio = (weighted_deviation / weight_total) / abs(center)
+
+    if dispersion_ratio <= 0.25:
         return ProjectionConfidence.HIGH
-    if positive_fraction >= 0.75:
+    if dispersion_ratio <= 0.75:
         return ProjectionConfidence.MEDIUM
     return ProjectionConfidence.LOW
