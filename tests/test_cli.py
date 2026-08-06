@@ -926,5 +926,420 @@ class BurnRateSurfaceTests(unittest.TestCase):
             self.assertTrue(rendered.startswith("headroom:"))
 
 
+class ContextSurfaceTests(unittest.TestCase):
+    """End-to-end coverage of the context-window feature across statusline,
+    hook, status, json, and doctor, using real files -- unit-level severity
+    and hook-arbitration edge cases live in tests/test_context_window.py.
+    """
+
+    def _environment(self, root: Path) -> dict:
+        return {
+            "CODEX_HOME": str(root / "codex-hooks"),
+            "HEADROOM_STATE_DIR": str(root / "state"),
+            "HEADROOM_CODEX_HOME": str(root / "codex"),
+            "HEADROOM_CODEX_RPC": "0",
+        }
+
+    def _statusline_payload(self, session_id: str, used_percentage: float) -> str:
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "context_window": {
+                    "context_window_size": 200_000,
+                    "used_percentage": used_percentage,
+                    "remaining_percentage": 100.0 - used_percentage,
+                },
+            }
+        )
+
+    def test_statusline_persists_context_keyed_by_session_and_shows_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 85.0))):
+                    with redirect_stdout(output):
+                        result = cli.main(["statusline"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("ctx 85% [warn]", output.getvalue())
+            state = json.loads((root / "state" / "state.json").read_text(encoding="utf-8"))
+            self.assertIn("session-a", state["sources"]["claude"]["context"])
+
+    def test_cross_session_hook_never_reads_a_different_sessions_reading(self) -> None:
+        # This is the test that stops the tool lying: session A is at a
+        # CRITICAL context level; a hook firing for an unrelated session B
+        # must not surface session A's reading as if it were its own.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 95.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            hook_input = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-b"}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_own_session_hook_does_read_its_own_critical_context(self) -> None:
+        # The positive counterpart of the cross-session test above: the hook
+        # DOES speak when the session_id matches.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 95.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            hook_input = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a"}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Context is nearly full", output.getvalue())
+
+    def test_missing_session_id_on_statusline_side_yields_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            payload = json.dumps({"context_window": {"used_percentage": 95.0}})
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(payload)):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            state = json.loads((root / "state" / "state.json").read_text(encoding="utf-8"))
+            self.assertNotIn("context", state.get("sources", {}).get("claude", {}))
+
+    def test_missing_session_id_on_hook_side_yields_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 95.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            # No session_id in the hook's own UserPromptSubmit payload.
+            hook_input = json.dumps({"hook_event_name": "UserPromptSubmit"})
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_corrupt_context_state_does_not_silence_a_critical_rate_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "codex": {
+                        "weekly": {
+                            "used_percentage": 95.0,
+                            "captured_at": time.time(),
+                            "resets_at": time.time() + 500_000.0,
+                            "window": "weekly",
+                            "source": "codex",
+                            "limit_reached": False,
+                            "raw": {},
+                        }
+                    },
+                    "claude": {
+                        "context": {
+                            "session-a": {"used_percentage": "not-a-number", "session_id": "session-a"}
+                        }
+                    },
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            hook_input = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a"}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Usage headroom:", output.getvalue())
+            self.assertIn("Codex", output.getvalue())
+
+    def test_malformed_context_window_does_not_break_statusline_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = json.dumps(
+                {"session_id": "session-a", "context_window": {"used_percentage": "nope"}}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(payload)):
+                    with redirect_stdout(output):
+                        result = cli.main(["statusline"])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output.getvalue().strip())
+
+    def test_unexpected_exception_during_statusline_still_prints_a_fallback_and_exits_0(
+        self,
+    ) -> None:
+        # finding #16 (context-window adversarial review): the test above
+        # feeds malformed JSON that parse_stdin's own defensive parsing
+        # already handles without raising, so it exercises a fully-handled
+        # path -- removing _statusline's blanket `except Exception`
+        # fallback entirely would still pass it. This injects a genuinely
+        # unexpected exception, well past parsing, to exercise the
+        # fallback itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = json.dumps(
+                {"session_id": "session-a", "context_window": {"used_percentage": 50}}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(payload)):
+                    with mock.patch(
+                        "headroom.cli.save_snapshots", side_effect=RuntimeError("boom")
+                    ):
+                        with redirect_stdout(output):
+                            result = cli.main(["statusline"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue().strip(), "headroom: usage unavailable")
+
+    def test_hook_ignores_a_state_entry_whose_own_session_id_disagrees_with_its_key(
+        self,
+    ) -> None:
+        # finding #5 (context-window adversarial review, THE most
+        # important finding of that round): a corrupt or hand-edited
+        # state.json can hold an entry under key "session-a" whose own
+        # session_id field claims a different session ("session-b").
+        # Trusting the dictionary key alone would let that mismatched
+        # entry answer for the hook's real running session (session-a);
+        # the fix requires the decoded value to agree with the key it was
+        # found under.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 95.0,
+                                "session_id": "session-b",
+                                "captured_at": time.time(),
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            hook_input = json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a"}
+            )
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with mock.patch("sys.stdin", io.StringIO(hook_input)):
+                    with redirect_stdout(output):
+                        result = cli.main(["hook", "--plain"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_lone_surrogate_session_id_in_state_heals_instead_of_exiting_1(self) -> None:
+        # finding #9 (context-window adversarial review): a state.json
+        # entry keyed by a session_id containing a lone UTF-16 surrogate
+        # (reachable via JSON's \uXXXX escapes, or a hand edit) crashes
+        # write_state's json.dump(..., ensure_ascii=False) call -- which
+        # runs on nearly every command via _refresh_codex, not just ones
+        # that touch context -- turning one bad entry into a permanent
+        # exit-1 for `headroom json`. Rejecting it only at decode time
+        # (ContextReading.from_dict) is not enough on its own: the very
+        # first _refresh_codex call still tries to re-persist the
+        # untouched corrupt entry before ever reaching that decode path.
+        # It must be scrubbed from the stored state itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 10.0,
+                                "session_id": "\ud800",
+                                "captured_at": time.time(),
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertEqual(document.get("context_readings", {}), {})
+            # The next command's own read-merge-write heals the file: the
+            # bad entry must not still be sitting on disk waiting to crash
+            # the NEXT command too.
+            healed_state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                healed_state.get("sources", {}).get("claude", {}).get("context", {}), {}
+            )
+
+    def test_json_does_not_expose_a_stale_capture_via_raw_sources(self) -> None:
+        # finding #7 (context-window adversarial review): _json_document
+        # used to shallow-copy state, so sources.claude.context still
+        # shared the same nested dict as the real state -- a stale capture
+        # excluded from the curated, fresh-filtered context_readings key
+        # was still directly readable off the raw sources subtree right
+        # next to it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            stale_captured_at = time.time() - 10_000.0  # well past the 300s default window
+            state_document = {
+                "version": 1,
+                "sources": {
+                    "claude": {
+                        "context": {
+                            "session-a": {
+                                "used_percentage": 92.0,
+                                "session_id": "session-a",
+                                "captured_at": stale_captured_at,
+                                "source": "claude",
+                            }
+                        }
+                    }
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps(state_document), encoding="utf-8")
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertEqual(document.get("context_readings", {}), {})
+            self.assertNotIn("context", document.get("sources", {}).get("claude", {}))
+
+    def test_json_emits_context_readings_keyed_by_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 30.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["json"])
+
+            self.assertEqual(result, 0)
+            document = json.loads(output.getvalue())
+            self.assertIn("context_readings", document)
+            # finding #14 (context-window adversarial review): "readings"
+            # is a LIST of dicts, so ``"context_readings" not in
+            # document.get("readings", {})`` only ever asked whether that
+            # exact string was an ELEMENT of the list -- always true,
+            # regardless of whether the key leaked into a reading dict.
+            # This checks every reading dict directly instead.
+            readings = document.get("readings", [])
+            self.assertTrue(readings)
+            for reading in readings:
+                self.assertNotIn("context_readings", reading)
+            self.assertEqual(document["context_readings"]["session-a"]["used_percent"], 30.0)
+
+    def test_doctor_reports_ok_context_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 10.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["doctor"])
+
+            self.assertEqual(result, 0)
+            self.assertIn("Claude context: ok (10% used, below notice threshold)", output.getvalue())
+
+    def test_doctor_reports_not_available_with_no_captures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self._environment(root), clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["doctor"])
+
+            self.assertEqual(result, 0)
+            self.assertIn(
+                "Claude context: not available (no session_id in last statusline payload)",
+                output.getvalue(),
+            )
+
+    def test_status_shows_context_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch("sys.stdin", io.StringIO(self._statusline_payload("session-a", 85.0))):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main(["statusline"]), 0)
+
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True):
+                with redirect_stdout(output):
+                    result = cli.main(["status"])
+
+            self.assertEqual(result, 0)
+            rendered = output.getvalue()
+            self.assertIn("Context\n", rendered)
+            self.assertIn("warn", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

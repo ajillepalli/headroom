@@ -10,6 +10,14 @@ CODEX_HOME_ENV = "HEADROOM_CODEX_HOME"
 FRESHNESS_ENV_VARS = {
     "claude": "HEADROOM_FRESH_CLAUDE_SECONDS",
     "codex": "HEADROOM_FRESH_CODEX_SECONDS",
+    # "context" is not a rate-limit source like "claude"/"codex" above --
+    # it is Claude's own per-session context-window signal, named by signal
+    # type rather than by source because there is exactly one source (see
+    # context_window.py) and "context" reads clearer than a source-shaped
+    # name would here. freshness_seconds() and freshness_override() are
+    # already generic over any lookup key, so this reuses both with no new
+    # resolution or validation code.
+    "context": "HEADROOM_FRESH_CONTEXT_SECONDS",
 }
 
 

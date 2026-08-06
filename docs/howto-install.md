@@ -111,6 +111,8 @@ The generated fragment sets a command statusline with a 300-second refresh inter
 
 `init` merges this fragment into the existing top-level object. It never overwrites the settings file wholesale. It preserves unrelated settings and hook events, appends the headroom prompt hook to an existing `UserPromptSubmit` array, and does not append a duplicate on later runs. It sets `statusLine` to the generated headroom statusline.
 
+The same statusline command also captures Claude's per-session context-window usage when the payload provides it, alongside the rate-limit windows described above; see [Why context is fresh-or-nothing](explanation-context.md).
+
 Before changing an existing file, `init` copies it to `settings.json.TIMESTAMP.bak` in the same directory. A new file needs no backup. An unchanged file is neither rewritten nor backed up. Invalid JSON, a non-object top level, a non-object `hooks` value, or a non-array `hooks.UserPromptSubmit` value is refused without a settings change.
 
 ## What init writes for Codex

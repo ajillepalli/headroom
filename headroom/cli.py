@@ -1,6 +1,7 @@
 """Command-line entry point for headroom."""
 
 import argparse
+import copy
 from dataclasses import dataclass
 from importlib import metadata
 import json
@@ -16,11 +17,14 @@ from .burn_rate import BurnRateProjection, project_exhaustion
 from .claude import parse_stdin
 from .codexrpc import CodexRpcResult, read_rate_limits
 from .codexsrc import CodexResult, read_latest
+from .context_window import ContextReading
 from .freshness import freshness_seconds
 from .install_info import format_modified_time, inspect_install, source_commit
 from .render import (
     render_burn_rate_doctor_lines,
     render_burn_rate_status_lines,
+    render_context_doctor_line,
+    render_context_status_lines,
     render_hook,
     render_report,
     render_statusline,
@@ -34,6 +38,7 @@ from .settings import (
 )
 from .state import (
     clear_state,
+    context_captures_from_state,
     read_state,
     resolve_state_dir,
     save_snapshots,
@@ -174,6 +179,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if arguments.command == "update":
         return _update()
     try:
+        # Read stdin exactly once for "hook": the same parsed payload
+        # decides both this session's context reading below and, later,
+        # whether to wrap output in the UserPromptSubmit JSON envelope.
+        # stdin is a stream, so a second read after this point is empty.
+        hook_payload = _hook_prompt_payload() if arguments.command == "hook" else None
         if arguments.command == "doctor":
             return _doctor()
         if arguments.command != "hook" or not arguments.stored_only:
@@ -200,6 +210,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if arguments.command == "status":
             print(render_report(readings, now))
+            print("Context")
+            for line in render_context_status_lines(_all_fresh_context_readings(state, now), now):
+                print(line)
             burn_lines = render_burn_rate_status_lines(projections, now, readings)
             if burn_lines:
                 print("Burn rate")
@@ -209,16 +222,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif arguments.command == "json":
             print(
                 json.dumps(
-                    _json_document(state, readings, projections),
+                    _json_document(state, readings, projections, now),
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 )
             )
         elif arguments.command == "hook":
-            text = render_hook(readings, now, projections=projections, forced_severity=_forced_hook_severity())
+            session_id = hook_payload.get("session_id") if hook_payload else None
+            context = (
+                _context_reading_for_session(state, now, session_id)
+                if isinstance(session_id, str) and session_id
+                else None
+            )
+            text = render_hook(
+                readings,
+                now,
+                projections=projections,
+                forced_severity=_forced_hook_severity(),
+                context=context,
+            )
             if text:
-                if arguments.plain or not _user_prompt_submit_input():
+                if arguments.plain or hook_payload is None:
                     print(text)
                 else:
                     print(
@@ -239,20 +264,111 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
 
-def _user_prompt_submit_input() -> bool:
-    """Return whether stdin contains a Claude UserPromptSubmit payload."""
+def _hook_prompt_payload() -> Optional[Dict[str, Any]]:
+    """Read stdin once for "hook" and return it if it is a Claude
+    UserPromptSubmit payload, else None.
+
+    This both decides the output envelope (JSON vs. plain text, unchanged
+    from before) and supplies this session's session_id for the context
+    lookup below -- one stdin read serves both, since stdin can only be
+    read once.
+    """
 
     if sys.stdin.isatty():
-        return False
+        return None
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw)
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and payload.get("hook_event_name") == "UserPromptSubmit"
+        return None
+    if isinstance(payload, dict) and payload.get("hook_event_name") == "UserPromptSubmit":
+        return payload
+    return None
+
+
+def _context_reading_for_session(
+    state: Dict[str, Any], now: float, session_id: str
+) -> Optional[ContextReading]:
+    """This session's context reading, or None when absent, stale, or corrupt.
+
+    No session_id on either side means silence (the caller never calls this
+    without one); a stale or undecodable stored entry also collapses to
+    None here rather than raising, matching snapshots_from_state's own
+    defensiveness -- hook/json/status do not catch a blanket Exception.
+    """
+
+    raw = context_captures_from_state(state).get(session_id)
+    if raw is None:
+        return None
+    try:
+        reading = ContextReading.from_dict(raw, now, freshness_seconds("context"))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    # The dict KEY is trusted only as far as context_captures_from_state's
+    # own lookup goes; the stored VALUE carries its own session_id field
+    # (claude.py writes both when a capture is first stored), and the two
+    # are meant to always agree. A mismatch -- a corrupt state.json, a hand
+    # edit, or a latent bug elsewhere that wrote an entry under the wrong
+    # key -- must not let one session's reading answer for a different one:
+    # that is the entire reason context is keyed by session in the first
+    # place (finding #5, context-window adversarial review, the single most
+    # important finding of that round). Requiring the decoded value to
+    # agree with ``session_id`` here checks it against BOTH the dictionary
+    # key used to look it up (the lookup above already required that) and
+    # the session this hook is actually running as (this function's own
+    # parameter), closing both directions of that leak in one comparison.
+    if reading.session_id != session_id:
+        return None
+    return reading if reading.fresh else None
+
+
+def _all_fresh_context_readings(state: Dict[str, Any], now: float) -> List[ContextReading]:
+    """Every currently-fresh context reading across every session.
+
+    Used by "status" and "json", neither of which has a session_id of its
+    own to prefer one session over another (see render_context_status_lines'
+    docstring for why that matters).
+    """
+
+    result: List[ContextReading] = []
+    for raw in context_captures_from_state(state).values():
+        try:
+            reading = ContextReading.from_dict(raw, now, freshness_seconds("context"))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if reading.fresh:
+            result.append(reading)
+    return result
+
+
+def _latest_context_reading(state: Dict[str, Any], now: float) -> Optional[ContextReading]:
+    """The single most-recently-captured context reading across every
+    session, decoded regardless of freshness.
+
+    Used only by "doctor", which has no session of its own and needs to
+    distinguish "stale" from "never captured" (render_context_doctor_line's
+    three states) rather than just checking freshness like the helpers
+    above.
+    """
+
+    captures = context_captures_from_state(state)
+    if not captures:
+        return None
+    latest_raw = max(
+        captures.values(),
+        key=lambda value: _capture_timestamp(value),
     )
+    try:
+        return ContextReading.from_dict(latest_raw, now, freshness_seconds("context"))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _capture_timestamp(value: Dict[str, Any]) -> float:
+    captured_at = value.get("captured_at")
+    if isinstance(captured_at, (int, float)) and not isinstance(captured_at, bool):
+        return float(captured_at)
+    return float("-inf")
 
 
 def _forced_hook_severity() -> Optional[Severity]:
@@ -270,13 +386,22 @@ def _statusline() -> int:
     now = time.time()
     try:
         result = parse_stdin(sys.stdin.read(), now)
-        diagnostics: Dict[str, Any] = {"claude": {"unparsed": list(result.unparsed)}}
-        if result.snapshots:
-            save_snapshots(result.snapshots, diagnostics=diagnostics)
-        else:
-            save_snapshots((), diagnostics=diagnostics)
-        readings = _readings(read_state(), now)
-        print(render_statusline(readings, now))
+        # Rate-limit and context parse notes are merged into one list: both
+        # are parse REJECTIONS visible through doctor's existing generic
+        # notes scraper (_stored_diagnostic_notes), so no new scraper is
+        # needed to satisfy "every rejection is visible through doctor".
+        diagnostics: Dict[str, Any] = {
+            "claude": {"unparsed": list(result.unparsed) + list(result.context_unparsed)}
+        }
+        save_snapshots(result.snapshots, diagnostics=diagnostics, context_capture=result.context)
+        state = read_state()
+        readings = _readings(state, now)
+        context = (
+            _context_reading_for_session(state, now, result.context["session_id"])
+            if result.context is not None
+            else None
+        )
+        print(render_statusline(readings, now, context))
     except Exception:
         # Claude Code's terminal contract is more important than diagnostics here.
         try:
@@ -369,14 +494,38 @@ def _json_document(
     state: Dict[str, Any],
     readings: Sequence[Reading],
     projections: Sequence[BurnRateProjection],
+    now: float,
 ) -> Dict[str, Any]:
-    result = dict(state)
+    # A shallow dict(state) copy still shares every NESTED dict with state
+    # itself, including sources["claude"]["context"] -- so a stale capture
+    # already excluded from context_readings below by the fresh-only filter
+    # would otherwise still be readable straight off the raw document at
+    # sources.claude.context, undermining the whole point of filtering it
+    # (finding #7, context-window adversarial review). A deep copy, plus
+    # dropping the raw context subtree entirely, makes context_readings the
+    # ONLY way this document exposes context -- there is no second, stale
+    # copy sitting next to it.
+    result = copy.deepcopy(state)
+    sources = result.get("sources")
+    if isinstance(sources, dict):
+        claude_source = sources.get("claude")
+        if isinstance(claude_source, dict):
+            claude_source.pop("context", None)
     result["readings"] = [reading.to_dict() for reading in readings]
     result["burn_rate_projections"] = [projection.to_dict() for projection in projections]
+    # Keyed by session_id, not last-write-wins: json has no stdin and no
+    # session of its own, so a single object here would pick whichever
+    # session wrote most recently -- the exact cross-session bug this
+    # feature exists to avoid, relocated to a different command.
+    result["context_readings"] = {
+        reading.session_id: reading.to_dict()
+        for reading in _all_fresh_context_readings(state, now)
+    }
     return result
 
 
 def _doctor() -> int:
+    now = time.time()
     install = inspect_install(_installed_version())
     print("Install")
     print("  Path: {}".format(install.path))
@@ -397,6 +546,12 @@ def _doctor() -> int:
     print("State directory: {}".format(directory))
     print("State file: {}".format("found" if state_path.is_file() else "missing"))
     print("Claude readings: {}".format(_found_windows(existing, "claude")))
+    print(
+        render_context_doctor_line(
+            _latest_context_reading(state, now),
+            freshness_seconds("context"),
+        )
+    )
     print("Codex source: {}".format(codex.source))
     print(
         "Codex sessions: {}".format(
@@ -420,8 +575,7 @@ def _doctor() -> int:
         print("Notes: {}".format("; ".join(dict.fromkeys(notes))))
     print()
     print("Burn rate")
-    doctor_now = time.time()
-    burn_lines = render_burn_rate_doctor_lines(_burn_rate_projections(doctor_now), doctor_now)
+    burn_lines = render_burn_rate_doctor_lines(_burn_rate_projections(now), now)
     if burn_lines:
         for line in burn_lines:
             print(line)

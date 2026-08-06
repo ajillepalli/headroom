@@ -4,22 +4,43 @@ from typing import Dict, List, Optional, Sequence
 
 from .bounds import Confidence, Reading
 from .burn_rate import BurnRateProjection, NoProjectionReason
+from .context_window import ContextReading
 from .severity import (
     Severity,
     burn_rate_evidence_is_current,
     burn_rate_projection_is_trustworthy,
+    context_reading_severity,
     reading_severity,
 )
 
 
-def render_statusline(readings: Sequence[Reading], now: float) -> str:
-    """Render a compact line that is safe to print for every statusline call."""
+def render_statusline(
+    readings: Sequence[Reading], now: float, context: Optional[ContextReading] = None
+) -> str:
+    """Render a compact line that is safe to print for every statusline call.
+
+    A context segment is appended only when it is not ok (fresh AND above
+    the ok threshold) -- the original design's own words, kept literally:
+    the number already exists in Claude Code's native UI, so this line
+    stays quiet unless it has something worth adding.
+    """
 
     known = [reading for reading in readings if reading.lower_bound_percent is not None]
-    if not known:
-        return "headroom: usage unavailable"
     parts = ["{} {} {}".format(_source(reading), _window(reading.window), _usage(reading)) for reading in known]
+    context_segment = _context_statusline_segment(context)
+    if context_segment is not None:
+        parts.append(context_segment)
+    if not parts:
+        return "headroom: usage unavailable"
     return "headroom: " + " | ".join(parts)
+
+
+def _context_statusline_segment(context: Optional[ContextReading]) -> Optional[str]:
+    severity = context_reading_severity(context)
+    if severity is Severity.OK:
+        return None
+    assert context is not None  # severity is only non-OK for a fresh reading
+    return "ctx {}% [{}]".format(_number(context.used_percent), severity)
 
 
 def render_report(readings: Sequence[Reading], now: float) -> str:
@@ -40,7 +61,118 @@ def render_report(readings: Sequence[Reading], now: float) -> str:
     return "\n".join(lines)
 
 
+def render_context_status_lines(readings: Sequence[ContextReading], now: float) -> List[str]:
+    """Render one line per currently-fresh session's context reading.
+
+    ``status`` has no stdin and no session of its own (same as ``json``), so
+    this reports every session with a fresh reading rather than picking one
+    -- picking one would relocate the exact cross-session bug the ENG review
+    phase caught to a different command. A stale or absent reading is not
+    listed at all here: fresh-or-nothing means there is nothing sound to say
+    about it, unlike a rate-limit window's stale-but-bounded reading.
+    """
+
+    if not readings:
+        return ["  unavailable"]
+    lines: List[str] = []
+    for reading in sorted(readings, key=lambda item: item.captured_at, reverse=True):
+        severity = context_reading_severity(reading)
+        lines.append(
+            "  session {}: {}% used [{}], reading {} old".format(
+                reading.session_id[:8],
+                _number(reading.used_percent),
+                severity,
+                _duration(reading.age_seconds),
+            )
+        )
+    return lines
+
+
+def render_context_doctor_line(
+    reading: Optional[ContextReading], fresh_for_seconds: float
+) -> str:
+    """Render doctor's dedicated, always-present context line.
+
+    This exists because the generic notes scraper (``cli._stored_diagnostic_notes``)
+    only ever fires on parse REJECTIONS. "No session_id" is an ABSENCE, not a
+    rejection, so it produces no note at all and doctor would otherwise say
+    nothing about context whatsoever -- required for ship once statusline
+    and status are the only other self-serve surfaces (see the plan's DX
+    review). ``reading`` here is the single most-recently-captured context
+    entry across every session in state (doctor has no session of its own),
+    already decoded by the caller; a caller passes ``None`` for either "no
+    context was ever captured" or "the stored entry could not be decoded" --
+    both collapse to the same message here because a corrupt entry and an
+    absent one are equally undebuggable from doctor's own vantage point, and
+    the specific decode failure (if any) already surfaces through the
+    generic notes scraper's context_unparsed entries.
+    """
+
+    if reading is None:
+        return "Claude context: not available (no session_id in last statusline payload)"
+    if not reading.fresh:
+        return "Claude context: stale (last capture {} ago, exceeds {}s freshness)".format(
+            _duration(reading.age_seconds), _number(fresh_for_seconds)
+        )
+    severity = context_reading_severity(reading)
+    if severity is Severity.OK:
+        return "Claude context: ok ({}% used, below notice threshold)".format(
+            _number(reading.used_percent)
+        )
+    return "Claude context: {} ({}% used)".format(severity, _number(reading.used_percent))
+
+
 _BURN_RATE_ACTION = "Slow down now: use cheaper models and checkpoint work before it runs out."
+
+# Adopted verbatim from the context-window plan's FINAL SCOPE. "Skip
+# subagent fan-out" (the rate-limit ladder's own wording, _severity_action
+# below) is backwards for context: a subagent spends its OWN context window
+# and returns only a condensed result, so delegating a large read is the
+# best move at high context and the closest thing to compaction the model
+# can actually invoke. Never instructs the model to compact -- it cannot.
+# "may compact without warning" is descriptive (explains WHY to act), not
+# an instruction to compact; see test_context_window.py's word-ban assertion.
+_CONTEXT_ADVICE: Dict[Severity, str] = {
+    Severity.NOTICE: (
+        "Context is filling ({}% used). Avoid opening large files unless the "
+        "current step needs them."
+    ),
+    Severity.WARN: (
+        "Context is high ({}% used) and may compact without warning. Delegate "
+        "large file reads or broad exploration to a subagent instead of "
+        "reading directly, and note current progress somewhere durable."
+    ),
+    Severity.CRITICAL: (
+        "Context is nearly full ({}% used) and may compact without warning. "
+        "Stop reading large files directly, delegate exploration to a "
+        "subagent, and save a short progress summary now."
+    ),
+}
+
+
+def _context_advice(reading: ContextReading, severity: Severity) -> str:
+    return _CONTEXT_ADVICE[severity].format(_number(reading.used_percent))
+
+
+def _context_trailing_clause(reading: ContextReading, severity: Severity) -> str:
+    """One short, factual trailing clause -- no second action line (the
+    arbitration rule's own words) -- for context as the SUBORDINATE signal."""
+
+    return "Context is also at {} ({}% used).".format(severity, _number(reading.used_percent))
+
+
+def _rate_trailing_clause(reading: Reading, severity: Severity) -> str:
+    """The rate-ladder equivalent of ``_context_trailing_clause``, for when
+    context wins arbitration and a live rate warning is the loser.
+
+    Uses the raw ``reading.window`` name ("weekly"/"short"), matching
+    ``_severity_reading_line``'s own convention, not the "7d"/"5h" shorthand
+    ``_window`` produces for ``status``/``statusline``.
+    """
+
+    return "{} {} usage is also at {} ({}).".format(
+        _source_name(reading.source), reading.window, severity, _usage(reading)
+    )
 
 
 def render_hook(
@@ -48,37 +180,43 @@ def render_hook(
     now: float,
     projections: Sequence[BurnRateProjection] = (),
     forced_severity: Optional[Severity] = None,
+    context: Optional[ContextReading] = None,
 ) -> str:
     """Render brief model guidance, or an empty string when no action is needed.
 
-    Composes two independent signals under one ~60-word budget: the
-    existing rate-limit severity ladder (bounds.py + severity.py, "how much
-    headroom is left right now") and the burn-rate policy
-    (severity.py's ``burn_rate_projection_is_trustworthy`` and its trust
-    constants, "will this window run out before it resets"). They answer
-    different questions -- a reading can have plenty of headroom right now
-    and still be on a trajectory that exhausts before reset, which is
-    exactly the case a burn-rate warning exists to catch (the model can only
-    change behavior if it learns this BEFORE the reset, not after).
-    Composition rule, stated explicitly so it isn't left to accident:
+    Composes THREE independent signals under one ~60-word budget: the
+    rate-limit severity ladder (bounds.py + severity.py, "how much headroom
+    is left right now"), the burn-rate policy (severity.py's
+    ``burn_rate_projection_is_trustworthy``, "will this window run out
+    before it resets"), and -- new -- this session's context-window
+    severity (``severity.context_reading_severity``, "is this conversation
+    about to compact"). Rate and burn-rate compose exactly as before (see
+    below); context arbitrates against rate specifically, per the plan's
+    six numbered rules:
 
-    * A CRITICAL rate-limit reading always wins and is shown ALONE. It is
-      the nearer-term, already-confirmed signal; a burn-rate warning is a
-      trend projected on top of it, and the word budget is tightest exactly
-      when brevity matters most. A CRITICAL reading is never displaced or
-      diluted by appending a second topic.
-    * Otherwise, a trustworthy burn-rate warning (one whose
-      ``exhaustion_precedes_reset`` is ``True`` -- never ``False`` or
-      ``None``, see BurnRateProjection's tri-state docstring -- that clears
-      severity.py's trust bar AND has a currently FRESH reading confirming
-      the same source and window, per
-      ``severity.burn_rate_evidence_is_current``) is shown alongside
-      whatever the severity ladder already has to say. If the ladder has
-      nothing actionable (every reading is OK), the burn-rate lines are the
-      only output. If the ladder has a NOTICE or WARN reading, both appear.
-    * If neither has anything to say, this returns "" and the hook prints
-      nothing, matching the documented "silent when nothing actionable"
-      hook contract.
+    1. Compute the worst rate severity and this session's context severity
+       separately (``rate_severity``/``context_severity`` below).
+    2. Both ok or absent: this function returns "".
+    3. Only one above ok: that one renders as the WHOLE primary block, same
+       as if the other did not exist.
+    4. Both above ok: CRITICAL > WARN > NOTICE; a tie goes to RATE, because
+       rate exhaustion blocks work for hours or days while context resolves
+       in seconds. The winner is the primary block.
+    5. If the LOSER is WARN or CRITICAL, ONE short trailing clause is
+       appended -- no second action line. A loser that is only NOTICE is
+       dropped to protect the word budget.
+    6. A CRITICAL rate line is never omitted for context: since CRITICAL is
+       the top of the ladder, context can never out-rank it, so rule 4
+       structurally guarantees this without extra code.
+
+    Burn-rate stays a purely rate-side addition, exactly as before: it
+    never appears when context wins arbitration (context winning already
+    means rate has nothing more urgent to add), and a CRITICAL rate line
+    still never gets a burn-rate addendum, only at most one trailing
+    context clause per rule 5. The forced-severity diagnostic path
+    (``HEADROOM_FORCE_SEVERITY``) stays isolated from context exactly like
+    it already stays isolated from burn-rate: a synthetic test severity is
+    never blended with a genuine context reading.
     """
 
     actionable = [reading for reading in readings if reading_severity(reading) is not Severity.OK]
@@ -88,7 +226,15 @@ def render_hook(
     burn_warning = (
         None if forced_severity is not None else _earliest_burn_rate_warning(projections, readings, now)
     )
-    if not actionable and forced_severity is None and burn_warning is None:
+    context_severity = (
+        Severity.OK if forced_severity is not None else context_reading_severity(context)
+    )
+    if (
+        not actionable
+        and forced_severity is None
+        and burn_warning is None
+        and context_severity is Severity.OK
+    ):
         return ""
 
     candidates = actionable or [
@@ -103,9 +249,9 @@ def render_hook(
         ),
         reverse=True,
     )
-    reading = candidates[0] if candidates else None
-    severity = forced_severity or (
-        reading_severity(reading) if reading is not None else Severity.OK
+    rate_reading = candidates[0] if candidates else None
+    rate_severity = forced_severity or (
+        reading_severity(rate_reading) if rate_reading is not None else Severity.OK
     )
 
     lines: List[str] = []
@@ -115,17 +261,35 @@ def render_hook(
                 forced_severity
             )
         )
+
+    # Arbitration rule 4: strictly greater wins; a tie (including OK == OK,
+    # already excluded above) goes to rate. Structurally impossible while
+    # forced_severity is set (context_severity is forced to OK above).
+    context_wins = context_severity > rate_severity
+    if context_wins:
+        lines.append(_context_advice(context, context_severity))
+        if rate_severity in (Severity.WARN, Severity.CRITICAL) and rate_reading is not None:
+            lines.append(_rate_trailing_clause(rate_reading, rate_severity))
+        return "\n".join(lines)
+
     show_severity_section = bool(actionable) or forced_severity is not None
     if show_severity_section:
-        if reading is None:
+        if rate_reading is None:
             lines.append("Usage headroom: no reading is available.")
         else:
-            lines.append(_severity_reading_line(reading, now))
-        lines.append(_severity_action(severity))
-        if severity is Severity.CRITICAL:
-            # Never displaced: return here, before the burn-rate section
-            # below is ever reached. See this function's docstring.
+            lines.append(_severity_reading_line(rate_reading, now))
+        lines.append(_severity_action(rate_severity))
+        if rate_severity is Severity.CRITICAL:
+            # Never displaced by burn-rate (existing rule) but MAY still
+            # carry one trailing context clause (arbitration rule 5) before
+            # returning, so this returns here rather than falling through
+            # to the burn-rate section below.
+            if context_severity in (Severity.WARN, Severity.CRITICAL):
+                lines.append(_context_trailing_clause(context, context_severity))
             return "\n".join(lines)
+
+    if context_severity in (Severity.WARN, Severity.CRITICAL):
+        lines.append(_context_trailing_clause(context, context_severity))
 
     if burn_warning is not None:
         lines.append(_burn_rate_warning_line(burn_warning, now))
