@@ -63,20 +63,41 @@ _LOCK_POLL_SECONDS = 0.05
 # sets HEADROOM_FRESH_CONTEXT_SECONDS below their own real-world
 # scheduling delay. This constant instead answers "how much concurrent-
 # process timing slop is plausible on one machine", which is unrelated to
-# how long a caller wants to trust a reading for. An hour comfortably
-# covers realistic lock contention and process-scheduling delays (which
-# this project's own stress testing never observed exceeding single-digit
-# seconds even under dozens of simultaneous processes) while staying
-# orders of magnitude below what a genuinely corrupt or clock-rolled-back
-# entry produces in practice (this project's own tests and hostile-input
-# scenarios use deltas of 10,000+ seconds for exactly that reason) --
-# still catching the failure mode CLOCK_SKEW_ALLOWANCE_SECONDS exists for
-# (context_window.py) without reintroducing the one this constant exists
-# to fix. The final, tight soundness gate on what a user actually SEES
-# remains ContextReading.from_dict's own CLOCK_SKEW_ALLOWANCE_SECONDS,
-# checked with a real time.time() reference at read time; this constant
-# only governs the write-time storage layer's coarser bookkeeping.
-_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS = 3600.0
+# how long a caller wants to trust a reading for.
+#
+# An EARLIER version of this constant used 3600.0 (one hour), reasoning
+# only about the upper bound (staying far below what a genuinely corrupt
+# entry looks like). Codex review round 3, P2 found the real cost of that
+# choice: a stored entry that is merely moderately future-dated -- a
+# 5-60 minute clock rollback or skew, not an attack -- would then survive
+# BOTH the pruning sweep and _should_replace_context_capture's "is
+# current implausible" check for up to an hour, permanently blocking
+# every legitimate same-session capture until wall time caught up, even
+# though ContextReading.from_dict's own tight decode-time check
+# (CLOCK_SKEW_ALLOWANCE_SECONDS, 5s) would already have refused to ever
+# DISPLAY that entry -- so the hour-long tolerance bought no soundness
+# benefit, only an hour of an otherwise-healthy session going dark.
+#
+# 60 seconds is sized from the other direction instead: this project's
+# own stress testing (real concurrent OS processes, not simulated) never
+# observed an actual lock-acquisition wait exceeding roughly a tenth of a
+# second even under several dozen simultaneous processes, and
+# _LOCK_TIMEOUT_SECONDS (5s) already bounds any single acquisition
+# attempt. 60 seconds is a generous order of magnitude beyond both --
+# comfortably covering realistic reordering delay -- while being tight
+# enough that even a moderate real clock skew (minutes, not
+# milliseconds) is correctly treated as implausible and cleaned up
+# promptly, and remaining orders of magnitude below what a genuinely
+# corrupt or badly clock-rolled-back entry produces in practice (this
+# project's own tests and hostile-input scenarios use deltas of 10,000+
+# seconds for exactly that reason). The final, tight soundness gate on
+# what a user actually SEES remains ContextReading.from_dict's own
+# CLOCK_SKEW_ALLOWANCE_SECONDS, checked with a real time.time() reference
+# at read time; this constant only governs the write-time storage
+# layer's coarser bookkeeping, and is now sized to keep that bookkeeping
+# self-healing on a realistic timescale rather than merely staying below
+# an arbitrary corruption threshold.
+_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS = 60.0
 # The errno values that mean "someone else holds this lock right now, try
 # again" -- as opposed to "this platform/filesystem cannot do this at all",
 # which retrying will never fix. fcntl.flock(LOCK_NB) raises EWOULDBLOCK (or

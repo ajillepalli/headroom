@@ -19,7 +19,9 @@ from headroom.cli import main
 from headroom.state import (
     _MAX_TRACKED_CONTEXT_SESSIONS,
     _acquire_lock,
+    _context_entry_is_fresh,
     _LOCK_TIMEOUT_SECONDS,
+    _should_replace_context_capture,
     context_captures_from_state,
     read_state,
     save_snapshots,
@@ -250,13 +252,21 @@ class StateTests(unittest.TestCase):
                 "source": "claude",
             }
             session_b_stale_out_of_order = {
-                # More than CLOCK_SKEW_ALLOWANCE_SECONDS (5s) older than
-                # both entries above, and rejected for session-b because
-                # session-b already has a newer capture on record.
+                # 30s older than both entries above -- realistically
+                # delayed (well past CLOCK_SKEW_ALLOWANCE_SECONDS's 5s),
+                # so it is correctly rejected for session-b by the
+                # ordinary "incoming >= current" comparison, but still
+                # comfortably inside _CROSS_SESSION_REORDERING_TOLERANCE_
+                # SECONDS so it does not also trip the SEPARATE "current
+                # is implausibly future-dated" self-heal check that
+                # protects a session from a genuinely corrupt stored
+                # entry (see test_session_recovers_on_its_own_from_a_
+                # stuck_future_dated_entry) -- this test is specifically
+                # about an ordinary late write, not a corrupt one.
                 "used_percentage": 5.0,
                 "size": None,
                 "session_id": "session-b",
-                "captured_at": 100.0,
+                "captured_at": 970.0,
                 "source": "claude",
             }
 
@@ -575,6 +585,47 @@ class StateTests(unittest.TestCase):
             captures = context_captures_from_state(state)
             self.assertIn("session-30", captures)
             self.assertIn("session-5", captures)
+
+    def test_a_moderate_clock_skew_does_not_survive_for_up_to_an_hour(self) -> None:
+        # Codex review (round 3, P2): an earlier version of the reordering
+        # tolerance above was set to 3600s (one hour) to comfortably clear
+        # "genuine corruption" scenarios, reasoning only about the upper
+        # bound. That choice had a real cost: a stored entry that is
+        # merely moderately future-dated (minutes, e.g. a real ~30-minute
+        # clock rollback, not an attack) would then survive BOTH the
+        # pruning sweep and the same-session self-heal check for up to an
+        # hour, even though it could never actually be DISPLAYED (
+        # ContextReading.from_dict's own much tighter decode-time check
+        # already refuses that) -- so the hour-long tolerance bought no
+        # soundness benefit, only an hour of an otherwise-healthy session
+        # going dark. This asserts BOTH surfaces recognize a 30-minute
+        # future entry as implausible promptly, not eventually.
+        thirty_minutes = 30 * 60.0
+        future_entry = {
+            "used_percentage": 92.0,
+            "size": None,
+            "session_id": "session-a",
+            "captured_at": 1_000.0 + thirty_minutes,
+            "source": "claude",
+        }
+
+        # Pruning: a DIFFERENT session's ordinary write must not retain
+        # the 30-minute-future entry as if it were merely a faster
+        # session that captured first.
+        self.assertFalse(_context_entry_is_fresh(future_entry, 1_000.0, 300.0))
+
+        # Same-session self-heal: a legitimate new capture for session-a
+        # itself must not be blocked by its own 30-minute-future entry.
+        self.assertTrue(
+            _should_replace_context_capture(
+                future_entry,
+                {
+                    "used_percentage": 10.0,
+                    "session_id": "session-a",
+                    "captured_at": 1_000.0,
+                },
+            )
+        )
 
     def test_session_recovers_on_its_own_from_a_stuck_future_dated_entry(self) -> None:
         # Codex review (round 2, P2): a stored entry that is FINITE but
