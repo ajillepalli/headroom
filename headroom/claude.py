@@ -221,6 +221,17 @@ def _extract_context(
         # rather than silently truncating or accepting it.
         notes.append({"path": list(path), "reason": "session_id exceeds max length"})
         return None, tuple(notes)
+    try:
+        session_id.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate survives json.loads but cannot be encoded on the
+        # way back out, and state.py writes with ensure_ascii=False. Letting
+        # one through here does not just lose this reading: the write raises
+        # and takes every other valid capture in the same payload with it.
+        # Decode-time already rejects a stored one, but that guard never sees
+        # an incoming payload, so reject it at capture too.
+        notes.append({"path": list(path), "reason": "session_id is not encodable"})
+        return None, tuple(notes)
 
     used = _context_percent(value, _USED_KEYS)
     remaining = _context_percent(value, _CONTEXT_REMAINING_KEYS)

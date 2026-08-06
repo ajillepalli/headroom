@@ -8,10 +8,12 @@ split between test_burn_rate_policy.py and test_cli.py.
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from headroom.bounds import Confidence, Reading
 from headroom.burn_rate import BurnRateProjection
+from headroom.claude import parse_payload
 from headroom.context_window import ContextReading
 from headroom.render import (
     render_context_doctor_line,
@@ -403,3 +405,40 @@ class StatusAndDoctorRenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnencodableSessionIdTests(unittest.TestCase):
+    """A session_id that cannot be encoded must be refused at capture.
+
+    json.loads accepts a lone surrogate, but state.py writes with
+    ensure_ascii=False, so storing one raises UnicodeEncodeError during the
+    write. That does not merely lose the context reading: it aborts the whole
+    save and takes every other valid capture in the same payload with it.
+    Decode-time validation cannot help, because it only ever inspects state
+    that was already written.
+    """
+
+    def _payload(self):
+        return {
+            "session_id": "\ud800",
+            "context_window": {"context_window_size": 1000000, "used_percentage": 81},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 40, "window_minutes": 300}
+            },
+        }
+
+    def test_lone_surrogate_session_id_is_refused_with_a_diagnostic(self) -> None:
+        result = parse_payload(self._payload())
+        self.assertIsNone(result.context)
+        reasons = [note.get("reason") for note in result.context_unparsed]
+        self.assertIn("session_id is not encodable", reasons)
+
+    def test_the_rest_of_the_payload_still_parses(self) -> None:
+        result = parse_payload(self._payload())
+        self.assertGreaterEqual(len(result.snapshots), 1)
+
+    def test_the_refused_capture_is_actually_unwritable(self) -> None:
+        # Proves the rejection is load bearing rather than defensive: the
+        # value it refuses genuinely cannot survive the write path.
+        with self.assertRaises(UnicodeEncodeError):
+            json.dumps({"\ud800": 1}, ensure_ascii=False).encode("utf-8")
