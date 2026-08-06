@@ -475,6 +475,13 @@ class StateTests(unittest.TestCase):
         # swept -- the naive (now - captured_at) clamp used before this fix
         # made that subtraction negative, which is <= any non-negative
         # freshness window, so the sweep never removed it.
+        #
+        # Implausibility is judged against REAL wall-clock time as of
+        # round 4 (see _FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS), so this
+        # test pins time.time() to the same small synthetic scale its own
+        # captured_at values use -- without that, 1_000_000.0 looks like
+        # ordinary ancient history next to the real Unix epoch (~1.7e9)
+        # and would never trip the implausibility check at all.
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             future_dated = {
@@ -484,8 +491,6 @@ class StateTests(unittest.TestCase):
                 "captured_at": 1_000_000.0,
                 "source": "claude",
             }
-            save_snapshots((), state_dir, context_capture=future_dated)
-
             new = {
                 "used_percentage": 10.0,
                 "size": None,
@@ -493,7 +498,10 @@ class StateTests(unittest.TestCase):
                 "captured_at": 400.0,
                 "source": "claude",
             }
-            state = save_snapshots((), state_dir, context_capture=new)
+
+            with mock.patch("headroom.state.time.time", return_value=400.0):
+                save_snapshots((), state_dir, context_capture=future_dated)
+                state = save_snapshots((), state_dir, context_capture=new)
 
             captures = context_captures_from_state(state)
             self.assertNotIn("future-session", captures)
@@ -586,6 +594,65 @@ class StateTests(unittest.TestCase):
             self.assertIn("session-30", captures)
             self.assertIn("session-5", captures)
 
+    def test_a_writer_suspended_for_several_minutes_does_not_prune_a_newer_session(
+        self,
+    ) -> None:
+        # Codex review (round 4, P2): the round-3 fix compared a stored
+        # entry's captured_at against the INCOMING capture's own
+        # timestamp with a 60s tolerance. That broke the moment a writer
+        # was legitimately suspended for MORE than 60s between
+        # timestamping its own capture and actually executing (laptop
+        # sleep/resume, SIGSTOP, a scheduler stall) -- its own genuinely
+        # valid but now-old-relative-to-execution timestamp would make a
+        # DIFFERENT session's already-stored, genuinely newer entry look
+        # "implausibly future" and prune it. session-x's capture was
+        # timestamped 5 minutes before it finally executes (well past the
+        # old 60s tolerance); session-y's entry, stored moments before
+        # session-x's write actually runs, must survive regardless.
+        five_minutes = 5 * 60.0
+        session_y_entry = {
+            "used_percentage": 8.0,
+            "size": None,
+            "session_id": "session-y",
+            "captured_at": 1_000.0,
+            "source": "claude",
+        }
+        session_x_incoming_now = 1_000.0 - five_minutes
+
+        with mock.patch("headroom.state.time.time", return_value=1_005.0):
+            self.assertTrue(
+                _context_entry_is_fresh(session_y_entry, session_x_incoming_now, 300.0)
+            )
+
+    def test_a_suspended_writers_stale_capture_does_not_overwrite_a_legitimate_entry(
+        self,
+    ) -> None:
+        # The same-session counterpart of the test above: a legitimately
+        # stored entry (captured_at close to real "now") must not be
+        # mistaken for corrupt and overwritten by a DELAYED capture for
+        # its own session whose own timestamp is simply old relative to
+        # when it finally executes (laptop sleep/resume, a scheduler
+        # stall) -- the round-3-era comparison (against the incoming
+        # capture's own timestamp, 60s tolerance) would misjudge the
+        # legitimate stored entry as implausible here and let the stale
+        # delayed capture win.
+        five_minutes = 5 * 60.0
+        legitimate_current = {
+            "used_percentage": 8.0,
+            "session_id": "session-a",
+            "captured_at": 1_000.0,
+        }
+        delayed_incoming = {
+            "used_percentage": 92.0,
+            "session_id": "session-a",
+            "captured_at": 1_000.0 - five_minutes,
+        }
+
+        with mock.patch("headroom.state.time.time", return_value=1_005.0):
+            self.assertFalse(
+                _should_replace_context_capture(legitimate_current, delayed_incoming)
+            )
+
     def test_a_moderate_clock_skew_does_not_survive_for_up_to_an_hour(self) -> None:
         # Codex review (round 3, P2): an earlier version of the reordering
         # tolerance above was set to 3600s (one hour) to comfortably clear
@@ -600,6 +667,12 @@ class StateTests(unittest.TestCase):
         # soundness benefit, only an hour of an otherwise-healthy session
         # going dark. This asserts BOTH surfaces recognize a 30-minute
         # future entry as implausible promptly, not eventually.
+        #
+        # Implausibility is judged against REAL wall-clock time as of
+        # round 4, so time.time() is pinned to 1_000.0 -- the same
+        # synthetic instant "session-a's real capture" represents here --
+        # rather than the real Unix epoch, which this test's small values
+        # are nowhere near.
         thirty_minutes = 30 * 60.0
         future_entry = {
             "used_percentage": 92.0,
@@ -609,23 +682,25 @@ class StateTests(unittest.TestCase):
             "source": "claude",
         }
 
-        # Pruning: a DIFFERENT session's ordinary write must not retain
-        # the 30-minute-future entry as if it were merely a faster
-        # session that captured first.
-        self.assertFalse(_context_entry_is_fresh(future_entry, 1_000.0, 300.0))
+        with mock.patch("headroom.state.time.time", return_value=1_000.0):
+            # Pruning: a DIFFERENT session's ordinary write must not retain
+            # the 30-minute-future entry as if it were merely a faster
+            # session that captured first.
+            self.assertFalse(_context_entry_is_fresh(future_entry, 1_000.0, 300.0))
 
-        # Same-session self-heal: a legitimate new capture for session-a
-        # itself must not be blocked by its own 30-minute-future entry.
-        self.assertTrue(
-            _should_replace_context_capture(
-                future_entry,
-                {
-                    "used_percentage": 10.0,
-                    "session_id": "session-a",
-                    "captured_at": 1_000.0,
-                },
+            # Same-session self-heal: a legitimate new capture for
+            # session-a itself must not be blocked by its own
+            # 30-minute-future entry.
+            self.assertTrue(
+                _should_replace_context_capture(
+                    future_entry,
+                    {
+                        "used_percentage": 10.0,
+                        "session_id": "session-a",
+                        "captured_at": 1_000.0,
+                    },
+                )
             )
-        )
 
     def test_session_recovers_on_its_own_from_a_stuck_future_dated_entry(self) -> None:
         # Codex review (round 2, P2): a stored entry that is FINITE but

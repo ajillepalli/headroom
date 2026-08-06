@@ -44,60 +44,69 @@ _LOCK_FILENAME = ".state.lock"
 _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.05
 
-# How far a stored context entry's captured_at may sit ahead of another
-# capture's own timestamp before it is treated as implausible rather than
-# as a different session that simply captured, and committed, first.
-# state.py never reads the real clock (see _merge_context_capture's own
-# docstring), so its only proxy for "now" is whichever capture it is
-# currently processing -- and two different sessions' captures can be
-# reordered in EXECUTION relative to when they were originally
-# timestamped (this process's own lock queueing, or plain OS scheduling,
-# can delay one session's write behind another's faster one; reproduced
-# directly with real concurrent processes, not merely theorized).
+# --- History of this constant (three prior Codex review rounds each found
+# a real defect; read this before touching the value again) ---
 #
-# This is deliberately NOT freshness_seconds("context") (the user-facing,
-# environment-overridable "how long is a reading still worth showing"
-# knob): that value answers a completely different question and can be
-# configured arbitrarily small (Codex review round 2, P2) -- reusing it
-# here would make the SAME reordering bug reappear the moment someone
-# sets HEADROOM_FRESH_CONTEXT_SECONDS below their own real-world
-# scheduling delay. This constant instead answers "how much concurrent-
-# process timing slop is plausible on one machine", which is unrelated to
-# how long a caller wants to trust a reading for.
+# round 1: judged implausibility by comparing a stored entry's captured_at
+# against ANOTHER capture's own timestamp (deterministic, state.py's usual
+# "never read the real clock" design). Two different sessions' captures
+# can be reordered in EXECUTION relative to when they were originally
+# timestamped (lock queueing or OS scheduling can delay one session's
+# write behind another's faster one; reproduced directly with real
+# concurrent processes), so a slower session's older timestamp could
+# treat a faster session's already-stored, perfectly valid entry as
+# "implausibly future" and erase it.
 #
-# An EARLIER version of this constant used 3600.0 (one hour), reasoning
-# only about the upper bound (staying far below what a genuinely corrupt
-# entry looks like). Codex review round 3, P2 found the real cost of that
-# choice: a stored entry that is merely moderately future-dated -- a
-# 5-60 minute clock rollback or skew, not an attack -- would then survive
-# BOTH the pruning sweep and _should_replace_context_capture's "is
-# current implausible" check for up to an hour, permanently blocking
-# every legitimate same-session capture until wall time caught up, even
-# though ContextReading.from_dict's own tight decode-time check
-# (CLOCK_SKEW_ALLOWANCE_SECONDS, 5s) would already have refused to ever
-# DISPLAY that entry -- so the hour-long tolerance bought no soundness
-# benefit, only an hour of an otherwise-healthy session going dark.
+# round 2 tried reusing freshness_seconds("context") as the tolerance,
+# which broke the moment that user-configurable value was set below
+# realistic scheduling delay -- "how long should a reading stay visible"
+# and "how much writer timing slop is plausible" are unrelated questions.
 #
-# 60 seconds is sized from the other direction instead: this project's
-# own stress testing (real concurrent OS processes, not simulated) never
-# observed an actual lock-acquisition wait exceeding roughly a tenth of a
-# second even under several dozen simultaneous processes, and
-# _LOCK_TIMEOUT_SECONDS (5s) already bounds any single acquisition
-# attempt. 60 seconds is a generous order of magnitude beyond both --
-# comfortably covering realistic reordering delay -- while being tight
-# enough that even a moderate real clock skew (minutes, not
-# milliseconds) is correctly treated as implausible and cleaned up
-# promptly, and remaining orders of magnitude below what a genuinely
-# corrupt or badly clock-rolled-back entry produces in practice (this
-# project's own tests and hostile-input scenarios use deltas of 10,000+
-# seconds for exactly that reason). The final, tight soundness gate on
-# what a user actually SEES remains ContextReading.from_dict's own
-# CLOCK_SKEW_ALLOWANCE_SECONDS, checked with a real time.time() reference
-# at read time; this constant only governs the write-time storage
-# layer's coarser bookkeeping, and is now sized to keep that bookkeeping
-# self-healing on a realistic timescale rather than merely staying below
-# an arbitrary corruption threshold.
-_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS = 60.0
+# round 3 introduced a large FIXED tolerance (3600s) sized only from the
+# "stay below genuine corruption" direction, and found ITS cost: a
+# merely-moderately-future entry (a real few-minute clock rollback, not
+# an attack) could then block legitimate same-session writes for up to an
+# hour, even though it could never be DISPLAYED either way (
+# ContextReading.from_dict's own much tighter decode-time check already
+# refuses that) -- so the hour bought no soundness benefit.
+#
+# round 4 tightened that same fixed tolerance to 60s and found the
+# opposite failure: a writer legitimately suspended for MORE than 60s
+# (laptop sleep/resume, SIGSTOP, a scheduler stall) between timestamping
+# its capture and actually executing would have its own perfectly valid,
+# merely-delayed capture treated as implausible.
+#
+# All four rounds share one root cause: comparing two DIFFERENT
+# CAPTURES' timestamps against each other cannot distinguish "this one
+# is corrupt" from "this one is simply older, or reordered in execution"
+# -- both look identical as a raw time gap, no matter what threshold is
+# chosen, because there is no ground truth in the comparison itself.
+#
+# The fix (Codex review round 4's own suggestion) is to stop comparing
+# captures against EACH OTHER for this question and instead validate
+# each one against REAL wall-clock time (``time.time()``), which IS
+# ground truth: a legitimate captured_at, however delayed in execution,
+# can never be dated later than the real moment it is checked, no matter
+# how long that delay was -- only genuinely wrong data (corruption, or a
+# badly rolled-back system clock) claims a time later than "now" by a
+# meaningful margin. This does mean state.py is no longer fully immune to
+# reading the real clock (a deliberate, narrow exception to the "never
+# call time.time()" property described elsewhere in this file): it is
+# used ONLY for this implausibility check, never for the deterministic
+# staleness/ordering logic that the rest of this module still bases on
+# whatever timestamp a caller passes in.
+#
+# With a REAL reference point, the tolerance only needs to cover the gap
+# between "when a genuinely valid capture was recorded" and "when THIS
+# check happens to run" -- ordinary clock-read skew plus, worst case,
+# this process's own lock queueing (bounded by _LOCK_TIMEOUT_SECONDS,
+# 5s). 30 seconds is a generous multiple of that bound, verified against
+# this project's own stress testing (real concurrent OS processes, which
+# never observed an actual lock wait exceeding roughly a tenth of a
+# second even under several dozen simultaneous processes), while staying
+# far below what any of the corruption scenarios in this project's own
+# tests and hostile-input fixtures produce (10,000+ seconds).
+_FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS = 30.0
 # The errno values that mean "someone else holds this lock right now, try
 # again" -- as opposed to "this platform/filesystem cannot do this at all",
 # which retrying will never fix. fcntl.flock(LOCK_NB) raises EWOULDBLOCK (or
@@ -436,13 +445,16 @@ def _merge_context_capture(sources: Dict[str, Any], capture: Dict[str, Any]) -> 
     session, see ``_should_replace_context_capture``) is never used as
     "now" for that sweep, even though it is still a real, valid
     ``captured_at`` value: it is, by definition, older than something
-    already known to be more current, so treating it as "now" would make
-    every genuinely newer entry -- for ANY session, not just this one --
-    look implausibly future-dated to ``_context_entry_is_fresh`` and get
-    pruned, erasing valid readings instead of the stale one that arrived
-    late (Codex review, round 1, P2). Skipping the sweep on a rejected
-    capture only defers cleanup, not correctness: the next ACCEPTED write,
-    from any session, still runs it.
+    already known to be more current (Codex review, round 1, P2).
+    ``_context_entry_is_fresh``'s implausible-future check no longer
+    depends on this "now" at all (round 4 moved that check to a real
+    ``time.time()`` reference instead), so a rejected capture's timestamp
+    can no longer cause a false PRUNE of another entry the way it
+    originally could -- but this gate is kept regardless, both as
+    defense in depth and because a rejected write has nothing new to
+    contribute to a sweep pass in the first place. Skipping it only
+    defers cleanup, not correctness: the next ACCEPTED write, from any
+    session, still runs it.
     """
 
     claude_source = sources.setdefault("claude", {})
@@ -505,6 +517,14 @@ def _should_replace_context_capture(current: Any, capture: Dict[str, Any]) -> bo
     session could never recover on its own -- only a DIFFERENT session's
     write happening to run afterward could ever clean it up (Codex review
     round 2, P2).
+
+    "Implausibly future-dated" is judged against REAL wall-clock time
+    (``time.time()``), not against the incoming capture's own timestamp:
+    see ``_FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS``'s own comment for why
+    comparing two captures against each other cannot soundly distinguish
+    "corrupt" from "simply older or execution-reordered" (Codex review
+    round 4, P2, after rounds 1-3 each found a different failure mode of
+    that approach).
     """
 
     if not isinstance(current, dict):
@@ -518,8 +538,8 @@ def _should_replace_context_capture(current: Any, capture: Dict[str, Any]) -> bo
     if (
         resolve_age(
             current_captured_at,
-            incoming_captured_at,
-            skew_allowance_seconds=_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS,
+            time.time(),
+            skew_allowance_seconds=_FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS,
         )
         is None
     ):
@@ -595,39 +615,45 @@ def _evict_oldest_context_entries(contexts: Dict[str, Any], max_entries: int) ->
 
 
 def _context_entry_is_fresh(value: Any, now: float, fresh_for_seconds: float) -> bool:
+    """Whether a stored context entry is both plausible and still fresh.
+
+    Two SEPARATE questions, deliberately answered against two DIFFERENT
+    reference points (Codex review round 4, P2, after rounds 1-3 each
+    found a different failure mode of using one shared reference for
+    both -- see _FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS's own comment
+    for the full history):
+
+    * Is captured_at PLAUSIBLE at all (not non-finite, not implausibly
+      future-dated -- corrupt data or a badly rolled-back clock)? Judged
+      against REAL wall-clock time (``time.time()``), the only sound
+      ground truth for "could this timestamp be real": a legitimate
+      captured_at, however long its write was delayed in EXECUTION, can
+      never be dated later than the real moment it is checked.
+    * Is captured_at STALE (too long ago to still show)? Judged against
+      ``now`` -- the MOST RECENTLY PROCESSED capture's own timestamp, not
+      a real clock reading (state.py otherwise never calls time.time()).
+      This deterministic reference is safe for staleness specifically
+      because fresh-or-nothing means an entry found "too old" here is
+      simply garbage-collected a little earlier or later than a real
+      clock would have called it -- never DISPLAYED either way, so a
+      loose reference point costs nothing here, unlike for the
+      plausibility question above.
+    """
+
     if not isinstance(value, dict):
         return False
     try:
         captured_at = float(value["captured_at"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
-    # resolve_age (context_window.py) rejects a non-finite or implausibly
-    # future-dated captured_at rather than clamping it to age 0.0: the naive
-    # clamp used before this existed made (now - captured_at) negative,
-    # which is always <= any non-negative freshness window, so a
-    # future-dated entry was reported as "fresh" and never pruned, no
-    # matter how long it sat there (finding #3, context-window adversarial
-    # review, the pruning half of the clock-rollback bug).
-    #
-    # The future-tolerance passed here is
-    # _CROSS_SESSION_REORDERING_TOLERANCE_SECONDS (see that constant's own
-    # comment), NOT resolve_age's tight decode-time default and NOT
-    # fresh_for_seconds: this "now" is not a real clock reading (state.py
-    # never calls time.time()), only the MOST RECENTLY PROCESSED capture's
-    # own timestamp, and different sessions' writes can be reordered in
-    # EXECUTION relative to when they were originally captured. An earlier
-    # version of this fix reused fresh_for_seconds for this tolerance,
-    # which reintroduced the exact same reordering bug the moment
-    # HEADROOM_FRESH_CONTEXT_SECONDS was configured below the real
-    # scheduling delay on a given machine (Codex review round 2, P2) --
-    # the two questions ("how much timing slop between concurrent writers
-    # is plausible" and "how long should a reading still be shown") are
-    # unrelated and must not share one knob.
-    age = resolve_age(
-        captured_at, now, skew_allowance_seconds=_CROSS_SESSION_REORDERING_TOLERANCE_SECONDS
-    )
-    if age is None:
+    if (
+        resolve_age(
+            captured_at, time.time(), skew_allowance_seconds=_FUTURE_IMPLAUSIBILITY_TOLERANCE_SECONDS
+        )
+        is None
+    ):
         return False
+    age = max(0.0, now - captured_at)
     return age <= max(0.0, fresh_for_seconds)
 
 
