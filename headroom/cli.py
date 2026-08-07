@@ -219,6 +219,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for line in burn_lines:
                     print(line)
             _print_status_update()
+            # 0.1.4 is the final release under this name. Printed by status
+            # only: statusline has a terminal contract to keep, and hook text
+            # reaches a model's context, where a packaging notice does not
+            # belong.
+            print(
+                "\nheadroom-cli has been renamed to quotagauge and is no longer "
+                "maintained.\nInstall the new package with: uv tool install quotagauge"
+            )
         elif arguments.command == "json":
             print(
                 json.dumps(

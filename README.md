@@ -1,69 +1,38 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="images/headroom-logo-dark.svg">
-    <img src="images/headroom-logo.svg" alt="headroom" width="420">
-  </picture><br>
-  <strong>headroom</strong><br>
-  <a href="docs/explanation-capture.md">Capture</a> &middot;
-  <a href="docs/howto-install.md">Install</a> &middot;
-  <a href="docs/reference-cli.md">CLI reference</a> &middot;
-  <a href="docs/explanation-bounds.md">Bounds</a> &middot;
-  <a href="docs/howto-troubleshoot.md">Troubleshooting</a><br><br>
-  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue.svg">
-  <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-zero-success.svg">
-  <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/python-3.9%2B-blue.svg">
-</p>
+# headroom-cli has been renamed to quotagauge
 
-Claude Code and Codex enforce rolling usage limits but show the numbers only to a human, so the model never sees them and can keep working right up to the wall. headroom captures those readings and warns the model when it should conserve usage.
-
-## Install and first run
-
-The shortest path:
+This package is no longer maintained. Development continues as
+[**quotagauge**](https://pypi.org/project/quotagauge/).
 
 ```console
-uv tool install headroom-cli
-headroom init --all
-headroom status
+uv tool uninstall headroom-cli
+uv tool install quotagauge
+quotagauge init --all
 ```
 
-To work from a clone instead, run one of these:
+## Why
 
-```console
-uv tool install .
-```
+The name collided with [Headroom](https://github.com/chopratejas/headroom), an
+actively developed context compression layer for LLM agents that targets Claude
+Code, Codex, Cursor and Aider. Same problem space, same clients, and far better
+known. Publishing under a colliding name would have left two projects with the
+same name aimed at the same users.
 
-```console
-pip install -e .
-```
+## What carries over
 
-Then run `headroom init --all` and `headroom status`. Plain `headroom init` configures Claude Code only, while `--codex` configures Codex only. See the [installation guide](docs/howto-install.md) for safe previews and the plain-clone fallback.
+`quotagauge init --all` rewrites the Claude Code statusline and hook commands.
+Remove any leftover `headroom` entries from `~/.claude/settings.json`, because
+the old command no longer exists.
 
-## Example output
+Accumulated state moves on first run. If `~/.quotagauge` is absent and
+`~/.headroom` is present, the directory is renamed rather than copied, so
+history carries over intact. If the rename cannot complete, the legacy
+directory is used in place. Nothing is deleted on any path.
 
-`headroom status` reports every source and window:
+Every `HEADROOM_*` environment variable is now `QUOTAGAUGE_*`.
 
-```text
-Claude
-  5h: 12% used [ok], resets in 1h 59m
-  7d: unavailable
-Codex
-  5h: unavailable
-  7d: >=94% used [critical], resets in 1h 59m
-```
+## Versions
 
-Near a limit, the prompt hook gives the model a short action:
+0.1.4 is the final release under this name and changes nothing except this
+notice. 0.1.0 through 0.1.3 remain installable but receive no further work.
 
-```text
-Usage headroom: Codex weekly >=94% used (reading 1h 0m old), resets in 1h 59m.
-Stop parallel subagent fan-out, use cheaper models, and checkpoint work now.
-```
-
-## Documentation
-
-| Document | What it covers |
-| --- | --- |
-| [CLI reference](docs/reference-cli.md) | Every command, flag, environment variable, state file, exit code, and the opt-in update check. |
-| [Why the bounds are sound](docs/explanation-bounds.md) | Fresh, stale, and post-reset readings, reset validation, and severity. |
-| [How capture works](docs/explanation-capture.md) | Claude statusline input, Codex app-server RPC, and rollout fallback. |
-| [Installation guide](docs/howto-install.md) | Claude Code settings, the `CODEX_HOME/hooks.json` path, safe init previews, backups, and clone installs. |
-| [Troubleshooting](docs/howto-troubleshoot.md) | Unavailable or stale readings, unknown resets, doctor output, and state reset. |
+Source, issues and releases: https://github.com/ajillepalli/quotagauge
