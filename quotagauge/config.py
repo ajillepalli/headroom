@@ -49,6 +49,27 @@ _STATE_DIR_NAME = ".quotagauge"
 _MIGRATION_RETRY_ATTEMPTS = 5
 _MIGRATION_RETRY_DELAY_SECONDS = 0.02
 
+# Sticky, per-process cache of the resolved default state directory. Every
+# state.py read and write resolves the state directory independently, on
+# its own, rather than sharing one resolution threaded through a whole
+# command invocation (a pre-existing design, unrelated to this rename).
+# Without this cache, a single process could see the DEFAULT resolution
+# answer change mid-invocation if a concurrent process completes a
+# migration between two of this process's own calls -- for example
+# reading from the freshly migrated ~/.quotagauge on one call after having
+# already written to ~/.headroom on an earlier call in the very same
+# invocation, an internally inconsistent result a single process should
+# never produce. Caching the FIRST answer this process computes, and
+# reusing it for the rest of this process's life, closes that within-
+# process split entirely and narrows the cross-process race to the
+# shortest possible window (this process's own first resolution attempt),
+# without requiring every state.py call site to be restructured to share
+# one resolution explicitly. This is safe to keep for a whole process
+# lifetime specifically because quotagauge has no persistent daemon: a
+# fresh process starts with a fresh, unset cache and resolves again from
+# scratch, so nothing here is ever stale across separate invocations.
+_default_state_dir_cache: Optional[Path] = None
+
 
 def resolve_state_dir(state_dir: Optional[Path] = None) -> Path:
     """Resolve an explicit, configured, or default state directory.
@@ -72,7 +93,10 @@ def resolve_state_dir(state_dir: Optional[Path] = None) -> Path:
         # environment variable is trivially re-set, so there is nothing to
         # migrate on this path either.
         return Path(configured).expanduser()
-    return _resolve_default_state_dir()
+    global _default_state_dir_cache
+    if _default_state_dir_cache is None:
+        _default_state_dir_cache = _resolve_default_state_dir()
+    return _default_state_dir_cache
 
 
 def _resolve_default_state_dir() -> Path:
@@ -83,9 +107,11 @@ def _resolve_default_state_dir() -> Path:
     is what makes this idempotent without any extra bookkeeping: once a
     migration succeeds (by this process or a concurrent one racing it), the
     new directory exists, so every later call -- later in this same
-    process, or in a wholly separate later invocation, since this tool runs
-    as a fresh process per command with no persistent daemon to remember
-    "already migrated" -- returns here before ever re-examining the legacy
+    process (though ``resolve_state_dir`` above now caches this function's
+    own answer, so within one process this only ever runs once), or in a
+    wholly separate later invocation, since this tool runs as a fresh
+    process per command with no persistent daemon to remember "already
+    migrated" -- returns here before ever re-examining the legacy
     directory below.
     """
 
@@ -143,24 +169,28 @@ def _resolve_default_state_dir() -> Path:
         # migrated yet." The next call -- this process's or a later one --
         # simply tries again from the same starting state.
         #
-        # Residual risk, accepted rather than eliminated: a caller that
-        # commits to this fallback path and then, over the life of a long
-        # running process, calls resolve_state_dir() again after a
-        # DIFFERENT process has since migrated the legacy directory out
-        # from under it would see that later call switch to the new
-        # target, since the target-exists branch above always wins. Any
-        # write already made against this returned legacy path in the
-        # meantime is not lost -- it is still real data on disk under
-        # ~/.headroom -- but it would no longer be picked up automatically
-        # by anything that resolves the state directory afterward, the
-        # same recoverable-but-not-automatic outcome documented for a
-        # stray pre-existing target above. Closing this completely would
-        # require every state.py read/write to share one resolution for
-        # an entire process invocation rather than each resolving
-        # independently; the retry above narrows the realistic window for
-        # this (a transient lock, not a permanent failure) without that
-        # broader, riskier restructuring of already-delicate concurrency
-        # code this rename does not otherwise need to touch.
+        # Residual risk, narrowed but not eliminated: resolve_state_dir's
+        # own cache (see _default_state_dir_cache above) means THIS
+        # process is stuck with this exact fallback decision for the rest
+        # of its life -- it can no longer flip to a DIFFERENT directory
+        # partway through its own invocation, so every read and write this
+        # process makes stays internally consistent with itself. What
+        # remains is purely a CROSS-process race: if this process's write
+        # against the returned legacy path lands after a different,
+        # concurrent process has already migrated that same directory
+        # away and started using the new one, this process's write is not
+        # lost -- it is still real data on disk under ~/.headroom -- but
+        # it would no longer be picked up automatically by anything that
+        # resolves the state directory afterward, the same
+        # recoverable-but-not-automatic outcome documented for a stray
+        # pre-existing target above. The retry above already narrows the
+        # window for reaching this fallback at all to a genuinely
+        # non-transient failure; closing the remaining cross-process
+        # window completely would require actual interprocess
+        # coordination (a lock file spanning the whole migration
+        # decision, held across process boundaries), which is
+        # disproportionate to a one-time, self-healing migration for a
+        # single-user local CLI tool with no persistent daemon.
         return legacy
 
 

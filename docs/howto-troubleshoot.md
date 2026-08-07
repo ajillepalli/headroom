@@ -84,6 +84,8 @@ Check `quotagauge doctor`'s dedicated `Claude context` line first; it names the 
 | `Codex readings` | Windows parsed during this check, or `missing`. |
 | `Notes` | Deduplicated stored diagnostics, rejected stored resets, RPC notes, and rollout notes. The line is omitted when there are no notes. |
 
+## Migrating from the earlier `headroom` name
+
 On a machine that ran this project under its earlier name, the first command that resolves the default state directory renames a pre-existing `~/.headroom` to `~/.quotagauge` automatically, once, and uses the new location from then on. If that rename cannot complete for any reason, the old directory is left exactly as it was and used in place, so `State directory` may still point at `~/.headroom` on such a machine -- that is expected, not a bug, and no history is lost either way.
 
 This automatic migration has three limits worth knowing about, all of them safe (nothing is ever deleted or overwritten) but worth knowing so a missing reading does not look like data loss:

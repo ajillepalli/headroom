@@ -17,10 +17,26 @@ import tempfile
 import unittest
 from unittest import mock
 
+import quotagauge.config as config_module
 from quotagauge.config import STATE_DIR_ENV, resolve_state_dir
 
 
 class ResolveStateDirTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # resolve_state_dir caches its default-path answer for the life of
+        # the process (see config.py's _default_state_dir_cache), so every
+        # test needs a clean slate -- otherwise an earlier test's answer,
+        # computed against ITS OWN fake home directory, would leak into a
+        # later test that expects a fresh resolution against a different
+        # one. Reset both before and after so a failing test cannot poison
+        # the ones that follow it either.
+        config_module._default_state_dir_cache = None
+        self.addCleanup(self._reset_cache)
+
+    @staticmethod
+    def _reset_cache() -> None:
+        config_module._default_state_dir_cache = None
+
     def test_explicit_argument_wins_and_is_never_migrated(self) -> None:
         # Branch 1: an explicit caller-supplied directory is used as-is,
         # even when a legacy directory sits right there waiting to migrate.
@@ -146,6 +162,42 @@ class ResolveStateDirTests(unittest.TestCase):
             self.assertFalse(legacy.exists())
             self.assertEqual((target / "history.jsonl").read_text(encoding="utf-8"), "data\n")
 
+    def test_default_resolution_stays_sticky_within_one_process_even_if_disk_changes(self) -> None:
+        # A single process must never see its OWN default-directory answer
+        # change mid-invocation, even if a concurrent process alters what
+        # is on disk in between two of this process's own calls -- that
+        # would let one process read from a different directory than it
+        # just wrote to, within a single command. The first call here
+        # falls back to the legacy directory (its rename fails); a
+        # DIFFERENT directory then appears on disk out from under it,
+        # simulating a concurrent process completing its own migration in
+        # between this process's two calls. A second call in the SAME
+        # process must still return the original (legacy) answer, not
+        # switch to the newly appeared target -- proving the cache, not
+        # just a coincidentally identical path value, is what makes this
+        # hold (unlike the neither-directory-exists case, a fallback path
+        # and a migrated target are genuinely different Path values, so a
+        # second call that recomputed from scratch would visibly disagree
+        # with the first).
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            legacy = home_path / ".headroom"
+            legacy.mkdir()
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch("quotagauge.config.Path.home", return_value=home_path):
+                    with mock.patch.object(Path, "rename", side_effect=PermissionError("locked")):
+                        with mock.patch("quotagauge.config.time.sleep"):
+                            first = resolve_state_dir()
+                    # Simulate a concurrent process completing its own
+                    # migration in between this process's two calls: the
+                    # target now exists, unlike when `first` was resolved.
+                    (home_path / ".quotagauge").mkdir()
+                    second = resolve_state_dir()
+
+            self.assertEqual(first, legacy)
+            self.assertEqual(second, first)
+
     def test_failed_rename_falls_back_to_legacy_directory_in_place(self) -> None:
         # Branch 3, failure path: the rename cannot complete even after
         # exhausting the transient-lock retry (a genuine permission
@@ -211,23 +263,35 @@ class ResolveStateDirTests(unittest.TestCase):
     def test_permission_error_exhausts_retries_then_falls_back_safely(self) -> None:
         # A PermissionError that never clears (a genuine, non-transient
         # problem) must still fall back safely once the retry budget is
-        # spent, exactly like any other non-racing failure.
+        # spent, exactly like any other non-racing failure. Asserts the
+        # EXACT attempt and sleep counts and the delay used, not just that
+        # a fallback happened, so a future change that silently drops the
+        # retry loop (always failing on the first attempt) would not pass
+        # this test by accident.
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             legacy = home_path / ".headroom"
             legacy.mkdir()
             (legacy / "history.jsonl").write_text("irreplaceable\n", encoding="utf-8")
 
+            attempts = {"count": 0}
+
+            def always_locked(self: Path, target_path: Path) -> None:
+                attempts["count"] += 1
+                raise PermissionError("locked")
+
             with mock.patch.dict(os.environ, {}, clear=True):
                 with mock.patch("quotagauge.config.Path.home", return_value=home_path):
-                    with mock.patch.object(Path, "rename", side_effect=PermissionError("locked")):
+                    with mock.patch.object(Path, "rename", always_locked):
                         with mock.patch("quotagauge.config.time.sleep") as sleep_mock:
                             result = resolve_state_dir()
 
             target = home_path / ".quotagauge"
             self.assertEqual(result, legacy)
             self.assertFalse(target.exists())
-            self.assertTrue(sleep_mock.called)
+            self.assertEqual(attempts["count"], config_module._MIGRATION_RETRY_ATTEMPTS)
+            self.assertEqual(sleep_mock.call_count, config_module._MIGRATION_RETRY_ATTEMPTS - 1)
+            sleep_mock.assert_called_with(config_module._MIGRATION_RETRY_DELAY_SECONDS)
             self.assertEqual((legacy / "history.jsonl").read_text(encoding="utf-8"), "irreplaceable\n")
 
     def test_failed_rename_never_destroys_data_across_repeated_attempts(self) -> None:
