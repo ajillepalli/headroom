@@ -1,4 +1,4 @@
-"""Describe the package copy backing the current headroom process."""
+"""Describe the package copy backing the current quotagauge process."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def _checkout_root(package_path: Path) -> Optional[Path]:
     """Recognize this project's package when imported from its checkout."""
 
     root = package_path.parent
-    if package_path.name != "headroom":
+    if package_path.name != "quotagauge":
         return None
     if not (root / "pyproject.toml").is_file():
         return None
@@ -82,7 +82,7 @@ def _checkout_root(package_path: Path) -> Optional[Path]:
 def _loaded_module_mtime(package_path: Path) -> Optional[float]:
     latest: Optional[float] = None
     for name, module in tuple(sys.modules.items()):
-        if name != "headroom" and not name.startswith("headroom."):
+        if name != "quotagauge" and not name.startswith("quotagauge."):
             continue
         raw_path = getattr(module, "__file__", None)
         if not isinstance(raw_path, str):
@@ -200,7 +200,7 @@ def _installed_update_mode(package_path: Path, inspect_metadata: bool) -> str:
     if not inspect_metadata:
         return "unknown"
     try:
-        installer = metadata.distribution("headroom-cli").read_text("INSTALLER")
+        installer = metadata.distribution("quotagauge").read_text("INSTALLER")
     except Exception:
         return "unknown"
     return "pip" if installer is not None and installer.strip().lower() == "pip" else "unknown"

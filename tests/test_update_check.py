@@ -13,11 +13,11 @@ import unittest
 from unittest import mock
 from urllib import error, request, response
 
-from headroom import update_check
+from quotagauge import update_check
 
 
 def _file(yanked: bool = False) -> dict:
-    return {"filename": "headroom.whl", "yanked": yanked}
+    return {"filename": "quotagauge.whl", "yanked": yanked}
 
 
 class _Response:
@@ -122,7 +122,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.update_check._open_pypi", return_value=response
+                "quotagauge.update_check._open_pypi", return_value=response
             ) as opened:
                 result = update_check.check_for_update(
                     "0.1.9", state_dir=state_dir, now=100.0
@@ -138,7 +138,7 @@ class CheckTests(unittest.TestCase):
 
     def test_unparsable_installed_version_offers_nothing_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch("headroom.update_check._open_pypi") as opened:
+            with mock.patch("quotagauge.update_check._open_pypi") as opened:
                 result = update_check.check_for_update(
                     "not a version", Path(directory), now=100.0
                 )
@@ -153,7 +153,7 @@ class CheckTests(unittest.TestCase):
         response = _Response(body, content_length=False)
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch(
-                "headroom.update_check._open_pypi", return_value=response
+                "quotagauge.update_check._open_pypi", return_value=response
             ):
                 result = update_check.check_for_update(
                     "1.0", Path(directory), now=100.0
@@ -168,7 +168,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.update_check._open_pypi",
+                "quotagauge.update_check._open_pypi",
                 side_effect=error.URLError("endpoint unavailable"),
             ) as opened:
                 first = update_check.check_for_update(
@@ -189,7 +189,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.update_check._open_pypi",
+                "quotagauge.update_check._open_pypi",
                 side_effect=(_Response(body), _Response(body)),
             ) as opened:
                 update_check.check_for_update("1.0", state_dir, now=100.0)
@@ -222,7 +222,7 @@ class CheckTests(unittest.TestCase):
                     state_dir = Path(directory)
                     update_check._write_cache(future_result, state_dir)
                     with mock.patch(
-                        "headroom.update_check._open_pypi",
+                        "quotagauge.update_check._open_pypi",
                         return_value=_Response(body),
                     ) as opened:
                         result = update_check.check_for_update(
@@ -250,7 +250,7 @@ class CheckTests(unittest.TestCase):
             state_dir = Path(directory)
             update_check._write_cache(cached_result, state_dir)
             with mock.patch(
-                "headroom.update_check._open_pypi"
+                "quotagauge.update_check._open_pypi"
             ) as opened:
                 result = update_check.check_for_update(
                     "1.0",
@@ -267,7 +267,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.update_check._open_pypi",
+                "quotagauge.update_check._open_pypi",
                 return_value=_Response(body),
             ):
                 result = update_check.check_for_update("1.0", state_dir, now=100.0)
@@ -290,7 +290,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.update_check._open_pypi",
+                "quotagauge.update_check._open_pypi",
                 side_effect=failure,
             ):
                 result = update_check.check_for_update("1.0", state_dir, now=100.0)
@@ -320,7 +320,7 @@ class CheckTests(unittest.TestCase):
                 )
                 with tempfile.TemporaryDirectory() as directory:
                     with mock.patch(
-                        "headroom.update_check.request.build_opener",
+                        "quotagauge.update_check.request.build_opener",
                         return_value=opener,
                     ):
                         result = update_check.check_for_update(
@@ -355,11 +355,11 @@ class CheckTests(unittest.TestCase):
         response_value = _Response(body)
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch(
-                "headroom.update_check._open_pypi",
+                "quotagauge.update_check._open_pypi",
                 return_value=response_value,
             ):
                 with mock.patch(
-                    "headroom.update_check.time.monotonic",
+                    "quotagauge.update_check.time.monotonic",
                     side_effect=(0.0, 0.1, 0.2, 0.3, 2.5),
                 ):
                     result = update_check.check_for_update(
@@ -434,7 +434,7 @@ class CacheTests(unittest.TestCase):
             cache.write_bytes(valid_document)
             fake_stat = os.stat_result((stat.S_IFDIR | 0o755,) + (0,) * 9)
             with mock.patch(
-                "headroom.update_check.os.fstat", return_value=fake_stat
+                "quotagauge.update_check.os.fstat", return_value=fake_stat
             ):
                 self.assertIsNone(update_check.read_cached_result(state_dir))
 

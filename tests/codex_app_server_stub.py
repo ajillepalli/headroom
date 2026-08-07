@@ -18,7 +18,7 @@ def _read() -> dict:
     line = sys.stdin.readline()
     if not line:
         raise SystemExit("unexpected end of input")
-    log_path = os.environ.get("HEADROOM_TEST_RPC_LOG")
+    log_path = os.environ.get("QUOTAGAUGE_TEST_RPC_LOG")
     if log_path:
         with Path(log_path).open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -33,8 +33,8 @@ def _send(value: dict) -> None:
 
 
 def main() -> int:
-    _write_marker("HEADROOM_TEST_RPC_STARTED")
-    mode = os.environ.get("HEADROOM_TEST_RPC_MODE", "success")
+    _write_marker("QUOTAGAUGE_TEST_RPC_STARTED")
+    mode = os.environ.get("QUOTAGAUGE_TEST_RPC_MODE", "success")
     if mode == "timeout":
         # Never respond, and outlast the RPC timeout the test configures
         # (see test_codexrpc.py) by a wide margin, so a slow-to-schedule
@@ -43,7 +43,7 @@ def main() -> int:
         # instead of one long sleep so the test can prove termination
         # quickly (heartbeats stop) rather than waiting out this process's
         # entire hypothetical lifetime.
-        heartbeat_path = os.environ.get("HEADROOM_TEST_RPC_HEARTBEAT")
+        heartbeat_path = os.environ.get("QUOTAGAUGE_TEST_RPC_HEARTBEAT")
         deadline = time.monotonic() + 30.0
         beat = 0
         while time.monotonic() < deadline:
@@ -51,7 +51,7 @@ def main() -> int:
                 Path(heartbeat_path).write_text(str(beat), encoding="utf-8")
             beat += 1
             time.sleep(0.1)
-        _write_marker("HEADROOM_TEST_RPC_SURVIVED", "survived")
+        _write_marker("QUOTAGAUGE_TEST_RPC_SURVIVED", "survived")
         return 0
     if mode == "garbage":
         print("this is not JSON", flush=True)
@@ -63,7 +63,7 @@ def main() -> int:
         initialize.get("jsonrpc") != "2.0"
         or initialize.get("id") != 1
         or initialize.get("method") != "initialize"
-        or client.get("name") != "headroom"
+        or client.get("name") != "quotagauge"
         or not isinstance(client.get("version"), str)
     ):
         raise SystemExit("invalid initialize request")

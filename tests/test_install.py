@@ -12,21 +12,21 @@ import tempfile
 import unittest
 from unittest import mock
 
-from headroom import cli
-from headroom import settings as settings_module
-from headroom.settings import codex_hooks_snippet, settings_snippet
+from quotagauge import cli
+from quotagauge import settings as settings_module
+from quotagauge.settings import codex_hooks_snippet, settings_snippet
 
 
 class InstallTests(unittest.TestCase):
     CODEX_DOCUMENT = {
-        "description": "headroom",
+        "description": "quotagauge",
         "hooks": {
             "UserPromptSubmit": [
                 {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "headroom hook",
+                            "command": "quotagauge hook",
                             "timeoutSec": 10,
                         }
                     ]
@@ -59,10 +59,10 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(installed["permissions"], original["permissions"])
             for event in ("PreToolUse", "PostToolUse", "SessionStart"):
                 self.assertEqual(installed["hooks"][event], original["hooks"][event])
-            self.assertEqual(installed["statusLine"]["command"], "headroom statusline")
+            self.assertEqual(installed["statusLine"]["command"], "quotagauge statusline")
             self.assertEqual(
                 installed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-                "headroom hook",
+                "quotagauge hook",
             )
             backups = list(path.parent.glob("settings.json.*.bak"))
             self.assertEqual(len(backups), 1)
@@ -135,25 +135,25 @@ class InstallTests(unittest.TestCase):
 
             self.assertEqual(result, 0, stderr)
             snippet = json.loads(stdout)
-            self.assertEqual(snippet["statusLine"]["command"], "headroom statusline")
+            self.assertEqual(snippet["statusLine"]["command"], "quotagauge statusline")
             self.assertEqual(
                 snippet["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-                "headroom hook",
+                "quotagauge hook",
             )
             self.assertFalse(path.exists())
 
-    def test_commands_use_bare_headroom_when_it_is_on_path(self) -> None:
-        with mock.patch("headroom.settings.shutil.which", return_value=os.devnull):
+    def test_commands_use_bare_quotagauge_when_it_is_on_path(self) -> None:
+        with mock.patch("quotagauge.settings.shutil.which", return_value=os.devnull):
             snippet = settings_snippet()
 
-        self.assertEqual(snippet["statusLine"]["command"], "headroom statusline")
+        self.assertEqual(snippet["statusLine"]["command"], "quotagauge statusline")
         self.assertEqual(
             snippet["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-            "headroom hook",
+            "quotagauge hook",
         )
 
-    def test_commands_use_absolute_python_module_fallback_without_headroom(self) -> None:
-        with mock.patch("headroom.settings.shutil.which", return_value=None):
+    def test_commands_use_absolute_python_module_fallback_without_quotagauge(self) -> None:
+        with mock.patch("quotagauge.settings.shutil.which", return_value=None):
             snippet = settings_snippet()
 
         commands = (
@@ -162,15 +162,15 @@ class InstallTests(unittest.TestCase):
         )
         for command, subcommand in zip(commands, ("statusline", "hook")):
             self.assertIn(str(Path(sys.executable).resolve()), command)
-            self.assertIn("-m headroom.cli {}".format(subcommand), command)
+            self.assertIn("-m quotagauge.cli {}".format(subcommand), command)
             self.assertIn("PYTHONPATH", command)
 
-    def test_codex_command_uses_python_fallback_without_headroom(self) -> None:
-        with mock.patch("headroom.settings.shutil.which", return_value=None):
+    def test_codex_command_uses_python_fallback_without_quotagauge(self) -> None:
+        with mock.patch("quotagauge.settings.shutil.which", return_value=None):
             command = codex_hooks_snippet()["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
 
         self.assertIn(str(Path(sys.executable).resolve()), command)
-        self.assertIn("-m headroom.cli hook", command)
+        self.assertIn("-m quotagauge.cli hook", command)
         self.assertIn("PYTHONPATH", command)
 
     def test_codex_init_writes_verified_schema_to_codex_home(self) -> None:
@@ -185,7 +185,7 @@ class InstallTests(unittest.TestCase):
             installed = json.loads(installed_text)
             self.assertEqual(installed, self.CODEX_DOCUMENT)
             self.assertEqual(installed_text, json.dumps(self.CODEX_DOCUMENT, indent=2) + "\n")
-            with mock.patch("headroom.settings.shutil.which", return_value=os.devnull):
+            with mock.patch("quotagauge.settings.shutil.which", return_value=os.devnull):
                 self.assertEqual(codex_hooks_snippet(), self.CODEX_DOCUMENT)
 
     def test_codex_home_override_takes_precedence_for_tests(self) -> None:
@@ -249,12 +249,12 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(len(json.loads(first_content)["hooks"]["UserPromptSubmit"]), 1)
             self.assertEqual(list(home.glob("hooks.json.*.bak")), [])
 
-    def test_customized_headroom_hook_is_preserved_and_not_duplicated_for_both_targets(self) -> None:
+    def test_customized_quotagauge_hook_is_preserved_and_not_duplicated_for_both_targets(self) -> None:
         customized = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": "  headroom   hook  ",
+                    "command": "  quotagauge   hook  ",
                     "timeoutSec": 30,
                     "custom": True,
                 }
@@ -291,7 +291,7 @@ class InstallTests(unittest.TestCase):
             for path in (settings, hooks_path):
                 prompt_hooks = json.loads(path.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
                 self.assertEqual(prompt_hooks, [customized])
-            self.assertEqual(stdout.count("customized headroom hook"), 2)
+            self.assertEqual(stdout.count("customized quotagauge hook"), 2)
 
     def test_codex_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -373,8 +373,8 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(result, 0, stderr)
             self.assertEqual(json.loads(codex_home.joinpath("hooks.json").read_text(encoding="utf-8")), self.CODEX_DOCUMENT)
             claude = json.loads(settings.read_text(encoding="utf-8"))
-            self.assertEqual(claude["statusLine"]["command"], "headroom statusline")
-            self.assertEqual(claude["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "headroom hook")
+            self.assertEqual(claude["statusLine"]["command"], "quotagauge statusline")
+            self.assertEqual(claude["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "quotagauge hook")
 
     def test_init_all_preflights_both_before_applying_either(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -401,7 +401,7 @@ class InstallTests(unittest.TestCase):
             codex_home = root / "codex"
             aliased_settings = codex_home / "child" / ".." / "hooks.json"
 
-            with mock.patch("headroom.settings._prepare_install") as preflight:
+            with mock.patch("quotagauge.settings._prepare_install") as preflight:
                 result, _, stderr = self._run_cli(
                     [
                         "init",
@@ -424,7 +424,7 @@ class InstallTests(unittest.TestCase):
             aliased_settings = codex_home / "child" / ".." / "hooks.json"
 
             with mock.patch(
-                "headroom.settings._same_file",
+                "quotagauge.settings._same_file",
                 side_effect=AssertionError("print must not compare paths"),
             ) as same_file:
                 result, stdout, stderr = self._run_cli(
@@ -455,7 +455,7 @@ class InstallTests(unittest.TestCase):
                 path.write_text(concurrent, encoding="utf-8")
                 return prepared
 
-            with mock.patch("headroom.settings._prepare_install", side_effect=prepare_then_create):
+            with mock.patch("quotagauge.settings._prepare_install", side_effect=prepare_then_create):
                 result, _, stderr = self._run_init(path)
 
             self.assertNotEqual(result, 0)
@@ -475,7 +475,7 @@ class InstallTests(unittest.TestCase):
                 path.write_text(concurrent, encoding="utf-8")
                 return prepared
 
-            with mock.patch("headroom.settings._prepare_install", side_effect=prepare_then_edit):
+            with mock.patch("quotagauge.settings._prepare_install", side_effect=prepare_then_edit):
                 result, _, stderr = self._run_init(path)
 
             self.assertNotEqual(result, 0)
@@ -498,7 +498,7 @@ class InstallTests(unittest.TestCase):
                     raise OSError("simulated Codex write failure")
                 real_write_prepared(item)
 
-            with mock.patch("headroom.settings._write_prepared", side_effect=fail_second_write):
+            with mock.patch("quotagauge.settings._write_prepared", side_effect=fail_second_write):
                 result, _, stderr = self._run_cli(
                     ["init", "--all", "--settings", str(settings), "--codex-home", str(codex_home)]
                 )
@@ -526,7 +526,7 @@ class InstallTests(unittest.TestCase):
                 real_write_prepared(item)
 
             with mock.patch(
-                "headroom.settings._write_prepared",
+                "quotagauge.settings._write_prepared",
                 side_effect=edit_then_fail_second_write,
             ):
                 result, _, stderr = self._run_cli(
@@ -550,7 +550,7 @@ class InstallTests(unittest.TestCase):
             path = Path(directory) / "settings.json"
 
             with mock.patch(
-                "headroom.settings.os.fsync", side_effect=OSError("disk full")
+                "quotagauge.settings.os.fsync", side_effect=OSError("disk full")
             ):
                 result, _, stderr = self._run_init(path)
 
@@ -564,7 +564,7 @@ class InstallTests(unittest.TestCase):
             "hooks": [
                 {
                     "type": "command",
-                    "command": "echo -m headroom.cli hook",
+                    "command": "echo -m quotagauge.cli hook",
                 }
             ]
         }
@@ -598,7 +598,7 @@ class InstallTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         arguments = ["init", "--settings", str(path)] + list(extra_arguments)
-        with mock.patch("headroom.settings.shutil.which", return_value=os.devnull):
+        with mock.patch("quotagauge.settings.shutil.which", return_value=os.devnull):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli.main(arguments)
         return result, stdout.getvalue(), stderr.getvalue()
@@ -609,7 +609,7 @@ class InstallTests(unittest.TestCase):
         stderr = io.StringIO()
         selected_environment = environment or {}
         with mock.patch.dict(os.environ, selected_environment, clear=True):
-            with mock.patch("headroom.settings.shutil.which", return_value=os.devnull):
+            with mock.patch("quotagauge.settings.shutil.which", return_value=os.devnull):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     result = cli.main(arguments)
         return result, stdout.getvalue(), stderr.getvalue()

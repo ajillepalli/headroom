@@ -180,13 +180,13 @@ def _replace_with_retry(source: str, target: Path) -> None:
     milliseconds if something else has the TARGET file open without
     FILE_SHARE_DELETE at the exact instant of the rename -- commonly
     antivirus real-time scanning or the Windows Search Indexer briefly
-    opening a freshly-written file, neither of which headroom controls.
+    opening a freshly-written file, neither of which quotagauge controls.
     Reproduced directly under real, heavy concurrent multi-process load
-    (dozens of separate ``headroom`` processes writing state.json back to
-    back). This is not a headroom locking bug: ``_locked_state_
-    transaction`` already guarantees only one headroom process is ever
+    (dozens of separate ``quotagauge`` processes writing state.json back to
+    back). This is not a quotagauge locking bug: ``_locked_state_
+    transaction`` already guarantees only one quotagauge process is ever
     inside this function at a time, so the OTHER holder of the file here
-    is always something external to headroom. POSIX ``rename(2)``, which
+    is always something external to quotagauge. POSIX ``rename(2)``, which
     os.replace uses on POSIX, has no equivalent failure mode -- there,
     the first attempt always either succeeds or fails for a durable
     reason, so this retries a genuine POSIX failure a few times for no
@@ -214,7 +214,7 @@ def _replace_with_retry(source: str, target: Path) -> None:
 def _locked_state_transaction(directory: Path):
     """Serialize save_snapshots' read-merge-write across processes.
 
-    Two headroom invocations (two terminal tabs, each running Claude Code's
+    Two quotagauge invocations (two terminal tabs, each running Claude Code's
     statusline command at nearly the same instant) can both call
     save_snapshots close enough together that each reads the SAME on-disk
     state, merges its own change into its own in-memory copy, and writes
@@ -229,7 +229,7 @@ def _locked_state_transaction(directory: Path):
     Locking degrades to a no-op, rather than raising, whenever it cannot be
     used: the lock file itself unopenable (e.g. a read-only or unusual
     filesystem), neither platform locking module available (should not
-    happen -- exactly one of fcntl/msvcrt exists on every platform headroom
+    happen -- exactly one of fcntl/msvcrt exists on every platform quotagauge
     supports -- but guarded rather than assumed), or every acquisition
     attempt within _LOCK_TIMEOUT_SECONDS failing. Dropping the safety this
     lock buys, on the rare host or rare wedge where it cannot be taken at
@@ -333,7 +333,7 @@ def save_snapshots(
 
     The whole read-merge-write below runs under an OS-level advisory lock
     (see ``_locked_state_transaction``) so that two overlapping calls to
-    this function -- from two separate headroom processes -- cannot both
+    this function -- from two separate quotagauge processes -- cannot both
     read the same on-disk state and then each write back a version that
     silently drops the other's update (finding #1, context-window
     adversarial review).
@@ -357,7 +357,7 @@ def save_snapshots(
         # call below on every SUBSEQUENT command -- including ones that
         # only refresh a Codex snapshot and never touch context at all --
         # turning one stale corrupt session into a permanent exit-1 for
-        # `headroom json`/`status`/`hook` (finding #9, context-window
+        # `quotagauge json`/`status`/`hook` (finding #9, context-window
         # adversarial review). Sanitizing here, unconditionally, means the
         # very next command heals it instead.
         _drop_unencodable_context_entries(sources)

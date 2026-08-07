@@ -8,6 +8,7 @@
     "monkeypatches",
     "NBLCK",
     "pycache",
+    "quotagauge",
     "statusline",
     "subagent",
     "uncontended",

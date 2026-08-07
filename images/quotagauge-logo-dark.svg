@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 120" role="img" aria-labelledby="title desc">
-  <title id="title">headroom</title>
+  <title id="title">quotagauge</title>
   <desc id="desc">A rising usage bar below a ceiling, with open headroom remaining.</desc>
   <g fill="none" stroke="#8c959f" stroke-linecap="round">
     <path d="M18 23h74" stroke-width="8"/>
     <rect x="27" y="34" width="56" height="58" rx="6" stroke-width="4"/>
   </g>
   <path fill="#2f81f7" d="M31 60h48v28H31z"/>
-  <text x="112" y="79" fill="#8c959f" font-family="ui-rounded, 'Arial Rounded MT Bold', 'Trebuchet MS', Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="-1.8">headroom</text>
+  <text x="112" y="79" fill="#8c959f" font-family="ui-rounded, 'Arial Rounded MT Bold', 'Trebuchet MS', Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="-1.8">quotagauge</text>
 </svg>

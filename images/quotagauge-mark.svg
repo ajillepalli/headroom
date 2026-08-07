@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc" color="#6b7280">
-  <title id="title">headroom mark</title>
+  <title id="title">quotagauge mark</title>
   <desc id="desc">A rising usage bar below a ceiling, with open headroom remaining.</desc>
   <style>
     @media (prefers-color-scheme: dark) { svg { color: #8c959f; } }

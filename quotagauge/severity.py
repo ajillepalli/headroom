@@ -199,14 +199,14 @@ STALE_TREND_TOLERANCE = 4.0
 # ~190x past any threshold that would still mean anything, and the reason is
 # structural, not a property of this account's usage being unusually bursty.
 # max_raw_rate_ratio compares one RAW (unfolded) inter-capture gap's rate to
-# the segment's overall rate; headroom's own captures are quantized to whole
+# the segment's overall rate; quotagauge's own captures are quantized to whole
 # percentage points (see burn_rate.py's docstring) and, within a session, are
 # often only seconds apart. Any time a real percentage-point change happens,
 # it lands entirely within one sub-minute raw gap while its neighbors show
 # zero change -- so that gap's raw rate is enormous relative to the session
 # average BY CONSTRUCTION, whether the underlying usage is bursty or
 # perfectly smooth. The metric cannot tell "this account's traffic is
-# spiky" from "headroom samples much faster than a whole point of usage
+# spiky" from "quotagauge samples much faster than a whole point of usage
 # accrues" for data shaped like this project's own -- it saturates on both.
 # That is a different failure from max_relative_deviation's (which measures
 # something a real bimodal gap in this same data shows IS discriminating):
@@ -215,7 +215,7 @@ STALE_TREND_TOLERANCE = 4.0
 # `json` and `doctor` (nothing here removes them from the data a caller can
 # inspect), and remain available to a caller building a different policy for
 # input with a different (coarser, evenly-spaced) capture cadence than
-# headroom's own.
+# quotagauge's own.
 
 
 def burn_rate_projection_is_trustworthy(projection: BurnRateProjection) -> bool:

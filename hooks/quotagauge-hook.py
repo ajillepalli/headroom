@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the headroom context hook without disrupting prompt submission."""
+"""Run the quotagauge context hook without disrupting prompt submission."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ STORED_FALLBACK_TIMEOUT_SECONDS = 1.0
 
 
 def main() -> int:
-    """Print actionable headroom context, if any, and always allow the prompt."""
+    """Print actionable quotagauge context, if any, and always allow the prompt."""
     payload = None if sys.stdin.isatty() else sys.stdin.read()
     project_root = Path(__file__).resolve().parent.parent
     try:
@@ -44,7 +44,7 @@ def _run_hook(
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "headroom.cli", "hook"]
+        [sys.executable, "-m", "quotagauge.cli", "hook"]
         + extra_arguments
         + sys.argv[1:],
         cwd=str(project_root),

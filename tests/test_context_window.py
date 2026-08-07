@@ -11,17 +11,17 @@ from __future__ import annotations
 import json
 import unittest
 
-from headroom.bounds import Confidence, Reading
-from headroom.burn_rate import BurnRateProjection
-from headroom.claude import parse_payload
-from headroom.context_window import ContextReading
-from headroom.render import (
+from quotagauge.bounds import Confidence, Reading
+from quotagauge.burn_rate import BurnRateProjection
+from quotagauge.claude import parse_payload
+from quotagauge.context_window import ContextReading
+from quotagauge.render import (
     render_context_doctor_line,
     render_context_status_lines,
     render_hook,
     render_statusline,
 )
-from headroom.severity import Severity, context_reading_severity, severity_for_headroom
+from quotagauge.severity import Severity, context_reading_severity, severity_for_headroom
 
 
 def _reading(
@@ -184,7 +184,7 @@ class ContextReadingCodecTests(unittest.TestCase):
         # finding #9 (context-window adversarial review): a lone UTF-16
         # surrogate (reachable via JSON's \uXXXX escapes, paired or not)
         # decodes as an ordinary Python str here, then fails much later at
-        # json.dumps(..., ensure_ascii=False) time, turning `headroom
+        # json.dumps(..., ensure_ascii=False) time, turning `quotagauge
         # json`'s exit code into 1. Rejecting it at decode keeps the rest
         # of the pipeline's "corrupt state collapses to silence" behavior.
         stored = {
@@ -252,7 +252,7 @@ class HookWordBanTests(unittest.TestCase):
     """
 
     def test_no_advice_instructs_compaction(self) -> None:
-        from headroom.render import _CONTEXT_ADVICE
+        from quotagauge.render import _CONTEXT_ADVICE
 
         for severity, template in _CONTEXT_ADVICE.items():
             with self.subTest(severity=severity):
@@ -363,7 +363,7 @@ class HookArbitrationTests(unittest.TestCase):
 class StatuslineContextSegmentTests(unittest.TestCase):
     def test_ok_context_adds_no_segment(self) -> None:
         text = render_statusline([], now=1_000.0, context=_reading(used_percent=10.0))
-        self.assertEqual(text, "headroom: usage unavailable")
+        self.assertEqual(text, "quotagauge: usage unavailable")
 
     def test_non_ok_context_appends_a_segment(self) -> None:
         text = render_statusline([], now=1_000.0, context=_reading(used_percent=85.0))
@@ -373,7 +373,7 @@ class StatuslineContextSegmentTests(unittest.TestCase):
         text = render_statusline(
             [], now=1_000.0, context=_reading(used_percent=95.0, fresh=False)
         )
-        self.assertEqual(text, "headroom: usage unavailable")
+        self.assertEqual(text, "quotagauge: usage unavailable")
 
 
 class StatusAndDoctorRenderTests(unittest.TestCase):

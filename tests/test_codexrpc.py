@@ -14,13 +14,13 @@ import time
 import unittest
 from unittest import mock
 
-from headroom import codexrpc
-from headroom.bounds import Snapshot
-from headroom.codexrpc import CodexRpcResult
-from headroom.codexsrc import CodexResult
-from headroom import cli, codexsrc
-from headroom.cli import main
-from headroom.state import read_state, save_snapshots
+from quotagauge import codexrpc
+from quotagauge.bounds import Snapshot
+from quotagauge.codexrpc import CodexRpcResult
+from quotagauge.codexsrc import CodexResult
+from quotagauge import cli, codexsrc
+from quotagauge.cli import main
+from quotagauge.state import read_state, save_snapshots
 
 
 STUB = Path(__file__).with_name("codex_app_server_stub.py")
@@ -31,7 +31,7 @@ class CodexRpcTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = self._environment(root, "success")
-            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
+            environment["QUOTAGAUGE_TEST_RPC_STARTED"] = str(root / "started")
             output = StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
                 with mock.patch("sys.stdin", StringIO("{}")):
@@ -46,7 +46,7 @@ class CodexRpcTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = self._environment(root, "success")
-            environment["HEADROOM_TEST_RPC_LOG"] = str(root / "requests.jsonl")
+            environment["QUOTAGAUGE_TEST_RPC_LOG"] = str(root / "requests.jsonl")
 
             document = self._run_json(environment)
 
@@ -61,7 +61,7 @@ class CodexRpcTests(unittest.TestCase):
                 ).splitlines()
             ]
             self.assertEqual(len(requests), 3)
-            self.assertEqual(requests[0]["params"]["clientInfo"]["name"], "headroom")
+            self.assertEqual(requests[0]["params"]["clientInfo"]["name"], "quotagauge")
             self.assertEqual(requests[1]["method"], "initialized")
             self.assertIsNone(requests[2]["params"])
 
@@ -96,14 +96,14 @@ class CodexRpcTests(unittest.TestCase):
             # than double the worst spawn jitter we measured -- to make the
             # residual race negligible in practice. Deliberately not exactly
             # 6s: that would make this test pass even if the
-            # HEADROOM_CODEX_RPC_TIMEOUT override were silently ignored and
+            # QUOTAGAUGE_CODEX_RPC_TIMEOUT override were silently ignored and
             # the default always won, see test_timeout_seconds_honors_a_
             # non_default_override for the direct, timing-independent check
             # of that parsing path.
-            environment["HEADROOM_CODEX_RPC_TIMEOUT"] = "7"
-            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
-            environment["HEADROOM_TEST_RPC_SURVIVED"] = str(root / "survived")
-            environment["HEADROOM_TEST_RPC_HEARTBEAT"] = str(root / "heartbeat")
+            environment["QUOTAGAUGE_CODEX_RPC_TIMEOUT"] = "7"
+            environment["QUOTAGAUGE_TEST_RPC_STARTED"] = str(root / "started")
+            environment["QUOTAGAUGE_TEST_RPC_SURVIVED"] = str(root / "survived")
+            environment["QUOTAGAUGE_TEST_RPC_HEARTBEAT"] = str(root / "heartbeat")
 
             document = self._run_json(environment)
 
@@ -149,13 +149,13 @@ class CodexRpcTests(unittest.TestCase):
 
     def test_timeout_seconds_honors_a_non_default_override(self) -> None:
         # A subprocess-timing integration test alone can't prove
-        # HEADROOM_CODEX_RPC_TIMEOUT is actually read: any value close
+        # QUOTAGAUGE_CODEX_RPC_TIMEOUT is actually read: any value close
         # enough to DEFAULT_TIMEOUT_SECONDS to keep that test fast is
         # indistinguishable, by wall-clock behavior, from the override
         # being silently ignored. Exercise the parsing directly instead.
         notes: list = []
         self.assertEqual(
-            codexrpc._timeout_seconds({"HEADROOM_CODEX_RPC_TIMEOUT": "7"}, notes),
+            codexrpc._timeout_seconds({"QUOTAGAUGE_CODEX_RPC_TIMEOUT": "7"}, notes),
             7.0,
         )
         self.assertEqual(notes, [])
@@ -173,10 +173,10 @@ class CodexRpcTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = {
-                "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
-                "HEADROOM_CODEX_RPC_TIMEOUT": "7",
-                "HEADROOM_TEST_RPC_MODE": "timeout",
-                "HEADROOM_TEST_RPC_HEARTBEAT": str(root / "heartbeat"),
+                "QUOTAGAUGE_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
+                "QUOTAGAUGE_CODEX_RPC_TIMEOUT": "7",
+                "QUOTAGAUGE_TEST_RPC_MODE": "timeout",
+                "QUOTAGAUGE_TEST_RPC_HEARTBEAT": str(root / "heartbeat"),
             }
             captured_deadlines: list = []
 
@@ -184,9 +184,9 @@ class CodexRpcTests(unittest.TestCase):
                 captured_deadlines.append(deadline)
                 raise codexrpc._RpcTimeout()
 
-            with mock.patch("headroom.codexrpc.time.monotonic", return_value=1_000.0):
+            with mock.patch("quotagauge.codexrpc.time.monotonic", return_value=1_000.0):
                 with mock.patch(
-                    "headroom.codexrpc._wait_for_response", side_effect=spy
+                    "quotagauge.codexrpc._wait_for_response", side_effect=spy
                 ):
                     codexrpc.read_rate_limits(environ=environment)
 
@@ -213,8 +213,8 @@ class CodexRpcTests(unittest.TestCase):
             root = Path(directory)
             self._write_rollout(root, used_percent=43)
             environment = self._environment(root, "success")
-            environment["HEADROOM_CODEX_RPC"] = "0"
-            environment["HEADROOM_TEST_RPC_STARTED"] = str(root / "started")
+            environment["QUOTAGAUGE_CODEX_RPC"] = "0"
+            environment["QUOTAGAUGE_TEST_RPC_STARTED"] = str(root / "started")
 
             document = self._run_json(environment)
 
@@ -233,8 +233,8 @@ class CodexRpcTests(unittest.TestCase):
             now = time.time()
             environment = {
                 "CODEX_HOME": str(root / "codex-hooks"),
-                "HEADROOM_CODEX_HOME": str(root / "codex-home"),
-                "HEADROOM_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex-home"),
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
             }
             stored = Snapshot(
                 used_percentage=94.0,
@@ -250,8 +250,8 @@ class CodexRpcTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, environment, clear=True):
                 save_snapshots((stored,))
-                with mock.patch("headroom.cli.read_rate_limits", return_value=rpc_result) as rpc:
-                    with mock.patch("headroom.cli.read_latest", return_value=rollout_result) as rollout:
+                with mock.patch("quotagauge.cli.read_rate_limits", return_value=rpc_result) as rpc:
+                    with mock.patch("quotagauge.cli.read_latest", return_value=rollout_result) as rollout:
                         with redirect_stdout(output):
                             result = main(["hook", "--plain"])
 
@@ -306,8 +306,8 @@ class CodexRpcTests(unittest.TestCase):
             )
             environment = {
                 "CODEX_HOME": str(root / "codex-hooks"),
-                "HEADROOM_CODEX_HOME": str(root / "codex-home"),
-                "HEADROOM_STATE_DIR": str(state_dir),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex-home"),
+                "QUOTAGAUGE_STATE_DIR": str(state_dir),
             }
             rollout_results = []
 
@@ -325,14 +325,14 @@ class CodexRpcTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 save_snapshots((stored,))
                 with mock.patch(
-                    "headroom.cli.read_rate_limits",
+                    "quotagauge.cli.read_rate_limits",
                     return_value=CodexRpcResult((), True, ("RPC unavailable",)),
                 ):
                     with mock.patch(
-                        "headroom.cli.read_latest", side_effect=read_real_rollout
+                        "quotagauge.cli.read_latest", side_effect=read_real_rollout
                     ):
                         with mock.patch(
-                            "headroom.codexsrc.time.monotonic",
+                            "quotagauge.codexsrc.time.monotonic",
                             side_effect=[0.0] * 6 + [float("inf")],
                         ):
                             with redirect_stdout(output):
@@ -350,10 +350,10 @@ class CodexRpcTests(unittest.TestCase):
     def _environment(self, root: Path, mode: str) -> dict[str, str]:
         return {
             "CODEX_HOME": str(root / "codex-hooks"),
-            "HEADROOM_CODEX_HOME": str(root / "codex-home"),
-            "HEADROOM_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
-            "HEADROOM_STATE_DIR": str(root / "state"),
-            "HEADROOM_TEST_RPC_MODE": mode,
+            "QUOTAGAUGE_CODEX_HOME": str(root / "codex-home"),
+            "QUOTAGAUGE_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
+            "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+            "QUOTAGAUGE_TEST_RPC_MODE": mode,
         }
 
     def _wait_for_marker(self, path: Path, timeout: float = 10.0) -> None:

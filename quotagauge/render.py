@@ -31,8 +31,8 @@ def render_statusline(
     if context_segment is not None:
         parts.append(context_segment)
     if not parts:
-        return "headroom: usage unavailable"
-    return "headroom: " + " | ".join(parts)
+        return "quotagauge: usage unavailable"
+    return "quotagauge: " + " | ".join(parts)
 
 
 def _context_statusline_segment(context: Optional[ContextReading]) -> Optional[str]:
@@ -214,13 +214,13 @@ def render_hook(
     means rate has nothing more urgent to add), and a CRITICAL rate line
     still never gets a burn-rate addendum, only at most one trailing
     context clause per rule 5. The forced-severity diagnostic path
-    (``HEADROOM_FORCE_SEVERITY``) stays isolated from context exactly like
+    (``QUOTAGAUGE_FORCE_SEVERITY``) stays isolated from context exactly like
     it already stays isolated from burn-rate: a synthetic test severity is
     never blended with a genuine context reading.
     """
 
     actionable = [reading for reading in readings if reading_severity(reading) is not Severity.OK]
-    # Forced-severity output is a diagnostic test path (HEADROOM_FORCE_SEVERITY),
+    # Forced-severity output is a diagnostic test path (QUOTAGAUGE_FORCE_SEVERITY),
     # not a real usage signal, so it stays isolated from burn-rate composition
     # rather than mixing synthetic severity with a genuine projection.
     burn_warning = (

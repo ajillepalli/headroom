@@ -13,10 +13,10 @@ import time
 import unittest
 from unittest import mock
 
-import headroom
-from headroom import cli
-from headroom.install_info import InstallInfo
-from headroom.settings import codex_hooks_snippet
+import quotagauge
+from quotagauge import cli
+from quotagauge.install_info import InstallInfo
+from quotagauge.settings import codex_hooks_snippet
 
 
 class CliTests(unittest.TestCase):
@@ -24,10 +24,10 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = {
-                "HEADROOM_STATE_DIR": str(root / "state"),
-                "HEADROOM_CODEX_HOME": str(root / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "1",
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "1",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
@@ -43,15 +43,15 @@ class CliTests(unittest.TestCase):
     def test_update_check_is_disabled_by_default_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = {
-                "HEADROOM_STATE_DIR": directory,
-                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
+                "QUOTAGAUGE_STATE_DIR": directory,
+                "QUOTAGAUGE_CODEX_HOME": str(Path(directory) / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.cli._refresh_codex"):
+                with mock.patch("quotagauge.cli._refresh_codex"):
                     with mock.patch(
-                        "headroom.update_check._open_pypi",
+                        "quotagauge.update_check._open_pypi",
                         side_effect=AssertionError("network attempted"),
                     ) as opened:
                         with redirect_stdout(output):
@@ -60,21 +60,21 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             opened.assert_not_called()
             self.assertIn(
-                "Updates: checking is off; set HEADROOM_UPDATE_CHECK=1 to enable.",
+                "Updates: checking is off; set QUOTAGAUGE_UPDATE_CHECK=1 to enable.",
                 output.getvalue(),
             )
 
     def test_explicit_disable_suppresses_update_discovery_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = {
-                "HEADROOM_STATE_DIR": directory,
-                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "0",
+                "QUOTAGAUGE_STATE_DIR": directory,
+                "QUOTAGAUGE_CODEX_HOME": str(Path(directory) / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "0",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.cli._refresh_codex"):
+                with mock.patch("quotagauge.cli._refresh_codex"):
                     with redirect_stdout(output):
                         result = cli.main(["status"])
 
@@ -84,22 +84,22 @@ class CliTests(unittest.TestCase):
     def test_enabled_stubbed_check_adds_update_line_to_status(self) -> None:
         document = {
             "releases": {
-                "0.1.10": [{"filename": "headroom.whl", "yanked": False}]
+                "0.1.10": [{"filename": "quotagauge.whl", "yanked": False}]
             }
         }
         with tempfile.TemporaryDirectory() as directory:
             environment = {
-                "HEADROOM_STATE_DIR": directory,
-                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "1",
+                "QUOTAGAUGE_STATE_DIR": directory,
+                "QUOTAGAUGE_CODEX_HOME": str(Path(directory) / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "1",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.cli._refresh_codex"):
-                    with mock.patch("headroom.cli._installed_version", return_value="0.1.9"):
+                with mock.patch("quotagauge.cli._refresh_codex"):
+                    with mock.patch("quotagauge.cli._installed_version", return_value="0.1.9"):
                         with mock.patch(
-                            "headroom.update_check._fetch_pypi_json",
+                            "quotagauge.update_check._fetch_pypi_json",
                             return_value=document,
                         ):
                             with redirect_stdout(output):
@@ -107,7 +107,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertIn(
-                "Update available: headroom-cli 0.1.10 (installed 0.1.9). Run headroom update.",
+                "Update available: quotagauge 0.1.10 (installed 0.1.9). Run quotagauge update.",
                 output.getvalue(),
             )
 
@@ -116,16 +116,16 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             environment = {
                 "CODEX_HOME": str(root / "codex-hooks"),
-                "HEADROOM_STATE_DIR": str(root / "state"),
-                "HEADROOM_CODEX_HOME": str(root / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "1",
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "1",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.cli._installed_version", return_value="1.0"):
+                with mock.patch("quotagauge.cli._installed_version", return_value="1.0"):
                     with mock.patch(
-                        "headroom.update_check._fetch_pypi_json",
+                        "quotagauge.update_check._fetch_pypi_json",
                         side_effect=OSError("endpoint unavailable"),
                     ) as fetched:
                         with redirect_stdout(output):
@@ -144,18 +144,18 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             environment = {
                 "CODEX_HOME": str(root / "codex-hooks"),
-                "HEADROOM_STATE_DIR": str(root / "state"),
-                "HEADROOM_CODEX_HOME": str(root / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "1",
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "1",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
                 with mock.patch(
-                    "headroom.cli._installed_version", return_value="development"
+                    "quotagauge.cli._installed_version", return_value="development"
                 ):
                     with mock.patch(
-                        "headroom.update_check._open_pypi",
+                        "quotagauge.update_check._open_pypi",
                         side_effect=AssertionError("network attempted"),
                     ) as opened:
                         with redirect_stdout(output):
@@ -185,14 +185,14 @@ class CliTests(unittest.TestCase):
             )
             environment = {
                 "CODEX_HOME": str(root / "codex-hooks"),
-                "HEADROOM_STATE_DIR": str(state_dir),
-                "HEADROOM_CODEX_HOME": str(root / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
-                "HEADROOM_UPDATE_CHECK": "0",
+                "QUOTAGAUGE_STATE_DIR": str(state_dir),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
+                "QUOTAGAUGE_UPDATE_CHECK": "0",
             }
             output = io.StringIO()
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.cli._installed_version", return_value="2.0"):
+                with mock.patch("quotagauge.cli._installed_version", return_value="2.0"):
                     with redirect_stdout(output):
                         result = cli.main(["doctor"])
 
@@ -202,8 +202,8 @@ class CliTests(unittest.TestCase):
 
     def test_update_prints_commands_without_executing_or_changing_files(self) -> None:
         cases = (
-            ("uv-tool", "uv tool upgrade headroom-cli"),
-            ("pip", "pip install -U headroom-cli"),
+            ("uv-tool", "uv tool upgrade quotagauge"),
+            ("pip", "pip install -U quotagauge"),
             ("source", "git pull\n  pip install -e ."),
             ("unknown", "No update command is suggested."),
         )
@@ -219,7 +219,7 @@ class CliTests(unittest.TestCase):
                             for mode, expected in cases:
                                 with self.subTest(mode=mode):
                                     info = InstallInfo(
-                                        path=root / "headroom",
+                                        path=root / "quotagauge",
                                         mode=(
                                             "source"
                                             if mode == "source"
@@ -232,7 +232,7 @@ class CliTests(unittest.TestCase):
                                     )
                                     output = io.StringIO()
                                     with mock.patch(
-                                        "headroom.cli.inspect_install",
+                                        "quotagauge.cli.inspect_install",
                                         return_value=info,
                                     ):
                                         with redirect_stdout(output):
@@ -252,65 +252,65 @@ class CliTests(unittest.TestCase):
     def test_version_uses_installed_distribution_metadata(self) -> None:
         output = io.StringIO()
 
-        with mock.patch("headroom.cli.metadata.version", return_value="2.3.4"):
-            with mock.patch("headroom.cli.source_commit", return_value="a1b2c3d"):
+        with mock.patch("quotagauge.cli.metadata.version", return_value="2.3.4"):
+            with mock.patch("quotagauge.cli.source_commit", return_value="a1b2c3d"):
                 with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
                     cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "headroom 2.3.4 (a1b2c3d)\n")
+        self.assertEqual(output.getvalue(), "quotagauge 2.3.4 (a1b2c3d)\n")
 
     def test_version_without_git_metadata_is_plain(self) -> None:
         output = io.StringIO()
 
-        with mock.patch("headroom.cli.metadata.version", return_value="2.3.4"):
-            with mock.patch("headroom.cli.source_commit", return_value=None):
+        with mock.patch("quotagauge.cli.metadata.version", return_value="2.3.4"):
+            with mock.patch("quotagauge.cli.source_commit", return_value=None):
                 with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
                     cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "headroom 2.3.4\n")
+        self.assertEqual(output.getvalue(), "quotagauge 2.3.4\n")
 
     def test_version_without_distribution_metadata_uses_package_version(self) -> None:
         output = io.StringIO()
 
         with mock.patch(
-            "headroom.cli.metadata.version",
+            "quotagauge.cli.metadata.version",
             side_effect=cli.metadata.PackageNotFoundError,
         ):
-            with mock.patch("headroom.cli.source_commit", return_value=None):
+            with mock.patch("quotagauge.cli.source_commit", return_value=None):
                 with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
                     cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertRegex(output.getvalue(), r"^headroom \d+\.\d+\.\d+(?:[^\s]*)?\n$")
-        self.assertEqual(output.getvalue(), "headroom {}\n".format(headroom.__version__))
+        self.assertRegex(output.getvalue(), r"^quotagauge \d+\.\d+\.\d+(?:[^\s]*)?\n$")
+        self.assertEqual(output.getvalue(), "quotagauge {}\n".format(quotagauge.__version__))
 
     def test_version_does_not_crash_outside_a_git_repository(self) -> None:
-        from headroom.install_info import source_commit
+        from quotagauge.install_info import source_commit
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / "headroom"
+            package = root / "quotagauge"
             package.mkdir()
             (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
             (root / ".git").mkdir()
             self.assertIsNone(source_commit(package))
 
         output = io.StringIO()
-        with mock.patch("headroom.cli.source_commit", return_value=None):
+        with mock.patch("quotagauge.cli.source_commit", return_value=None):
             with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
                 cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertTrue(output.getvalue().startswith("headroom "))
+        self.assertTrue(output.getvalue().startswith("quotagauge "))
 
     def test_source_commit_reads_head_without_running_git(self) -> None:
-        from headroom.install_info import inspect_install
+        from quotagauge.install_info import inspect_install
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / "headroom"
+            package = root / "quotagauge"
             git = root / ".git"
             package.mkdir()
             git.mkdir()
@@ -323,11 +323,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(info.commit, "0123456")
 
     def test_package_copy_nested_in_checkout_is_installed(self) -> None:
-        from headroom.install_info import inspect_install
+        from quotagauge.install_info import inspect_install
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / ".venv" / "site-packages" / "headroom"
+            package = root / ".venv" / "site-packages" / "quotagauge"
             package.mkdir(parents=True)
             (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
             (root / ".git").mkdir()
@@ -338,11 +338,11 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(info.commit)
 
     def test_uv_tool_install_is_detected_from_receipt(self) -> None:
-        from headroom.install_info import inspect_install
+        from quotagauge.install_info import inspect_install
 
         with tempfile.TemporaryDirectory() as directory:
-            environment = Path(directory) / "headroom-cli"
-            package = environment / "Lib" / "site-packages" / "headroom"
+            environment = Path(directory) / "quotagauge"
+            package = environment / "Lib" / "site-packages" / "quotagauge"
             package.mkdir(parents=True)
             (environment / "uv-receipt.toml").write_text("[tool]\n", encoding="utf-8")
 
@@ -351,10 +351,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(info.update_mode, "uv-tool")
 
     def test_pip_install_is_detected_from_installer_metadata(self) -> None:
-        import headroom.install_info as install_info
+        import quotagauge.install_info as install_info
 
         with tempfile.TemporaryDirectory() as directory:
-            package = Path(directory) / "site-packages" / "headroom"
+            package = Path(directory) / "site-packages" / "quotagauge"
             package.mkdir(parents=True)
             distribution = mock.Mock()
             distribution.read_text.return_value = "pip\n"
@@ -369,11 +369,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(info.update_mode, "pip")
 
     def test_pipx_install_is_not_misidentified_as_pip(self) -> None:
-        from headroom.install_info import inspect_install
+        from quotagauge.install_info import inspect_install
 
         with tempfile.TemporaryDirectory() as directory:
-            environment = Path(directory) / "headroom-cli"
-            package = environment / "Lib" / "site-packages" / "headroom"
+            environment = Path(directory) / "quotagauge"
+            package = environment / "Lib" / "site-packages" / "quotagauge"
             package.mkdir(parents=True)
             (environment / "pipx_metadata.json").write_text("{}\n", encoding="utf-8")
 
@@ -385,9 +385,9 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             environment = {
                 "CODEX_HOME": str(Path(directory) / "codex-hooks"),
-                "HEADROOM_STATE_DIR": directory,
-                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
+                "QUOTAGAUGE_STATE_DIR": directory,
+                "QUOTAGAUGE_CODEX_HOME": str(Path(directory) / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
             }
             output = io.StringIO()
             with mock.patch.dict("os.environ", environment, clear=True):
@@ -398,7 +398,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("Install\n", rendered)
         self.assertIn(
-            "  Path: {}".format(Path(headroom.__file__).resolve().parent),
+            "  Path: {}".format(Path(quotagauge.__file__).resolve().parent),
             rendered,
         )
         self.assertRegex(rendered, r"(?m)^  Mode: (?:installed|source)$")
@@ -416,9 +416,9 @@ class CliTests(unittest.TestCase):
             hooks_path.write_text(json.dumps(codex_hooks_snippet()), encoding="utf-8")
             environment = {
                 "CODEX_HOME": str(codex_home),
-                "HEADROOM_STATE_DIR": str(root / "state"),
-                "HEADROOM_CODEX_HOME": str(root / "capture"),
-                "HEADROOM_CODEX_RPC": "0",
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "capture"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
             }
             output = io.StringIO()
 
@@ -443,7 +443,7 @@ class CliTests(unittest.TestCase):
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "headroom hook",
+                                    "command": "quotagauge hook",
                                     "timeoutSec": 30,
                                 }
                             ]
@@ -454,14 +454,14 @@ class CliTests(unittest.TestCase):
             hooks_path.write_text(json.dumps(document), encoding="utf-8")
             environment = {
                 "CODEX_HOME": str(codex_home),
-                "HEADROOM_STATE_DIR": str(root / "state"),
-                "HEADROOM_CODEX_HOME": str(root / "capture"),
-                "HEADROOM_CODEX_RPC": "0",
+                "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+                "QUOTAGAUGE_CODEX_HOME": str(root / "capture"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
             }
             output = io.StringIO()
 
             with mock.patch.dict(os.environ, environment, clear=True):
-                with mock.patch("headroom.settings.shutil.which", return_value=None):
+                with mock.patch("quotagauge.settings.shutil.which", return_value=None):
                     with redirect_stdout(output):
                         result = cli.main(["doctor"])
 
@@ -476,7 +476,7 @@ class CliTests(unittest.TestCase):
         match = re.search(r'^version\s*=\s*"([^"]+)"\s*$', project_section, re.MULTILINE)
 
         self.assertIsNotNone(match)
-        self.assertEqual(headroom.__version__, match.group(1))
+        self.assertEqual(quotagauge.__version__, match.group(1))
 
 
 def _write_history(state_dir: Path, records) -> None:
@@ -607,9 +607,9 @@ class BurnRateSurfaceTests(unittest.TestCase):
     def _environment(self, root: Path) -> dict:
         return {
             "CODEX_HOME": str(root / "codex-hooks"),
-            "HEADROOM_STATE_DIR": str(root / "state"),
-            "HEADROOM_CODEX_HOME": str(root / "codex"),
-            "HEADROOM_CODEX_RPC": "0",
+            "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+            "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+            "QUOTAGAUGE_CODEX_RPC": "0",
         }
 
     def test_json_burn_rate_projections_is_top_level_not_nested_in_readings(self) -> None:
@@ -831,7 +831,7 @@ class BurnRateSurfaceTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.dict(os.environ, self._environment(root), clear=True):
                 with mock.patch(
-                    "headroom.cli._refresh_codex", side_effect=_append_third_record_during_refresh
+                    "quotagauge.cli._refresh_codex", side_effect=_append_third_record_during_refresh
                 ):
                     with redirect_stdout(output):
                         result = cli.main(["json"])
@@ -856,7 +856,7 @@ class BurnRateSurfaceTests(unittest.TestCase):
             history_path = root / "state" / "history.jsonl"
             actual_size = history_path.stat().st_size
 
-            with mock.patch.dict(os.environ, {"HEADROOM_STATE_DIR": str(root / "state")}, clear=True):
+            with mock.patch.dict(os.environ, {"QUOTAGAUGE_STATE_DIR": str(root / "state")}, clear=True):
                 unbounded = cli._burn_rate_projections(now)
                 bounded_under = cli._burn_rate_projections(now, max_history_bytes=actual_size + 1)
                 bounded_over = cli._burn_rate_projections(now, max_history_bytes=actual_size - 1)
@@ -923,7 +923,7 @@ class BurnRateSurfaceTests(unittest.TestCase):
             rendered = output.getvalue()
             self.assertNotIn("Burn rate", rendered)
             self.assertNotIn("burn rate", rendered)
-            self.assertTrue(rendered.startswith("headroom:"))
+            self.assertTrue(rendered.startswith("quotagauge:"))
 
 
 class ContextSurfaceTests(unittest.TestCase):
@@ -935,9 +935,9 @@ class ContextSurfaceTests(unittest.TestCase):
     def _environment(self, root: Path) -> dict:
         return {
             "CODEX_HOME": str(root / "codex-hooks"),
-            "HEADROOM_STATE_DIR": str(root / "state"),
-            "HEADROOM_CODEX_HOME": str(root / "codex"),
-            "HEADROOM_CODEX_RPC": "0",
+            "QUOTAGAUGE_STATE_DIR": str(root / "state"),
+            "QUOTAGAUGE_CODEX_HOME": str(root / "codex"),
+            "QUOTAGAUGE_CODEX_RPC": "0",
         }
 
     def _statusline_payload(self, session_id: str, used_percentage: float) -> str:
@@ -1121,13 +1121,13 @@ class ContextSurfaceTests(unittest.TestCase):
             with mock.patch.dict(os.environ, self._environment(root), clear=True):
                 with mock.patch("sys.stdin", io.StringIO(payload)):
                     with mock.patch(
-                        "headroom.cli.save_snapshots", side_effect=RuntimeError("boom")
+                        "quotagauge.cli.save_snapshots", side_effect=RuntimeError("boom")
                     ):
                         with redirect_stdout(output):
                             result = cli.main(["statusline"])
 
             self.assertEqual(result, 0)
-            self.assertEqual(output.getvalue().strip(), "headroom: usage unavailable")
+            self.assertEqual(output.getvalue().strip(), "quotagauge: usage unavailable")
 
     def test_hook_ignores_a_state_entry_whose_own_session_id_disagrees_with_its_key(
         self,
@@ -1180,7 +1180,7 @@ class ContextSurfaceTests(unittest.TestCase):
         # write_state's json.dump(..., ensure_ascii=False) call -- which
         # runs on nearly every command via _refresh_codex, not just ones
         # that touch context -- turning one bad entry into a permanent
-        # exit-1 for `headroom json`. Rejecting it only at decode time
+        # exit-1 for `quotagauge json`. Rejecting it only at decode time
         # (ContextReading.from_dict) is not enough on its own: the very
         # first _refresh_codex call still tries to re-persist the
         # untouched corrupt entry before ever reaching that decode path.

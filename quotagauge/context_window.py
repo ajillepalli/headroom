@@ -11,7 +11,7 @@ future time at which a stale reading becomes known-good. A stale context
 reading is therefore reported as nothing -- never a bound, never a guess.
 See docs/explanation-context.md for the full argument.
 
-Context is also per-session where every other headroom signal is
+Context is also per-session where every other quotagauge signal is
 account-wide. ``claude.py`` extracts the top-level ``session_id`` alongside
 the ``context_window`` subtree, and ``state.py`` keys stored captures by
 that session_id, so a reading here always names the one session it
@@ -162,7 +162,7 @@ class ContextReading:
             # corrupted state.json: JSON's \uXXXX escapes accept any code
             # unit, paired or not) decodes here as an ordinary Python str
             # and then fails much later at json.dumps(..., ensure_ascii=False)
-            # time (finding #9), turning `headroom json`'s exit code into 1.
+            # time (finding #9), turning `quotagauge json`'s exit code into 1.
             # Rejecting it here, at decode time, keeps that surface's exit
             # code intact through the same "corrupt state collapses to
             # silence" path every other bad-data case in this method takes,

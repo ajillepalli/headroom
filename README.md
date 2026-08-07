@@ -1,9 +1,9 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="images/headroom-logo-dark.svg">
-    <img src="images/headroom-logo.svg" alt="headroom" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="images/quotagauge-logo-dark.svg">
+    <img src="images/quotagauge-logo.svg" alt="quotagauge" width="420">
   </picture><br>
-  <strong>headroom</strong><br>
+  <strong>quotagauge</strong><br>
   <a href="docs/explanation-capture.md">Capture</a> &middot;
   <a href="docs/howto-install.md">Install</a> &middot;
   <a href="docs/reference-cli.md">CLI reference</a> &middot;
@@ -14,16 +14,16 @@
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/python-3.9%2B-blue.svg">
 </p>
 
-Claude Code and Codex enforce rolling usage limits but show the numbers only to a human, so the model never sees them and can keep working right up to the wall. headroom captures those readings and warns the model when it should conserve usage.
+Claude Code and Codex enforce rolling usage limits but show the numbers only to a human, so the model never sees them and can keep working right up to the wall. quotagauge captures those readings and warns the model when it should conserve usage.
 
 ## Install and first run
 
 The shortest path:
 
 ```console
-uv tool install headroom-cli
-headroom init --all
-headroom status
+uv tool install quotagauge
+quotagauge init --all
+quotagauge status
 ```
 
 To work from a clone instead, run one of these:
@@ -36,11 +36,11 @@ uv tool install .
 pip install -e .
 ```
 
-Then run `headroom init --all` and `headroom status`. Plain `headroom init` configures Claude Code only, while `--codex` configures Codex only. See the [installation guide](docs/howto-install.md) for safe previews and the plain-clone fallback.
+Then run `quotagauge init --all` and `quotagauge status`. Plain `quotagauge init` configures Claude Code only, while `--codex` configures Codex only. See the [installation guide](docs/howto-install.md) for safe previews and the plain-clone fallback.
 
 ## Example output
 
-`headroom status` reports every source and window:
+`quotagauge status` reports every source and window:
 
 ```text
 Claude

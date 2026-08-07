@@ -15,14 +15,14 @@ from __future__ import annotations
 from typing import Optional
 import unittest
 
-from headroom.bounds import Confidence, Reading
-from headroom.burn_rate import BurnRateProjection, NoProjectionReason
-from headroom.render import (
+from quotagauge.bounds import Confidence, Reading
+from quotagauge.burn_rate import BurnRateProjection, NoProjectionReason
+from quotagauge.render import (
     render_burn_rate_doctor_lines,
     render_burn_rate_status_lines,
     render_hook,
 )
-from headroom.severity import (
+from quotagauge.severity import (
     MAX_TRUSTED_RATE_DRIFT,
     MAX_TRUSTED_RELATIVE_DEVIATION,
     MAX_TRUSTED_USAGE_SHARE,
@@ -183,10 +183,10 @@ class TrustworthyPolicyTests(unittest.TestCase):
         # Deliberately excluded from the policy: see severity.py's module
         # comment. It saturates (69-566, ~20x-190x past any threshold that
         # would still admit real data) on every real successful projection
-        # in this project's own history because headroom's capture cadence
+        # in this project's own history because quotagauge's capture cadence
         # is far finer than a whole percentage point of usage, not because
         # real usage is unusually bursty -- so it cannot discriminate for
-        # input shaped like headroom's own. A projection with an extreme
+        # input shaped like quotagauge's own. A projection with an extreme
         # max_raw_rate_ratio must still be trustworthy if every OTHER
         # threshold clears; this pins that down so a future change cannot
         # silently reintroduce the gate this project measured and removed.
