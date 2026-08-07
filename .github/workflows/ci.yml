@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Default GITHUB_TOKEN permissions can be looser than this workflow needs
+# (repo settings vary). Neither job pushes, comments, or writes packages, so
+# read-only content access is the most this ever needs (Codex review, P2).
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
