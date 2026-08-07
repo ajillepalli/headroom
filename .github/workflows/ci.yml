@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Default GITHUB_TOKEN permissions can be looser than this workflow needs
+# (repo settings vary). Neither job pushes, comments, or writes packages, so
+# read-only content access is the most this ever needs (Codex review, P2).
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Full 6-version x 3-OS matrix would be 18 jobs for a project with
+        # no runtime dependencies to isolate per-OS; that is excessive.
+        # Instead: every Python version runs on Ubuntu (cheapest runner,
+        # catches version-specific stdlib behavior), and only the floor
+        # (3.9, the declared minimum) and ceiling (3.14, newest) versions
+        # are repeated on Windows and macOS. state.py picks fcntl.flock on
+        # POSIX vs msvcrt.locking on Windows at import time, and has
+        # os.replace retry logic aimed specifically at Windows antivirus
+        # interference, so Windows must appear in the matrix at all; macOS
+        # shares the POSIX fcntl branch with Ubuntu, so it is included at
+        # the two edges rather than every version, which would only repeat
+        # Ubuntu's own coverage six times over.
+        include:
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.9"
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify both artifacts were produced
+        run: |
+          ls dist/
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz')"
+          test -n "$(find dist -maxdepth 1 -name '*.whl')"

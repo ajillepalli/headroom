@@ -9,6 +9,7 @@
   <a href="docs/reference-cli.md">CLI reference</a> &middot;
   <a href="docs/explanation-bounds.md">Bounds</a> &middot;
   <a href="docs/howto-troubleshoot.md">Troubleshooting</a><br><br>
+  <a href="https://github.com/ajillepalli/quotagauge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ajillepalli/quotagauge/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-zero-success.svg">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/python-3.9%2B-blue.svg">

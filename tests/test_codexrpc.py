@@ -348,13 +348,36 @@ class CodexRpcTests(unittest.TestCase):
             self.assertEqual(persisted["captured_at"], now)
 
     def _environment(self, root: Path, mode: str) -> dict[str, str]:
-        return {
+        environment = {
             "CODEX_HOME": str(root / "codex-hooks"),
             "QUOTAGAUGE_CODEX_HOME": str(root / "codex-home"),
             "QUOTAGAUGE_CODEX_RPC_CMD": json.dumps([sys.executable, str(STUB)]),
             "QUOTAGAUGE_STATE_DIR": str(root / "state"),
             "QUOTAGAUGE_TEST_RPC_MODE": mode,
         }
+        # This environment feeds mock.patch.dict(os.environ, ..., clear=True),
+        # which the real codexrpc.read_rate_limits() then inherits when it
+        # spawns the stub as a REAL child process (no env= override there,
+        # by design -- production must inherit whatever the user's actual
+        # shell has). Wiping SystemRoot along with everything else is fine on
+        # POSIX, but on Windows it starves the child interpreter of the
+        # SystemRoot it needs to locate bcrypt.dll for its own startup CSPRNG
+        # call: on Python 3.9 that call is NOT optional (hash randomization
+        # init), so the child dies with "Fatal Python error:
+        # _Py_HashRandomization_Init: failed to get random numbers to
+        # initialize Python" before it ever reads a line of stdin -- observed
+        # directly by reproducing this exact spawn outside the test suite.
+        # Newer CPython (3.11+ observed) tolerates the same missing variable,
+        # which is why this was invisible on every Python version this
+        # project had ever run its tests on before CI added Windows + 3.9.
+        # Restoring just this one variable is not a loosening of the
+        # isolation this test wants (QUOTAGAUGE_*/CODEX_HOME are still fully
+        # controlled) -- it only stops the test's own env-clearing from
+        # breaking child process startup, a failure mode no real invocation
+        # of quotagauge could ever hit.
+        if os.name == "nt" and "SystemRoot" in os.environ:
+            environment["SystemRoot"] = os.environ["SystemRoot"]
+        return environment
 
     def _wait_for_marker(self, path: Path, timeout: float = 10.0) -> None:
         """Poll for a marker file with a generous deadline instead of a

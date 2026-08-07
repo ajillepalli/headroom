@@ -161,7 +161,19 @@ class InstallTests(unittest.TestCase):
             snippet["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
         )
         for command, subcommand in zip(commands, ("statusline", "hook")):
-            self.assertIn(str(Path(sys.executable).resolve()), command)
+            # quotagauge_command() embeds sys.executable verbatim, not
+            # resolved: sys.executable is already documented as absolute,
+            # and a resolved path is not strictly more correct here -- on a
+            # version-manager-provided interpreter (pyenv, uv), sys.executable
+            # can be a symlink/junction that keeps working across a later
+            # patch upgrade, whereas resolving pins the recorded command to
+            # today's literal target file, which such a manager may later
+            # garbage-collect. Asserting the resolved form here previously
+            # passed only because the local dev machine's own interpreter
+            # happened to already be its own resolved target; it fails on any
+            # installer (uv, hosted CI runners) whose interpreter is a real
+            # symlink, even though the command it produces is fully valid.
+            self.assertIn(sys.executable, command)
             self.assertIn("-m quotagauge.cli {}".format(subcommand), command)
             self.assertIn("PYTHONPATH", command)
 
@@ -169,7 +181,9 @@ class InstallTests(unittest.TestCase):
         with mock.patch("quotagauge.settings.shutil.which", return_value=None):
             command = codex_hooks_snippet()["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
 
-        self.assertIn(str(Path(sys.executable).resolve()), command)
+        # See test_commands_use_absolute_python_module_fallback_without_
+        # quotagauge above for why this checks the unresolved sys.executable.
+        self.assertIn(sys.executable, command)
         self.assertIn("-m quotagauge.cli hook", command)
         self.assertIn("PYTHONPATH", command)
 
