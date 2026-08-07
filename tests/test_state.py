@@ -14,9 +14,9 @@ import time
 import unittest
 from unittest import mock
 
-from headroom.bounds import Snapshot
-from headroom.cli import main
-from headroom.state import (
+from quotagauge.bounds import Snapshot
+from quotagauge.cli import main
+from quotagauge.state import (
     _MAX_TRACKED_CONTEXT_SESSIONS,
     _acquire_lock,
     _context_entry_is_fresh,
@@ -38,7 +38,7 @@ class StateTests(unittest.TestCase):
             state_dir = Path(directory)
             write_state(original, state_dir)
 
-            with mock.patch("headroom.state.os.replace", side_effect=OSError("interrupted")):
+            with mock.patch("quotagauge.state.os.replace", side_effect=OSError("interrupted")):
                 with self.assertRaises(OSError):
                     write_state(replacement, state_dir)
 
@@ -53,8 +53,8 @@ class StateTests(unittest.TestCase):
         # PermissionError for a few milliseconds if something external
         # (antivirus real-time scanning, the Windows Search Indexer) has
         # the target file open at the exact instant of the rename. This
-        # is not a headroom locking bug -- the lock already guarantees
-        # only one headroom process is ever inside write_state at a time
+        # is not a quotagauge locking bug -- the lock already guarantees
+        # only one quotagauge process is ever inside write_state at a time
         # -- so retrying a BOUNDED number of times, rather than failing
         # the whole write outright, is the correct response to a purely
         # external, momentary conflict.
@@ -70,8 +70,8 @@ class StateTests(unittest.TestCase):
                     raise PermissionError(5, "Access is denied")
                 return real_replace(source, target)
 
-            with mock.patch("headroom.state.os.replace", side_effect=flaky_replace):
-                with mock.patch("headroom.state.time.sleep"):
+            with mock.patch("quotagauge.state.os.replace", side_effect=flaky_replace):
+                with mock.patch("quotagauge.state.time.sleep"):
                     write_state(new_state, state_dir)
 
             self.assertEqual(len(calls), 3)
@@ -81,14 +81,14 @@ class StateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with mock.patch(
-                "headroom.state.os.replace",
+                "quotagauge.state.os.replace",
                 side_effect=PermissionError(5, "Access is denied"),
             ) as replace_mock:
-                with mock.patch("headroom.state.time.sleep"):
+                with mock.patch("quotagauge.state.time.sleep"):
                     with self.assertRaises(PermissionError):
                         write_state({"version": 1, "sources": {}}, state_dir)
 
-            from headroom.state import _REPLACE_RETRY_ATTEMPTS
+            from quotagauge.state import _REPLACE_RETRY_ATTEMPTS
 
             self.assertEqual(replace_mock.call_count, _REPLACE_RETRY_ATTEMPTS)
             self.assertEqual(list(state_dir.glob(".state-*.tmp")), [])
@@ -114,7 +114,7 @@ class StateTests(unittest.TestCase):
             output = StringIO()
 
             with mock.patch.dict(
-                os.environ, {"HEADROOM_STATE_DIR": directory}, clear=True
+                os.environ, {"QUOTAGAUGE_STATE_DIR": directory}, clear=True
             ):
                 with redirect_stdout(output):
                     result = main(["reset"])
@@ -296,7 +296,7 @@ class StateTests(unittest.TestCase):
         # sweep uses as "now", and resolve_age already rejects a
         # non-finite "now" independently of this fix) -- so a directly
         # written hostile state.json (a hand edit, or a file from a
-        # pre-fix version of headroom) is what actually exercises the
+        # pre-fix version of quotagauge) is what actually exercises the
         # "already sitting on disk" scenario this fix targets.
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -342,7 +342,7 @@ class StateTests(unittest.TestCase):
         # host. Only a CONTENDED attempt (another holder in the way,
         # EACCES/EAGAIN/EWOULDBLOCK) should retry; anything else must give
         # up on the very first attempt.
-        import headroom.state as state_module
+        import quotagauge.state as state_module
 
         permanent_error = OSError()
         permanent_error.errno = errno.ENOTSUP
@@ -423,7 +423,7 @@ class StateTests(unittest.TestCase):
             def write_b() -> None:
                 save_snapshots((), state_dir, context_capture=session_b)
 
-            with mock.patch("headroom.state.read_state", side_effect=synced_read_state):
+            with mock.patch("quotagauge.state.read_state", side_effect=synced_read_state):
                 thread_a = threading.Thread(target=write_a)
                 thread_b = threading.Thread(target=write_b)
                 thread_a.start()
@@ -499,7 +499,7 @@ class StateTests(unittest.TestCase):
                 "source": "claude",
             }
 
-            with mock.patch("headroom.state.time.time", return_value=400.0):
+            with mock.patch("quotagauge.state.time.time", return_value=400.0):
                 save_snapshots((), state_dir, context_capture=future_dated)
                 state = save_snapshots((), state_dir, context_capture=new)
 
@@ -557,7 +557,7 @@ class StateTests(unittest.TestCase):
         self,
     ) -> None:
         # Codex review (round 2, P2): an earlier version of the reordering
-        # fix above reused fresh_for_seconds (HEADROOM_FRESH_CONTEXT_SECONDS,
+        # fix above reused fresh_for_seconds (QUOTAGAUGE_FRESH_CONTEXT_SECONDS,
         # user-configurable) as the pruning sweep's future-tolerance. That
         # reintroduces the exact same reordering bug the moment someone
         # configures a freshness window shorter than realistic scheduling
@@ -566,7 +566,7 @@ class StateTests(unittest.TestCase):
         # questions and must not share one knob.
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
-            with mock.patch.dict(os.environ, {"HEADROOM_FRESH_CONTEXT_SECONDS": "10"}):
+            with mock.patch.dict(os.environ, {"QUOTAGAUGE_FRESH_CONTEXT_SECONDS": "10"}):
                 save_snapshots(
                     (),
                     state_dir,
@@ -619,7 +619,7 @@ class StateTests(unittest.TestCase):
         }
         session_x_incoming_now = 1_000.0 - five_minutes
 
-        with mock.patch("headroom.state.time.time", return_value=1_005.0):
+        with mock.patch("quotagauge.state.time.time", return_value=1_005.0):
             self.assertTrue(
                 _context_entry_is_fresh(session_y_entry, session_x_incoming_now, 300.0)
             )
@@ -648,7 +648,7 @@ class StateTests(unittest.TestCase):
             "captured_at": 1_000.0 - five_minutes,
         }
 
-        with mock.patch("headroom.state.time.time", return_value=1_005.0):
+        with mock.patch("quotagauge.state.time.time", return_value=1_005.0):
             self.assertFalse(
                 _should_replace_context_capture(legitimate_current, delayed_incoming)
             )
@@ -682,7 +682,7 @@ class StateTests(unittest.TestCase):
             "source": "claude",
         }
 
-        with mock.patch("headroom.state.time.time", return_value=1_000.0):
+        with mock.patch("quotagauge.state.time.time", return_value=1_000.0):
             # Pruning: a DIFFERENT session's ordinary write must not retain
             # the 30-minute-future entry as if it were merely a faster
             # session that captured first.
@@ -803,7 +803,7 @@ class StateTests(unittest.TestCase):
                 "source": "claude",
             }
 
-            with mock.patch("headroom.state.write_state") as write_mock:
+            with mock.patch("quotagauge.state.write_state") as write_mock:
                 save_snapshots((snapshot,), state_dir, context_capture=capture)
 
             self.assertEqual(write_mock.call_count, 1)

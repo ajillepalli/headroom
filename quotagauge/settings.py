@@ -1,4 +1,4 @@
-"""Install headroom hooks without discarding user configuration."""
+"""Install quotagauge hooks without discarding user configuration."""
 
 from __future__ import annotations
 
@@ -41,13 +41,13 @@ def shell_command(command_parts: Sequence[str]) -> str:
     return subprocess.list2cmdline(command_parts) if os.name == "nt" else shlex.join(command_parts)
 
 
-def headroom_command(subcommand: str) -> str:
+def quotagauge_command(subcommand: str) -> str:
     """Return an installed command, with a checkout-safe Python fallback."""
-    if shutil.which("headroom") is not None:
-        return "headroom {}".format(subcommand)
+    if shutil.which("quotagauge") is not None:
+        return "quotagauge {}".format(subcommand)
 
     repository = str(Path(__file__).resolve().parent.parent)
-    command = shell_command([sys.executable, "-m", "headroom.cli", subcommand])
+    command = shell_command([sys.executable, "-m", "quotagauge.cli", subcommand])
     if os.name == "nt":
         return 'set "PYTHONPATH={}" && {}'.format(repository, command)
     return "PYTHONPATH={} {}".format(shlex.quote(repository), command)
@@ -58,7 +58,7 @@ def settings_snippet() -> Dict[str, Any]:
     return {
         "statusLine": {
             "type": "command",
-            "command": headroom_command("statusline"),
+            "command": quotagauge_command("statusline"),
             "refreshInterval": 300,
         },
         "hooks": {
@@ -67,7 +67,7 @@ def settings_snippet() -> Dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": headroom_command("hook"),
+                            "command": quotagauge_command("hook"),
                         }
                     ]
                 }
@@ -79,14 +79,14 @@ def settings_snippet() -> Dict[str, Any]:
 def codex_hooks_snippet() -> Dict[str, Any]:
     """Return the hook document accepted by Codex."""
     return {
-        "description": "headroom",
+        "description": "quotagauge",
         "hooks": {
             "UserPromptSubmit": [
                 {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": headroom_command("hook"),
+                            "command": quotagauge_command("hook"),
                             "timeoutSec": 10,
                         }
                     ]
@@ -97,7 +97,7 @@ def codex_hooks_snippet() -> Dict[str, Any]:
 
 
 def merge_settings(existing: Dict[str, Any], snippet: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge headroom settings while preserving unrelated configuration."""
+    """Merge quotagauge settings while preserving unrelated configuration."""
     merged = copy.deepcopy(existing)
     hooks = merged.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -107,9 +107,9 @@ def merge_settings(existing: Dict[str, Any], snippet: Dict[str, Any]) -> Dict[st
     if not isinstance(prompt_hooks, list):
         raise ValueError("the existing 'hooks.UserPromptSubmit' setting is not a JSON array")
 
-    headroom_hook = snippet["hooks"]["UserPromptSubmit"][0]
-    if not _contains_headroom_hook(prompt_hooks):
-        prompt_hooks.append(copy.deepcopy(headroom_hook))
+    quotagauge_hook = snippet["hooks"]["UserPromptSubmit"][0]
+    if not _contains_quotagauge_hook(prompt_hooks):
+        prompt_hooks.append(copy.deepcopy(quotagauge_hook))
     merged["statusLine"] = copy.deepcopy(snippet["statusLine"])
     return merged
 
@@ -126,9 +126,9 @@ def merge_codex_hooks(existing: Dict[str, Any], snippet: Dict[str, Any]) -> Dict
     if not isinstance(prompt_hooks, list):
         raise ValueError("the existing 'hooks.UserPromptSubmit' setting is not a JSON array")
 
-    headroom_hook = snippet["hooks"]["UserPromptSubmit"][0]
-    if not _contains_headroom_hook(prompt_hooks):
-        prompt_hooks.append(copy.deepcopy(headroom_hook))
+    quotagauge_hook = snippet["hooks"]["UserPromptSubmit"][0]
+    if not _contains_quotagauge_hook(prompt_hooks):
+        prompt_hooks.append(copy.deepcopy(quotagauge_hook))
     return merged
 
 
@@ -189,7 +189,7 @@ def run_init(
 
     if len(targets) > 1 and _same_file(targets[0].path, targets[1].path):
         print(
-            "headroom init: refusing to configure the same file as both Claude and Codex: {}".format(
+            "quotagauge init: refusing to configure the same file as both Claude and Codex: {}".format(
                 targets[0].path
             ),
             file=sys.stderr,
@@ -201,7 +201,7 @@ def run_init(
         try:
             prepared.append(_prepare_install(target))
         except ValueError as error:
-            print("headroom init: refusing to change {}: {}".format(target.path, error), file=sys.stderr)
+            print("quotagauge init: refusing to change {}: {}".format(target.path, error), file=sys.stderr)
             return 1
 
     if dry_run:
@@ -215,7 +215,7 @@ def run_init(
                 )
                 sys.stdout.writelines(diff)
         if not any(item.changed for item in prepared):
-            print("headroom init: no changes")
+            print("quotagauge init: no changes")
         return 0
 
     changed = [item for item in prepared if item.changed]
@@ -223,12 +223,12 @@ def run_init(
         for item in prepared:
             if item.customized_hook:
                 print(
-                    "headroom init: {} already has a customized headroom hook; leaving it unchanged".format(
+                    "quotagauge init: {} already has a customized quotagauge hook; leaving it unchanged".format(
                         item.target.path
                     )
                 )
             else:
-                print("headroom init: {} is already configured".format(item.target.path))
+                print("quotagauge init: {} is already configured".format(item.target.path))
         return 0
 
     applied: List[_PreparedInstall] = []
@@ -241,7 +241,7 @@ def run_init(
         rollback_errors = _rollback_installs(applied)
         if rollback_errors:
             print(
-                "headroom init: update failed after another target was applied; "
+                "quotagauge init: update failed after another target was applied; "
                 "rollback was incomplete: {}; original error: {}".format(
                     "; ".join(rollback_errors), error
                 ),
@@ -249,11 +249,11 @@ def run_init(
             )
         elif applied:
             print(
-                "headroom init: update failed; restored the previously updated target(s): {}".format(error),
+                "quotagauge init: update failed; restored the previously updated target(s): {}".format(error),
                 file=sys.stderr,
             )
         else:
-            print("headroom init: update failed: {}".format(error), file=sys.stderr)
+            print("quotagauge init: update failed: {}".format(error), file=sys.stderr)
         return 1
 
     for item in changed:
@@ -261,12 +261,12 @@ def run_init(
     for item in prepared:
         if item.customized_hook:
             print(
-                "headroom init: {} already has a customized headroom hook; leaving it unchanged".format(
+                "quotagauge init: {} already has a customized quotagauge hook; leaving it unchanged".format(
                     item.target.path
                 )
             )
         elif not item.changed:
-            print("headroom init: {} is already configured".format(item.target.path))
+            print("quotagauge init: {} is already configured".format(item.target.path))
     return 0
 
 
@@ -292,7 +292,7 @@ def _prepare_install(target: _InstallTarget) -> _PreparedInstall:
     changed = merged != existing
     prompt_hooks = _prompt_hooks(existing)
     expected = target.snippet["hooks"]["UserPromptSubmit"][0]
-    customized_hook = _contains_headroom_hook(prompt_hooks) and expected not in prompt_hooks
+    customized_hook = _contains_quotagauge_hook(prompt_hooks) and expected not in prompt_hooks
     return _PreparedInstall(
         target,
         existed,
@@ -360,7 +360,7 @@ def _rollback_installs(applied: Sequence[_PreparedInstall]) -> List[str]:
 
 
 def codex_hook_registration(codex_home: Optional[Path] = None) -> Tuple[Path, str]:
-    """Return the selected hooks path and its headroom registration status."""
+    """Return the selected hooks path and its quotagauge registration status."""
     path = codex_hooks_path(codex_home)
     if not path.exists():
         return path, "not registered (file missing)"
@@ -376,7 +376,7 @@ def codex_hook_registration(codex_home: Optional[Path] = None) -> Tuple[Path, st
     prompt_hooks = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
     return (
         (path, "registered")
-        if isinstance(prompt_hooks, list) and _contains_headroom_hook(prompt_hooks)
+        if isinstance(prompt_hooks, list) and _contains_quotagauge_hook(prompt_hooks)
         else (path, "not registered")
     )
 
@@ -390,7 +390,7 @@ def codex_hook_command_availability(codex_home: Optional[Path] = None) -> str:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return "not checked (hook not registered)"
     prompt_hooks = _prompt_hooks(parsed if isinstance(parsed, dict) else {})
-    commands = list(_headroom_hook_commands(prompt_hooks))
+    commands = list(_quotagauge_hook_commands(prompt_hooks))
     if not commands:
         return "not checked (hook not registered)"
     return "available" if any(_command_is_available(command) for command in commands) else "unavailable"
@@ -420,11 +420,11 @@ def _prompt_hooks(document: Dict[str, Any]) -> List[Any]:
     return prompt_hooks if isinstance(prompt_hooks, list) else []
 
 
-def _contains_headroom_hook(prompt_hooks: Sequence[Any]) -> bool:
-    return any(_headroom_hook_commands(prompt_hooks))
+def _contains_quotagauge_hook(prompt_hooks: Sequence[Any]) -> bool:
+    return any(_quotagauge_hook_commands(prompt_hooks))
 
 
-def _headroom_hook_commands(prompt_hooks: Sequence[Any]):
+def _quotagauge_hook_commands(prompt_hooks: Sequence[Any]):
     for wrapper in prompt_hooks:
         if not isinstance(wrapper, dict):
             continue
@@ -435,7 +435,7 @@ def _headroom_hook_commands(prompt_hooks: Sequence[Any]):
             if not isinstance(registration, dict) or registration.get("type") != "command":
                 continue
             command = registration.get("command")
-            if isinstance(command, str) and _is_headroom_hook_command(command):
+            if isinstance(command, str) and _is_quotagauge_hook_command(command):
                 yield command
 
 
@@ -460,16 +460,16 @@ def _command_segments(command: str) -> List[List[str]]:
     return segments
 
 
-def _is_headroom_hook_command(command: str) -> bool:
+def _is_quotagauge_hook_command(command: str) -> bool:
     for tokens in _command_segments(command):
         executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
-        if executable in ("headroom", "headroom.exe") and len(tokens) > 1:
+        if executable in ("quotagauge", "quotagauge.exe") and len(tokens) > 1:
             if tokens[1].casefold() == "hook":
                 return True
         if _is_python_executable(executable):
             lowered = [token.casefold() for token in tokens]
             for index in range(1, len(lowered) - 2):
-                if lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]:
+                if lowered[index : index + 3] == ["-m", "quotagauge.cli", "hook"]:
                     return True
     return False
 
@@ -480,11 +480,11 @@ def _command_is_available(command: str) -> bool:
         name = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
         is_hook = False
         if len(tokens) > 1:
-            is_hook = name in ("headroom", "headroom.exe") and lowered[1] == "hook"
+            is_hook = name in ("quotagauge", "quotagauge.exe") and lowered[1] == "hook"
         is_hook = is_hook or (
             _is_python_executable(name)
             and any(
-                lowered[index : index + 3] == ["-m", "headroom.cli", "hook"]
+                lowered[index : index + 3] == ["-m", "quotagauge.cli", "hook"]
                 for index in range(1, len(lowered) - 2)
             )
         )

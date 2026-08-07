@@ -1,4 +1,4 @@
-"""Opt-in, cached checks for newer headroom releases on PyPI."""
+"""Opt-in, cached checks for newer quotagauge releases on PyPI."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from urllib import error, request
 from .config import resolve_state_dir
 
 
-UPDATE_CHECK_ENV = "HEADROOM_UPDATE_CHECK"
-PYPI_URL = "https://pypi.org/pypi/headroom-cli/json"
+UPDATE_CHECK_ENV = "QUOTAGAUGE_UPDATE_CHECK"
+PYPI_URL = "https://pypi.org/pypi/quotagauge/json"
 CACHE_FILENAME = "update-check.json"
 CACHE_SECONDS = 24 * 60 * 60
 # Operational tolerance for ordinary clock behaviour (NTP step corrections,
@@ -86,7 +86,7 @@ def discovery_line(environ: Optional[Mapping[str, str]] = None) -> Optional[str]
     environment = os.environ if environ is None else environ
     if UPDATE_CHECK_ENV in environment:
         return None
-    return "Updates: checking is off; set HEADROOM_UPDATE_CHECK=1 to enable."
+    return "Updates: checking is off; set QUOTAGAUGE_UPDATE_CHECK=1 to enable."
 
 
 def parse_version(value: str) -> Optional[ParsedVersion]:
@@ -160,7 +160,7 @@ def check_for_update(
     state_dir: Optional[Path] = None,
     now: Optional[float] = None,
 ) -> UpdateResult:
-    """Return a daily cached result, performing the only network call in headroom."""
+    """Return a daily cached result, performing the only network call in quotagauge."""
 
     checked_at = time.time() if now is None else now
     cached = read_cached_result(state_dir, installed_version)
@@ -232,7 +232,7 @@ def read_cached_result(
 
     path = resolve_state_dir(state_dir) / CACHE_FILENAME
     # Cache authentication is intentionally out of scope. Anyone who can write
-    # the user's state directory can also replace the headroom executable, so
+    # the user's state directory can also replace the quotagauge executable, so
     # integrity material would add complexity without protecting this threat model.
     try:
         with path.open("rb") as handle:
@@ -279,7 +279,7 @@ def _fetch_pypi_json() -> Any:
         headers={
             "Accept": "application/json",
             "Connection": "close",
-            "User-Agent": "headroom-update-check",
+            "User-Agent": "quotagauge-update-check",
         },
         method="GET",
     )

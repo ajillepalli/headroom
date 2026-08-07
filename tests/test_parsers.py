@@ -11,12 +11,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from headroom.bounds import Confidence, Snapshot, bound_snapshot
-from headroom.claude import classify_window, parse_payload, parse_reset_time, parse_stdin
-from headroom.cli import main
-from headroom.codexsrc import parse_rate_limits
-from headroom.render import render_report
-from headroom.state import save_snapshots
+from quotagauge.bounds import Confidence, Snapshot, bound_snapshot
+from quotagauge.claude import classify_window, parse_payload, parse_reset_time, parse_stdin
+from quotagauge.cli import main
+from quotagauge.codexsrc import parse_rate_limits
+from quotagauge.render import render_report
+from quotagauge.state import save_snapshots
 
 
 CLAUDE_STATUSLINE_PAYLOAD = {
@@ -474,9 +474,9 @@ class ParserTests(unittest.TestCase):
             )
             environment = {
                 "CODEX_HOME": str(Path(directory) / "codex-hooks"),
-                "HEADROOM_STATE_DIR": directory,
-                "HEADROOM_CODEX_HOME": str(Path(directory) / "codex"),
-                "HEADROOM_CODEX_RPC": "0",
+                "QUOTAGAUGE_STATE_DIR": directory,
+                "QUOTAGAUGE_CODEX_HOME": str(Path(directory) / "codex"),
+                "QUOTAGAUGE_CODEX_RPC": "0",
             }
             with mock.patch.dict(os.environ, environment, clear=True):
                 output = StringIO()
@@ -491,7 +491,7 @@ class ParserTests(unittest.TestCase):
         for payload in ("", "{"):
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
                 output = StringIO()
-                environment = {"HEADROOM_STATE_DIR": directory}
+                environment = {"QUOTAGAUGE_STATE_DIR": directory}
                 with mock.patch.dict(os.environ, environment, clear=False):
                     with mock.patch("sys.stdin", StringIO(payload)):
                         with redirect_stdout(output):

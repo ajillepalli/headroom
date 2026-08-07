@@ -12,7 +12,7 @@ from .config import FRESHNESS_ENV_VARS, freshness_override
 # wider thirty-minute window.
 #
 # "context" shares the 300s Claude default deliberately, not coincidentally:
-# headroom init sets the statusline refreshInterval to 300s (settings.py),
+# quotagauge init sets the statusline refreshInterval to 300s (settings.py),
 # and context rides the exact same statusline payload as the Claude rate
 # limits above. A tighter window here would be tighter than the tool's own
 # configured sample rate and would go silent on a clean install with nothing

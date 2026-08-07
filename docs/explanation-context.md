@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md) | [Why the bounds are sound](explanation-bounds.md) | [CLI reference](reference-cli.md)
 
-headroom reports Claude's context-window usage as its own signal, separate from the rate-limit windows described in [Why the bounds are sound](explanation-bounds.md). That page's whole argument -- a stale reading is still a sound lower bound -- does not carry over here, and this page explains why, and what headroom does instead.
+quotagauge reports Claude's context-window usage as its own signal, separate from the rate-limit windows described in [Why the bounds are sound](explanation-bounds.md). That page's whole argument -- a stale reading is still a sound lower bound -- does not carry over here, and this page explains why, and what quotagauge does instead.
 
 ## The property rate limits have that context does not
 
@@ -14,21 +14,21 @@ A stale context reading is therefore neither a sound lower bound (compaction may
 
 ## The consequence: report it fresh, or not at all
 
-Because a stale context reading cannot be bounded in either direction, headroom reports it only while it is genuinely fresh, and says nothing otherwise. There is no `>=` marker, no escalation, no hedge. `ContextReading.fresh` is the only confidence state that exists: `age_seconds` at or under the configured window is fresh, anything older is treated exactly like no reading at all.
+Because a stale context reading cannot be bounded in either direction, quotagauge reports it only while it is genuinely fresh, and says nothing otherwise. There is no `>=` marker, no escalation, no hedge. `ContextReading.fresh` is the only confidence state that exists: `age_seconds` at or under the configured window is fresh, anything older is treated exactly like no reading at all.
 
-This is a real, deliberate divergence from every other reading headroom produces. It is also the honest one: a bounded guess is not available here at any confidence, so headroom does not manufacture one.
+This is a real, deliberate divergence from every other reading quotagauge produces. It is also the honest one: a bounded guess is not available here at any confidence, so quotagauge does not manufacture one.
 
 ## Why the freshness window is 300 seconds, not tighter
 
-`headroom init` sets the Claude statusline's `refreshInterval` to 300 seconds, matching `HEADROOM_FRESH_CLAUDE_SECONDS`'s own default. Context rides the exact same statusline payload as the rate-limit windows, so its freshness window (`HEADROOM_FRESH_CONTEXT_SECONDS`) defaults to the same 300 seconds rather than something tighter.
+`quotagauge init` sets the Claude statusline's `refreshInterval` to 300 seconds, matching `QUOTAGAUGE_FRESH_CLAUDE_SECONDS`'s own default. Context rides the exact same statusline payload as the rate-limit windows, so its freshness window (`QUOTAGAUGE_FRESH_CONTEXT_SECONDS`) defaults to the same 300 seconds rather than something tighter.
 
 A tighter window would not make context "more accurate" -- it would only make the signal go silent more often, on a clean install with nothing actually wrong, because it would be tighter than the tool's own configured sample rate. In practice the sample rate is usually much faster than 300 seconds anyway: Claude Code re-runs the statusline command on several event-driven triggers (a new assistant message, `/compact` finishing, a permission-mode change, a vim-mode toggle), and `refreshInterval` only adds a periodic re-render on top of those events during an idle session. It does not throttle invocation down to once per 300 seconds. See the [CLI reference](reference-cli.md#environment-variables) for the exact variable and its default.
 
 ## Context is per-session; rate limits are account-wide
 
-Every other signal headroom reports is account-wide: a rate-limit window is the same number no matter which terminal tab asks. Context usage is not -- it belongs to one specific conversation. Two terminal tabs are two different context usages at any given moment, and nothing about the statusline payload changes that.
+Every other signal quotagauge reports is account-wide: a rate-limit window is the same number no matter which terminal tab asks. Context usage is not -- it belongs to one specific conversation. Two terminal tabs are two different context usages at any given moment, and nothing about the statusline payload changes that.
 
-`state.json` keys context captures by `session_id`, taken from the statusline payload on write and from the `UserPromptSubmit` hook payload on read. When either side has no `session_id`, headroom reports nothing rather than guessing which session a stored reading belongs to. Without this, a flat, non-session-keyed slot would let one terminal tab's fresh 8%-used reading answer for a different, simultaneously-critical session's prompt -- the exact inverse of the truth, delivered with full confidence.
+`state.json` keys context captures by `session_id`, taken from the statusline payload on write and from the `UserPromptSubmit` hook payload on read. When either side has no `session_id`, quotagauge reports nothing rather than guessing which session a stored reading belongs to. Without this, a flat, non-session-keyed slot would let one terminal tab's fresh 8%-used reading answer for a different, simultaneously-critical session's prompt -- the exact inverse of the truth, delivered with full confidence.
 
 `json` and `status` have no session of their own (no stdin, no hook payload), so both report every currently-fresh session rather than picking one -- picking one would only relocate the same cross-session risk to a different command. `doctor` also has no session of its own, but answers a different question ("is context capture working at all"), so it reports the single most recently captured entry across every session instead, and states plainly when none exists.
 
@@ -42,7 +42,7 @@ The rate-limit hook tells the model to avoid parallel subagent fan-out, because 
 
 ## Arbitration with the rate-limit ladder
 
-A single hook invocation can have both a live rate-limit warning and a live context warning to report, and the ~60-word budget cannot always show both in full. headroom picks a winner:
+A single hook invocation can have both a live rate-limit warning and a live context warning to report, and the ~60-word budget cannot always show both in full. quotagauge picks a winner:
 
 1. Compute the worst rate-limit severity and this session's context severity separately.
 2. If both are `ok` or absent, the hook says nothing.
@@ -55,6 +55,6 @@ Burn-rate projections (see [Why the bounds are sound](explanation-bounds.md#a-bu
 
 ## What this does not cover
 
-Codex has no equivalent field in its app-server responses, so this is Claude-only. headroom does not predict when compaction will fire, only reports the last fresh percentage it observed. And this signal never changes the existing rate-limit `Reading` type or its own thresholds -- the two live side by side, deliberately not sharing a model.
+Codex has no equivalent field in its app-server responses, so this is Claude-only. quotagauge does not predict when compaction will fire, only reports the last fresh percentage it observed. And this signal never changes the existing rate-limit `Reading` type or its own thresholds -- the two live side by side, deliberately not sharing a model.
 
 For the exact field names, the environment variable, and example renders, see the [CLI reference](reference-cli.md). For what to do when context guidance never appears, see [Troubleshooting](howto-troubleshoot.md).

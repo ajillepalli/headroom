@@ -6,10 +6,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-from headroom.bounds import Confidence, Snapshot, bound_snapshot
-from headroom.freshness import freshness_seconds
-from headroom.render import render_hook, render_report, render_statusline
-from headroom.severity import Severity, reading_severity
+from quotagauge.bounds import Confidence, Snapshot, bound_snapshot
+from quotagauge.freshness import freshness_seconds
+from quotagauge.render import render_hook, render_report, render_statusline
+from quotagauge.severity import Severity, reading_severity
 
 
 class BoundsTests(unittest.TestCase):
@@ -183,8 +183,8 @@ class BoundsTests(unittest.TestCase):
 
     def test_freshness_environment_overrides_are_honoured(self) -> None:
         overrides = {
-            "HEADROOM_FRESH_CLAUDE_SECONDS": "42",
-            "HEADROOM_FRESH_CODEX_SECONDS": "84",
+            "QUOTAGAUGE_FRESH_CLAUDE_SECONDS": "42",
+            "QUOTAGAUGE_FRESH_CODEX_SECONDS": "84",
         }
 
         with patch.dict(os.environ, overrides, clear=True):

@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for helping improve headroom. Keep changes small, explain the user-facing effect, and include tests for changed behavior.
+Thanks for helping improve quotagauge. Keep changes small, explain the user-facing effect, and include tests for changed behavior.
 
 ## Set up a checkout
 
-Clone this repository or your fork into a directory named `headroom`. Enter that directory before running project commands. The project needs Python 3.9 or newer and no third-party packages.
+Clone this repository or your fork into a directory named `quotagauge`. Enter that directory before running project commands. The project needs Python 3.9 or newer and no third-party packages.
 
 Run the full suite before making a change:
 

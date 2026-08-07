@@ -2,11 +2,11 @@
 
 [Back to the README](../README.md) | [Why the bounds are sound](explanation-bounds.md) | [Troubleshooting](howto-troubleshoot.md)
 
-headroom combines two local capture paths. Claude arrives through statusline input. Codex is requested on demand through a local stdio RPC, with session rollouts as a fallback.
+quotagauge combines two local capture paths. Claude arrives through statusline input. Codex is requested on demand through a local stdio RPC, with session rollouts as a fallback.
 
 ## Claude Code capture
 
-Claude Code invokes a configured statusline command and sends a JSON document on standard input. Claude Code 2.1.80 and newer include `rate_limits` in that input. headroom reads the whole document whenever Claude Code renders the statusline.
+Claude Code invokes a configured statusline command and sends a JSON document on standard input. Claude Code 2.1.80 and newer include `rate_limits` in that input. quotagauge reads the whole document whenever Claude Code renders the statusline.
 
 On a multi-machine setup, this capture sees only the statusline payloads observed on that machine, so its Claude reading is a lower bound on account-wide usage. See [Claude readings look too good on multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
 
@@ -27,9 +27,9 @@ Claude freshness depends on the most recent statusline render. The default exact
 
 ## Codex app-server capture
 
-`status`, `json`, `hook`, and `doctor` start the configured app-server command. headroom exchanges newline-delimited JSON-RPC messages over the child process's standard input and output:
+`status`, `json`, `hook`, and `doctor` start the configured app-server command. quotagauge exchanges newline-delimited JSON-RPC messages over the child process's standard input and output:
 
-1. Send `initialize` with `clientInfo.name` set to `headroom` and the package version.
+1. Send `initialize` with `clientInfo.name` set to `quotagauge` and the package version.
 2. Wait for response id 1, ignoring notifications and unrelated messages.
 3. Send the `initialized` notification with an empty object.
 4. Send `account/rateLimits/read` with request id 2 and `params` set to `null`.
@@ -68,7 +68,7 @@ The verified response has this shape, with other limit buckets allowed beside th
 }
 ```
 
-headroom first searches `rateLimitsByLimitId` for a bucket whose `limitId` is `codex`. If none is found, it uses the top-level `rateLimits` object when present. The RPC spells the duration `windowDurationMins`; rollout records spell it `window_minutes`. The shared parser accepts both, along with the other camel-case and snake-case variants listed in the source.
+quotagauge first searches `rateLimitsByLimitId` for a bucket whose `limitId` is `codex`. If none is found, it uses the top-level `rateLimits` object when present. The RPC spells the duration `windowDurationMins`; rollout records spell it `window_minutes`. The shared parser accepts both, along with the other camel-case and snake-case variants listed in the source.
 
 The `account/rateLimits/read` request costs no Codex quota and creates no session rollout. Those two side effects were checked against Codex 0.146.0.
 
@@ -78,49 +78,49 @@ The whole exchange shares a default six-second deadline. A timeout, launch failu
 
 ## Codex rollout fallback
 
-The fallback searches `sessions/YYYY/MM/DD/rollout-*.jsonl` below the Codex home. By default that is `~/.codex`; `HEADROOM_CODEX_HOME` changes it.
+The fallback searches `sessions/YYYY/MM/DD/rollout-*.jsonl` below the Codex home. By default that is `~/.codex`; `QUOTAGAUGE_CODEX_HOME` changes it.
 
-Files are ordered newest first by modification time and then path. headroom scans until the first file with a usable snapshot. Inside each file it keeps the last usable `rate_limits` occurrence. A payload timestamp from `timestamp`, `created_at`, or `createdAt` becomes the capture time when valid; otherwise the file modification time is used.
+Files are ordered newest first by modification time and then path. quotagauge scans until the first file with a usable snapshot. Inside each file it keeps the last usable `rate_limits` occurrence. A payload timestamp from `timestamp`, `created_at`, or `createdAt` becomes the capture time when valid; otherwise the file modification time is used.
 
 Rollouts may contain `primary` and `secondary` buckets, and either can be `null`. Current samples often have a weekly primary bucket and a null short bucket, so the Codex 5h reading can remain unavailable. The parser accepts `used_percent`, `used_percentage`, `usedPercent`, and `usedPercentage`, plus all three supported window-duration spellings.
 
 ## Which surfaces are covered
 
-Claude Code runs in several places, and capture and injection do not reach the same set of them. Capture is how headroom reads the numbers. Injection is how the warning reaches the model.
+Claude Code runs in several places, and capture and injection do not reach the same set of them. Capture is how quotagauge reads the numbers. Injection is how the warning reaches the model.
 
 | Surface | Claude capture | Injection |
 | --- | --- | --- |
 | Local terminal | yes | yes |
 | Local Desktop app | no documented mechanism | yes |
 | Local VS Code and JetBrains extensions | no documented mechanism | yes |
-| Claude Code on the web | no documented mechanism | not available to headroom |
-| Remote terminal over SSH or in a container | yes, where headroom is installed and configured there | yes, against that machine's state |
-| Remote Desktop or IDE session | no documented mechanism | only where headroom is installed with its state |
+| Claude Code on the web | no documented mechanism | not available to quotagauge |
+| Remote terminal over SSH or in a container | yes, where quotagauge is installed and configured there | yes, against that machine's state |
+| Remote Desktop or IDE session | no documented mechanism | only where quotagauge is installed with its state |
 
-The word local is doing real work in those rows, and the two columns answer different questions. Capture needs a terminal status line, which is why every non-terminal row reads the same way wherever it runs. Injection needs the `headroom` command and its state directory on whichever machine the session executes on.
+The word local is doing real work in those rows, and the two columns answer different questions. Capture needs a terminal status line, which is why every non-terminal row reads the same way wherever it runs. Injection needs the `quotagauge` command and its state directory on whichever machine the session executes on.
 
-That second requirement is what the web fails, and it is not unique to the web. A Desktop or IDE session pointed at a cloud machine, an SSH host, or a dev container is on the far side of the same line. A remote terminal is the case worth calling out separately: install and configure headroom on that host and it captures and injects there perfectly well, reporting that machine's view rather than your laptop's.
+That second requirement is what the web fails, and it is not unique to the web. A Desktop or IDE session pointed at a cloud machine, an SSH host, or a dev container is on the far side of the same line. A remote terminal is the case worth calling out separately: install and configure quotagauge on that host and it captures and injects there perfectly well, reporting that machine's view rather than your laptop's.
 
-Injection is the documented case. The hooks documentation states that hooks run wherever Claude Code runs, covering terminal sessions, IDE extensions, the Desktop app, and the web. Firing is not the same as being configured, so a surface warns only where the headroom hook is actually installed for it.
+Injection is the documented case. The hooks documentation states that hooks run wherever Claude Code runs, covering terminal sessions, IDE extensions, the Desktop app, and the web. Firing is not the same as being configured, so a surface warns only where the quotagauge hook is actually installed for it.
 
 Capture is the narrow one. Among the first-party clients, the statusline payload is the only documented source of Claude rate limits, and statusline is documented only for the terminal. Nothing states that the other surfaces refuse to run a statusline command; there is simply no documented mechanism for it, and those surfaces have no terminal status bar to render into. Treat that row as an absence of documentation rather than a tested failure.
 
 Nothing else observes a first-party client's numbers passively. `/usage` draws its bars for a person to read rather than emitting anything a program can parse, no state or config file records the numbers, no other hook event carries them in its payload, and MCP servers are not given them.
 
-One documented active alternative is an Agent SDK session, whose rate-limit events can include utilization for shared subscription limits after a quota-consuming request. Those limits can cover what was spent interactively in Claude Code, so the numbers are relevant, but the events arrive on status changes and the utilization field is optional, so this is not an on-demand reader. For Claude, headroom watches a payload already being produced and spends no additional model quota.
+One documented active alternative is an Agent SDK session, whose rate-limit events can include utilization for shared subscription limits after a quota-consuming request. Those limits can cover what was spent interactively in Claude Code, so the numbers are relevant, but the events arrive on status changes and the utilization field is optional, so this is not an on-demand reader. For Claude, quotagauge watches a payload already being produced and spends no additional model quota.
 
-The web is out of reach, and not merely unconfigured. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings, and not from the `~/.claude/settings.json` that `headroom init` writes. Registering the hook there would make it fire, and it would then fail, because a web session runs on Anthropic-managed infrastructure rather than on your machine. The `headroom` command is installed locally and is not part of the repository clone, so it is not on that machine's path, and `~/.headroom/state.json` is written by your statusline and does not exist there either. Installing headroom through a cloud setup script does not help, because that copy would start with empty state and report nothing while looking configured.
+The web is out of reach, and not merely unconfigured. Cloud sessions load hooks from project settings, meaning `.claude/settings.json` or `.claude/settings.local.json` in the repository, or from organization server-managed settings, and not from the `~/.claude/settings.json` that `quotagauge init` writes. Registering the hook there would make it fire, and it would then fail, because a web session runs on Anthropic-managed infrastructure rather than on your machine. The `quotagauge` command is installed locally and is not part of the repository clone, so it is not on that machine's path, and `~/.quotagauge/state.json` is written by your statusline and does not exist there either. Installing quotagauge through a cloud setup script does not help, because that copy would start with empty state and report nothing while looking configured.
 
-Reaching web sessions would mean reading state from a network service instead of a local file, which is a different tool. [Issue #36](https://github.com/ajillepalli/headroom/issues/36) records the reasoning and is closed.
+Reaching web sessions would mean reading state from a network service instead of a local file, which is a different tool. [Issue #36](https://github.com/ajillepalli/quotagauge/issues/36) records the reasoning and is closed.
 
 Codex is not affected the same way when the app-server RPC answers. That query asks the account for its own limits, so the result does not depend on which client spent the quota, and GUI and IDE use stays visible. The rollout fallback is different: it reads local session records, so it sees only work done by a client that wrote rollouts on this machine. `doctor` reports which source won, and the distinction matters whenever RPC fails or is disabled.
 
-The practical result follows from the bound rather than from any special handling. Usage is monotonic within a window and the limit is account-wide, so a capture taken in the terminal stays a valid lower bound on work done anywhere else, until that window resets and the old percentage stops describing it. Working in the terminal some of the time and elsewhere the rest means headroom captures in the terminal and still warns on any surface where its hook is installed; the warning is sound and reads low. For Claude, working only outside the terminal means headroom captures nothing and stays quiet. It under-reports rather than misreporting, which is the same property described for [multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
+The practical result follows from the bound rather than from any special handling. Usage is monotonic within a window and the limit is account-wide, so a capture taken in the terminal stays a valid lower bound on work done anywhere else, until that window resets and the old percentage stops describing it. Working in the terminal some of the time and elsewhere the rest means quotagauge captures in the terminal and still warns on any surface where its hook is installed; the warning is sound and reads low. For Claude, working only outside the terminal means quotagauge captures nothing and stays quiet. It under-reports rather than misreporting, which is the same property described for [multiple machines](howto-troubleshoot.md#claude-readings-look-too-good-on-multiple-machines).
 
 ## Storage and limits of the sources
 
 Successful snapshots from either source are merged into `state.json`, which is replaced atomically. Each snapshot is appended to `history.jsonl`. On-demand Codex refresh updates Codex diagnostics even when neither source yields a new snapshot. `doctor` performs capture discovery without changing state.
 
-Neither source provides a published token allowance through these payloads. headroom reports percentage used and reset time, never tokens remaining. Claude can be only as fresh as its last statusline render. Codex can be only as fresh as the RPC response or newest usable rollout.
+Neither source provides a published token allowance through these payloads. quotagauge reports percentage used and reset time, never tokens remaining. Claude can be only as fresh as its last statusline render. Codex can be only as fresh as the RPC response or newest usable rollout.
 
 For output fields and source controls, see the [CLI reference](reference-cli.md). For missing readings and RPC fallback checks, see [Troubleshooting](howto-troubleshoot.md).

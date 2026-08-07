@@ -16,9 +16,9 @@ from .bounds import Snapshot
 from .codexsrc import parse_rate_limits
 
 
-RPC_ENABLED_ENV = "HEADROOM_CODEX_RPC"
-RPC_TIMEOUT_ENV = "HEADROOM_CODEX_RPC_TIMEOUT"
-RPC_COMMAND_ENV = "HEADROOM_CODEX_RPC_CMD"
+RPC_ENABLED_ENV = "QUOTAGAUGE_CODEX_RPC"
+RPC_TIMEOUT_ENV = "QUOTAGAUGE_CODEX_RPC_TIMEOUT"
+RPC_COMMAND_ENV = "QUOTAGAUGE_CODEX_RPC_CMD"
 DEFAULT_TIMEOUT_SECONDS = 6.0
 
 
@@ -48,7 +48,7 @@ def read_rate_limits(
     environment = os.environ if environ is None else environ
     if environment.get(RPC_ENABLED_ENV) == "0":
         return CodexRpcResult(
-            (), False, ("app-server RPC disabled by HEADROOM_CODEX_RPC=0",)
+            (), False, ("app-server RPC disabled by QUOTAGAUGE_CODEX_RPC=0",)
         )
 
     notes: List[str] = []
@@ -86,7 +86,7 @@ def read_rate_limits(
         reader = threading.Thread(
             target=_read_lines,
             args=(process.stdout, messages),
-            name="headroom-codex-rpc",
+            name="quotagauge-codex-rpc",
             daemon=True,
         )
         reader.start()
@@ -98,7 +98,7 @@ def read_rate_limits(
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "headroom", "version": __version__}
+                    "clientInfo": {"name": "quotagauge", "version": __version__}
                 },
             },
         )
@@ -151,7 +151,7 @@ def _timeout_seconds(environment: Mapping[str, str], notes: List[str]) -> float:
         timeout = -1.0
     if not math.isfinite(timeout) or timeout <= 0.0:
         notes.append(
-            "invalid HEADROOM_CODEX_RPC_TIMEOUT; using {}s".format(
+            "invalid QUOTAGAUGE_CODEX_RPC_TIMEOUT; using {}s".format(
                 _format_timeout(DEFAULT_TIMEOUT_SECONDS)
             )
         )
@@ -166,7 +166,7 @@ def _command(
     if configured is None:
         return ("codex", "app-server")
     if not configured.strip():
-        notes.append("HEADROOM_CODEX_RPC_CMD is empty")
+        notes.append("QUOTAGAUGE_CODEX_RPC_CMD is empty")
         return None
 
     try:
@@ -181,12 +181,12 @@ def _command(
     try:
         parts = shlex.split(configured, posix=os.name != "nt")
     except ValueError as error:
-        notes.append("invalid HEADROOM_CODEX_RPC_CMD: {}".format(error))
+        notes.append("invalid QUOTAGAUGE_CODEX_RPC_CMD: {}".format(error))
         return None
     if os.name == "nt":
         parts = [_strip_windows_quotes(part) for part in parts]
     if not parts:
-        notes.append("HEADROOM_CODEX_RPC_CMD is empty")
+        notes.append("QUOTAGAUGE_CODEX_RPC_CMD is empty")
         return None
     return tuple(parts)
 

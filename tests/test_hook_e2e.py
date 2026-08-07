@@ -15,7 +15,7 @@ from typing import Optional
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-HOOK = REPOSITORY_ROOT / "hooks" / "headroom-hook.py"
+HOOK = REPOSITORY_ROOT / "hooks" / "quotagauge-hook.py"
 
 
 class HookEndToEndTests(unittest.TestCase):
@@ -169,13 +169,13 @@ class HookEndToEndTests(unittest.TestCase):
                     rollout.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
                 environment = os.environ.copy()
-                environment["HEADROOM_CODEX_HOME"] = codex_home
-                environment["HEADROOM_CODEX_RPC"] = "0"
-                environment["HEADROOM_STATE_DIR"] = state_dir
-                environment["HEADROOM_FRESH_CODEX_SECONDS"] = "1800"
-                environment.pop("HEADROOM_FORCE_SEVERITY", None)
+                environment["QUOTAGAUGE_CODEX_HOME"] = codex_home
+                environment["QUOTAGAUGE_CODEX_RPC"] = "0"
+                environment["QUOTAGAUGE_STATE_DIR"] = state_dir
+                environment["QUOTAGAUGE_FRESH_CODEX_SECONDS"] = "1800"
+                environment.pop("QUOTAGAUGE_FORCE_SEVERITY", None)
                 if force_severity is not None:
-                    environment["HEADROOM_FORCE_SEVERITY"] = force_severity
+                    environment["QUOTAGAUGE_FORCE_SEVERITY"] = force_severity
                 return subprocess.run(
                     [sys.executable, str(HOOK)] + (["--plain"] if plain else []),
                     input=stdin_payload,

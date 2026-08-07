@@ -13,7 +13,7 @@ from typing import Optional
 import unittest
 from unittest import mock
 
-from headroom.burn_rate import (
+from quotagauge.burn_rate import (
     MAX_FIT_SAMPLES,
     MIN_INTERVAL_SECONDS,
     MIN_SPAN_TO_HORIZON_RATIO,
@@ -478,7 +478,7 @@ class BurnRateTests(unittest.TestCase):
 
     def test_steady_rate_sampled_at_uneven_intervals_measures_small(self) -> None:
         # Realistic shape #1: captures do not arrive on a fixed clock (the
-        # gap between two readings depends on when headroom happened to
+        # gap between two readings depends on when quotagauge happened to
         # run), so a genuinely steady 1.0 %/s process can still be sampled
         # at durations spread over a 5x range (30s to 150s, a fixed
         # sequence, not real randomness). Every interval reports EXACTLY
@@ -1895,7 +1895,7 @@ class BurnRateTests(unittest.TestCase):
                 json.dumps(self._record(0.0, 10.0)), encoding="utf-8"
             )
             with mock.patch(
-                "headroom.burn_rate.Path.open",
+                "quotagauge.burn_rate.Path.open",
                 side_effect=PermissionError("denied"),
             ):
                 self.assertEqual(

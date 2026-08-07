@@ -1,4 +1,4 @@
-"""Command-line entry point for headroom."""
+"""Command-line entry point for quotagauge."""
 
 import argparse
 import copy
@@ -77,7 +77,7 @@ HOOK_MAX_HISTORY_BYTES = 20_000_000
 def build_parser() -> argparse.ArgumentParser:
     """Build the command parser."""
 
-    parser = argparse.ArgumentParser(prog="headroom")
+    parser = argparse.ArgumentParser(prog="quotagauge")
     parser.add_argument(
         "--version",
         action="version",
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _installed_version() -> str:
     try:
-        return metadata.version("headroom-cli")
+        return metadata.version("quotagauge")
     except Exception:
         return __version__
 
@@ -146,7 +146,7 @@ def _display_version() -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run a headroom command and return its process status."""
+    """Run a quotagauge command and return its process status."""
 
     arguments = build_parser().parse_args(argv)
     if arguments.command == "init":
@@ -160,7 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print_only=arguments.print_only,
             )
         except OSError as error:
-            print("headroom init: {}".format(error), file=sys.stderr)
+            print("quotagauge init: {}".format(error), file=sys.stderr)
             return 1
     if arguments.command == "statusline":
         return _statusline()
@@ -174,7 +174,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
         except OSError as error:
-            print("headroom reset: {}".format(error), file=sys.stderr)
+            print("quotagauge reset: {}".format(error), file=sys.stderr)
             return 1
     if arguments.command == "update":
         return _update()
@@ -260,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
         return 0
     except (OSError, ValueError, TypeError) as error:
-        print("headroom: {}".format(error), file=sys.stderr)
+        print("quotagauge: {}".format(error), file=sys.stderr)
         return 1
 
 
@@ -374,7 +374,7 @@ def _capture_timestamp(value: Dict[str, Any]) -> float:
 def _forced_hook_severity() -> Optional[Severity]:
     """Read the opt-in diagnostic severity, ignoring unsupported values."""
 
-    value = os.environ.get("HEADROOM_FORCE_SEVERITY", "").strip().lower()
+    value = os.environ.get("QUOTAGAUGE_FORCE_SEVERITY", "").strip().lower()
     return {
         "notice": Severity.NOTICE,
         "warn": Severity.WARN,
@@ -405,7 +405,7 @@ def _statusline() -> int:
     except Exception:
         # Claude Code's terminal contract is more important than diagnostics here.
         try:
-            print("headroom: usage unavailable")
+            print("quotagauge: usage unavailable")
         except Exception:
             pass
     return 0
@@ -599,7 +599,7 @@ def _print_status_update() -> None:
     result = check_for_update(_installed_version())
     if result.update_available:
         print(
-            "Update available: headroom-cli {} (installed {}). Run headroom update.".format(
+            "Update available: quotagauge {} (installed {}). Run quotagauge update.".format(
                 result.latest_version,
                 result.installed_version,
             )
@@ -650,10 +650,10 @@ def _update() -> int:
     install = inspect_install(_installed_version())
     if install.update_mode == "uv-tool":
         print("Detected install mode: uv tool")
-        print("Run: uv tool upgrade headroom-cli")
+        print("Run: uv tool upgrade quotagauge")
     elif install.update_mode == "pip":
         print("Detected install mode: pip")
-        print("Run: pip install -U headroom-cli")
+        print("Run: pip install -U quotagauge")
     elif install.update_mode == "source":
         print("Detected install mode: source checkout")
         print("In {}, run:".format(install.path.parent))
