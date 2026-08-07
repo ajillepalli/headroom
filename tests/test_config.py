@@ -57,6 +57,16 @@ class ResolveStateDirTests(unittest.TestCase):
         # Branch 2: ~/.quotagauge already exists (a prior migration, or a
         # fresh install that never saw the old name). It wins outright, and
         # a leftover ~/.headroom -- however it got there -- is left alone.
+        #
+        # This also covers the unlikely case of an unrelated, non-migration
+        # directory happening to occupy ~/.quotagauge already (a manual
+        # mkdir, a different local tool): this function cannot distinguish
+        # that from a genuine prior migration, and deliberately does not
+        # try -- it always prefers an existing target over guessing. The
+        # real legacy directory is never deleted or written to either way,
+        # so nothing here is destructive: at worst, real history stays
+        # sitting at ~/.headroom, fully intact and recoverable by hand,
+        # simply not picked up automatically.
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             target = home_path / ".quotagauge"
@@ -185,18 +195,27 @@ class ResolveStateDirTests(unittest.TestCase):
         # never silently replaces an existing target). That must be told
         # apart from a genuine failure: re-checking the target and using it
         # is the only way, and doing so must never fall back to the legacy
-        # directory once a winner already exists.
+        # directory once a winner already exists. The fake winner below
+        # renames the SAME legacy directory this process sees (moving its
+        # real content, not just creating an empty target) and removes it,
+        # exactly like a real concurrent process's os.rename would -- so
+        # this test also proves the winner's actual data, not just an empty
+        # directory, is what gets used.
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             legacy = home_path / ".headroom"
             legacy.mkdir()
+            (legacy / "history.jsonl").write_text("winner's data\n", encoding="utf-8")
             target = home_path / ".quotagauge"
 
             def fake_rename(target_path: Path) -> None:
                 # Simulate a concurrent process's own migration completing
                 # in the window between this process's existence check and
-                # its own rename attempt.
-                target.mkdir()
+                # its own rename attempt: it moves the real legacy
+                # directory (using the real os.rename, not this mocked
+                # one) so the legacy path is gone afterward too, exactly
+                # as a genuine winner would leave things.
+                os.rename(str(legacy), str(target))
                 raise OSError("target exists")
 
             with mock.patch.dict(os.environ, {}, clear=True):
@@ -206,6 +225,8 @@ class ResolveStateDirTests(unittest.TestCase):
 
             self.assertEqual(result, target)
             self.assertTrue(target.is_dir())
+            self.assertFalse(legacy.exists())
+            self.assertEqual((target / "history.jsonl").read_text(encoding="utf-8"), "winner's data\n")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,19 @@ def _resolve_default_state_dir() -> Path:
 
     target = Path.home() / _STATE_DIR_NAME
     if target.exists():
+        # This branch wins unconditionally, even over a legacy directory
+        # that still exists right beside it: an existing target could be a
+        # genuine prior migration (the common case), a fresh install that
+        # simply reached this name first, OR a directory unrelated to any
+        # migration (a stray empty ~/.quotagauge, however that got there --
+        # a typo, a separate local tool). This function cannot tell those
+        # apart from an OSError alone, and it deliberately does not try:
+        # ~/.headroom is never deleted or written to on this path (see
+        # below), so nothing here is destructive even in the unlikely stray
+        # case, and the legacy data stays fully recoverable by hand.
+        # Preferring "trust an existing target" over "guess and possibly
+        # pick the wrong directory automatically" is the intentional
+        # trade-off.
         return target
 
     legacy = Path.home() / _LEGACY_STATE_DIR_NAME

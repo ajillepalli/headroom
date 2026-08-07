@@ -86,6 +86,12 @@ Check `quotagauge doctor`'s dedicated `Claude context` line first; it names the 
 
 On a machine that ran this project under its earlier name, the first command that resolves the default state directory renames a pre-existing `~/.headroom` to `~/.quotagauge` automatically, once, and uses the new location from then on. If that rename cannot complete for any reason, the old directory is left exactly as it was and used in place, so `State directory` may still point at `~/.headroom` on such a machine -- that is expected, not a bug, and no history is lost either way.
 
+This automatic migration has three limits worth knowing about, all of them safe (nothing is ever deleted or overwritten) but worth knowing so a missing reading does not look like data loss:
+
+- **It only looks at the default `~/.headroom` path.** If the earlier install used a custom `HEADROOM_STATE_DIR`, that data is not found automatically -- set `QUOTAGAUGE_STATE_DIR` to the same path yourself. Environment variables are trivially re-set, unlike accumulated history, which is why only the directory itself is migrated automatically.
+- **An already-present `~/.quotagauge` always wins, even over an untouched `~/.headroom` beside it.** This covers the common "already migrated" case, but also means a stray, unrelated `~/.quotagauge` (however it got there) would shadow real legacy history without erasing it. If `doctor` shows an empty or unexpectedly small state right after upgrading, check whether `~/.headroom` still has your real history sitting untouched next to a near-empty `~/.quotagauge`, and merge or remove the stray directory by hand.
+- **`init` does not remove an old `headroom` hook registration.** If both `headroom` and `quotagauge` commands are installed and configured, both hook entries run on every prompt. Uninstall the old `headroom-cli` package (or manually remove its entry from `settings.json`/`hooks.json`) once you have switched to `quotagauge`.
+
 ## Disable the Codex RPC
 
 Set the exact value `0` to skip `codex app-server` and read rollout files only:
