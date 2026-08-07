@@ -147,11 +147,14 @@ class ResolveStateDirTests(unittest.TestCase):
             self.assertEqual((target / "history.jsonl").read_text(encoding="utf-8"), "data\n")
 
     def test_failed_rename_falls_back_to_legacy_directory_in_place(self) -> None:
-        # Branch 3, failure path: the rename cannot complete (permissions,
-        # a stray file already at the target, a cross-device boundary,
-        # ...). The legacy directory -- and every reading in it -- must
-        # still be reachable afterward, in place, never destroyed and
-        # never copy-then-deleted.
+        # Branch 3, failure path: the rename cannot complete even after
+        # exhausting the transient-lock retry (a genuine permission
+        # problem, a stray file already at the target, a cross-device
+        # boundary, ...). The legacy directory -- and every reading in it
+        # -- must still be reachable afterward, in place, never destroyed
+        # and never copy-then-deleted. PermissionError specifically (not a
+        # generic OSError) exercises the retry path this failure goes
+        # through before giving up.
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             legacy = home_path / ".headroom"
@@ -160,13 +163,71 @@ class ResolveStateDirTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {}, clear=True):
                 with mock.patch("quotagauge.config.Path.home", return_value=home_path):
-                    with mock.patch.object(Path, "rename", side_effect=OSError("permission denied")):
-                        result = resolve_state_dir()
+                    with mock.patch.object(Path, "rename", side_effect=PermissionError("permission denied")):
+                        with mock.patch("quotagauge.config.time.sleep"):
+                            result = resolve_state_dir()
 
             target = home_path / ".quotagauge"
             self.assertEqual(result, legacy)
             self.assertTrue(legacy.is_dir())
             self.assertFalse(target.exists())
+            self.assertEqual((legacy / "history.jsonl").read_text(encoding="utf-8"), "irreplaceable\n")
+
+    def test_transient_permission_error_is_retried_and_succeeds(self) -> None:
+        # The realistic mechanism behind two processes racing this
+        # migration: a rename can fail for a few milliseconds because
+        # something else (antivirus, the Windows Search Indexer) briefly
+        # has the directory open, not because it can never succeed.
+        # Retrying narrows that window instead of prematurely committing
+        # to the legacy-directory fallback and potentially writing there
+        # while another process goes on to migrate successfully.
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            legacy = home_path / ".headroom"
+            legacy.mkdir()
+            (legacy / "history.jsonl").write_text("data\n", encoding="utf-8")
+
+            real_rename = Path.rename
+            attempts = {"count": 0}
+
+            def flaky_rename(self: Path, target_path: Path) -> None:
+                attempts["count"] += 1
+                if attempts["count"] < 3:
+                    raise PermissionError("transient lock")
+                real_rename(self, target_path)
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch("quotagauge.config.Path.home", return_value=home_path):
+                    with mock.patch.object(Path, "rename", flaky_rename):
+                        with mock.patch("quotagauge.config.time.sleep"):
+                            result = resolve_state_dir()
+
+            target = home_path / ".quotagauge"
+            self.assertEqual(result, target)
+            self.assertEqual(attempts["count"], 3)
+            self.assertFalse(legacy.exists())
+            self.assertEqual((target / "history.jsonl").read_text(encoding="utf-8"), "data\n")
+
+    def test_permission_error_exhausts_retries_then_falls_back_safely(self) -> None:
+        # A PermissionError that never clears (a genuine, non-transient
+        # problem) must still fall back safely once the retry budget is
+        # spent, exactly like any other non-racing failure.
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            legacy = home_path / ".headroom"
+            legacy.mkdir()
+            (legacy / "history.jsonl").write_text("irreplaceable\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch("quotagauge.config.Path.home", return_value=home_path):
+                    with mock.patch.object(Path, "rename", side_effect=PermissionError("locked")):
+                        with mock.patch("quotagauge.config.time.sleep") as sleep_mock:
+                            result = resolve_state_dir()
+
+            target = home_path / ".quotagauge"
+            self.assertEqual(result, legacy)
+            self.assertFalse(target.exists())
+            self.assertTrue(sleep_mock.called)
             self.assertEqual((legacy / "history.jsonl").read_text(encoding="utf-8"), "irreplaceable\n")
 
     def test_failed_rename_never_destroys_data_across_repeated_attempts(self) -> None:

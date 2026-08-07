@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import time
 from typing import Mapping, Optional
 
 
@@ -29,6 +30,24 @@ FRESHNESS_ENV_VARS = {
 # reach of it would be strictly worse than a stray old name in the source.
 _LEGACY_STATE_DIR_NAME = ".headroom"
 _STATE_DIR_NAME = ".quotagauge"
+
+# How many times to retry the migration rename on a transient Windows
+# access-denied failure, and how long to wait between attempts. Mirrors
+# state.py's _replace_with_retry, which retries os.replace for exactly this
+# reason: MoveFileEx (what Path.rename wraps on Windows) can fail with
+# ERROR_ACCESS_DENIED for a few milliseconds if something else -- commonly
+# antivirus real-time scanning or the Windows Search Indexer -- briefly has
+# the directory open, not because the rename can never succeed. Retrying
+# narrows a real-world instance of the race a Codex review round flagged:
+# two processes racing this exact migration at nearly the same moment can
+# otherwise see one process's rename lose to a momentary external lock
+# while the other's succeeds a few milliseconds later, after the first
+# process has already committed to the legacy-directory fallback below and
+# may go on to write there. A bounded retry gives the losing side a real
+# chance to become the winner instead, the same way it does for
+# _replace_with_retry's analogous case.
+_MIGRATION_RETRY_ATTEMPTS = 5
+_MIGRATION_RETRY_DELAY_SECONDS = 0.02
 
 
 def resolve_state_dir(state_dir: Optional[Path] = None) -> Path:
@@ -95,7 +114,7 @@ def _resolve_default_state_dir() -> Path:
         return target
 
     try:
-        legacy.rename(target)
+        _rename_with_retry(legacy, target)
         return target
     except OSError:
         # A failed rename is ambiguous by itself: it can mean "a concurrent
@@ -106,7 +125,11 @@ def _resolve_default_state_dir() -> Path:
         # occupying `target`, crossing a filesystem boundary, and so on).
         # Both raise the same OSError, so re-checking `target` is the only
         # way to tell a race that already resolved itself from a real
-        # failure.
+        # failure. _rename_with_retry has already absorbed a few
+        # milliseconds of transient Windows lock contention by this point,
+        # so what remains here is either a genuine winner or a genuine
+        # failure, not a spurious loss to a lock that would have cleared a
+        # moment later.
         if target.exists():
             return target
         # A genuine, non-racing failure: the legacy directory still holds
@@ -119,7 +142,42 @@ def _resolve_default_state_dir() -> Path:
         # anything, so a still-failing migration is never worse than "not
         # migrated yet." The next call -- this process's or a later one --
         # simply tries again from the same starting state.
+        #
+        # Residual risk, accepted rather than eliminated: a caller that
+        # commits to this fallback path and then, over the life of a long
+        # running process, calls resolve_state_dir() again after a
+        # DIFFERENT process has since migrated the legacy directory out
+        # from under it would see that later call switch to the new
+        # target, since the target-exists branch above always wins. Any
+        # write already made against this returned legacy path in the
+        # meantime is not lost -- it is still real data on disk under
+        # ~/.headroom -- but it would no longer be picked up automatically
+        # by anything that resolves the state directory afterward, the
+        # same recoverable-but-not-automatic outcome documented for a
+        # stray pre-existing target above. Closing this completely would
+        # require every state.py read/write to share one resolution for
+        # an entire process invocation rather than each resolving
+        # independently; the retry above narrows the realistic window for
+        # this (a transient lock, not a permanent failure) without that
+        # broader, riskier restructuring of already-delicate concurrency
+        # code this rename does not otherwise need to touch.
         return legacy
+
+
+def _rename_with_retry(source: Path, target: Path) -> None:
+    """Path.rename, retrying a bounded number of times on a transient
+    Windows access-denied failure. See _MIGRATION_RETRY_ATTEMPTS's own
+    comment for why this exists; mirrors state.py's _replace_with_retry.
+    """
+
+    for attempt in range(_MIGRATION_RETRY_ATTEMPTS):
+        try:
+            source.rename(target)
+            return
+        except PermissionError:
+            if attempt == _MIGRATION_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_MIGRATION_RETRY_DELAY_SECONDS)
 
 
 def resolve_codex_sessions_dir() -> Path:
